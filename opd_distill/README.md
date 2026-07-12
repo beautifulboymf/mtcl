@@ -19,6 +19,16 @@ Distilling the `object` task via OPD (reverse-KL, on-policy) into three differen
 Contrast — the SAME strong 130 student **collapses** (goal 0.5→0, avg 0.62→0.24) when the method
 is wrong (norm-**mismatch** + rank **128**). So the make-or-break is the **method**, not student strength.
 
+## 130-task full OPD (distill ALL tasks, not one suite)
+
+`libero_object_opd_faithful130_2gpu.yaml` distills a single-suite (object) teacher; to distill the
+**whole 130-task generalist** roll out across all 130 tasks (`env/libero_130`) with the 130-GRPO
+teacher. Config: **`libero_130full_opd_fromsft_2gpu.yaml`** (student = 130-Base-Lora SFT, teacher =
+`RLinf-OpenVLAOFT-LIBERO-130` GRPO, matched norm `libero_130_no_noops_trajall`, rank 32, rollout_epoch 2,
+`total_num_envs: 32`, 10 steps). In-training 130-task average success **climbs 0.62 → 0.67 → 0.81**
+over the first 3 steps (toward the teacher's ~0.97) — OPD distillation works at full-130 scale, not just
+single-suite. (10 steps is enough to see the rising trajectory; post-hoc 4-suite eval confirms.)
+
 ## The 3 make-or-break factors
 
 1. **Norm alignment (crux).** Student and teacher must share the **same `unnorm_key`**. In
