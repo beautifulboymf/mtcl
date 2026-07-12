@@ -110,6 +110,13 @@ class MultiStepRolloutWorker(Worker):
                 expert_model_config.model_path = (
                     self.cfg.rollout.expert_model.model_path
                 )
+                # expert (task teacher) may have a DIFFERENT native norm_stats key than
+                # the student (e.g. spatial student vs object expert). Without this the
+                # expert inherits the student's unnorm_key and fails the load-time
+                # "un-norm key not found" assertion. Default None = unchanged.
+                _euk = self.cfg.rollout.expert_model.get("unnorm_key", None)
+                if _euk:
+                    expert_model_config.unnorm_key = _euk
             self.expert_model = get_model(expert_model_config)
 
             if self.cfg.runner.get("expert_ckpt_path", None):

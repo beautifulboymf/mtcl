@@ -1027,11 +1027,45 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         self.setup_model_and_optimizer()
 
+        # VLA-OPD: load a frozen teacher (separate bf16 model, no LoRA, no grad) that
+        # scores the student's on-policy rollouts. Kept resident on GPU alongside the
+        # (LoRA) student; only used for no_grad forward -> teacher logprobs.
+        self.teacher_model = None
+        if self.cfg.actor.get("use_teacher_distill", False):
+            self._load_teacher_model()
+
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
 
         self._setup_rollout_weight_dst_ranks()
+
+    def _load_teacher_model(self) -> None:
+        """VLA-OPD frozen teacher: full (non-LoRA) OpenVLA-OFT loaded from the RL'd
+        teacher ckpt, eval + requires_grad_(False), resident on the training device."""
+        from copy import deepcopy
+
+        from omegaconf import open_dict
+
+        tcfg = deepcopy(self.cfg.actor.model)
+        with open_dict(tcfg):
+            tcfg.model_path = self.cfg.actor.teacher_model_path
+            tcfg.is_lora = False
+            tcfg.lora_path = None
+            # teacher may have DIFFERENT native norm_stats than the student (e.g.
+            # spatial-init student + libero10 teacher). Teacher only SCORES (never
+            # acts), so its unnorm_key is a load-time validation only. Allow an
+            # optional override; default (None) = inherit student's key (unchanged).
+            _tuk = self.cfg.actor.get("teacher_unnorm_key", None)
+            if _tuk:
+                tcfg.unnorm_key = _tuk
+        self.teacher_model = get_model(tcfg)
+        self.teacher_model.eval()
+        for p in self.teacher_model.parameters():
+            p.requires_grad_(False)
+        self.log_info(
+            f"[VLA-OPD] loaded frozen teacher from {self.cfg.actor.teacher_model_path}"
+        )
 
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
@@ -1218,9 +1252,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Compute the advantages and returns.
         """
+        if self.cfg.algorithm.adv_type == "opd":
+            # VLA-OPD: the advantage is the per-token reverse-KL reward
+            # r_t = log pi_teacher(a_t) - log pi_student(a_t), computed PER MICRO-BATCH inside
+            # run_training (the teacher forward needs the flattened/processed batch + matching
+            # forward_inputs). Here we only place a same-shape placeholder so
+            # process_nested_dict_for_train and the training loop find an "advantages" tensor.
+            self.rollout_batch["advantages"] = torch.zeros_like(
+                self.rollout_batch["prev_logprobs"]
+            )
+            return compute_rollout_metrics(self.rollout_batch)
+
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
+            "opd_center": self.cfg.algorithm.get("opd_center", False),
             "rewards": self.rollout_batch["rewards"],
             "dones": self.rollout_batch["dones"],
             "values": self.rollout_batch.get("prev_values", None),
@@ -1415,6 +1461,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     loss_mask_sum = batch.get("loss_mask_sum", None)
 
                     forward_inputs = batch.get("forward_inputs", None)
+                    opd_kl = None   # KL(student||teacher) diagnostic, filled in the opd block
+                    opd_gap = None  # mean(teacher_lp - student_rollout_lp) on executed actions
+                    opd_distill_loss = None  # differentiable KL-distill loss (opd_mode=distill)
 
                     kwargs = {}
                     if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -1425,6 +1474,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             self.cfg.algorithm.sampling_params.temperature_train
                         )
                         kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
+                        # request 256-bin action logits for the OPD student-teacher KL diagnostic
+                        kwargs["return_action_logits"] = (
+                            self.cfg.algorithm.adv_type == "opd"
+                        )
                     elif (
                         SupportedModel(self.cfg.actor.model.model_type)
                         == SupportedModel.GR00T
@@ -1451,6 +1504,102 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     ):
                         prev_logprobs = output_dict["prev_logprobs"]
 
+                    if self.cfg.algorithm.adv_type == "opd":
+                        # VLA-OPD: frozen teacher scores the SAME actions the student executed
+                        # (forward_inputs holds the rollout action tokens); the reverse-KL
+                        # log-ratio is the advantage (detached -> constant reward).
+                        with torch.no_grad(), self.amp_context:
+                            teacher_out = self.teacher_model(
+                                forward_inputs=forward_inputs,
+                                compute_logprobs=True,
+                                use_cache=False,
+                                **kwargs,
+                            )
+                        t_lp = teacher_out["logprobs"].detach()
+                        # per-token reverse-KL -> aggregate to per-chunk (num_action_chunks) so it
+                        # matches RLinf's action-granularity advantages. logprobs are
+                        # [B, num_action_chunks * action_dim]; the loss preprocessing reduces
+                        # logprobs over action_dim, and expects advantages already at [B, num_action_chunks].
+                        rkl = (t_lp - prev_logprobs).detach()  # [B, chunks*action_dim]
+                        sad = self.cfg.actor.model.get("action_dim", 7)
+                        # MEAN over the action_dim (not sum) -> per-chunk RKL, avoids one outlier
+                        # token dominating the whole chunk's advantage.
+                        adv = rkl.reshape(rkl.shape[0], -1, sad).mean(dim=-1)  # [B, chunks]
+                        # STANDARDIZE the advantage (masked) — the EmbodiedFSDPActor path has no
+                        # normalize_advantages, so raw RKL gave grad_norm 200-670 -> divergence.
+                        # Bring it to ~O(1) so PPO updates are stable.
+                        if self.cfg.algorithm.get("normalize_advantages", False):
+                            m = (loss_mask.to(adv.dtype) if loss_mask is not None
+                                 else torch.ones_like(adv))
+                            cnt = m.sum().clamp_min(1.0)
+                            mean = (adv * m).sum() / cnt
+                            var = (((adv - mean) ** 2) * m).sum() / cnt
+                            adv = ((adv - mean) / (var.sqrt() + 1e-6)) * m
+                        advantages = adv
+                        opd_gap = rkl.mean().item()  # mean(log pi_tea - log pi_stu) on executed actions
+                        # DIFFERENTIABLE on-policy distillation (pi0 op_distill analog): directly
+                        # minimize KL(student||teacher) over the 256 action bins on the student's
+                        # rollout states. Teacher detached (frozen); student side carries gradient.
+                        # This realizes OPD's reverse-KL objective as a DIFFERENTIABLE loss (GKD-style),
+                        # NOT the REINFORCE/advantage route (which wouldn't converge here).
+                        if "action_logits" in output_dict and "action_logits" in teacher_out:
+                            ls = torch.log_softmax(output_dict["action_logits"].float(), dim=-1)
+                            lt = torch.log_softmax(
+                                teacher_out["action_logits"].float().detach(), dim=-1
+                            )
+                            # diagnostic: reverse KL(student||teacher) (comparable across runs)
+                            opd_kl = (ls.exp() * (ls - lt)).sum(dim=-1).detach().mean().item()
+                            # LOSS direction (distill_kl):
+                            #   forward  = KL(teacher||student), teacher-weighted, MODE-COVERING
+                            #     (student covers teacher's good actions without deleting its own ->
+                            #      FORGETS LESS; matches pi0 velocity-MSE that worked).
+                            #   reverse  = KL(student||teacher), MODE-SEEKING (zero-forces student
+                            #      onto teacher's OOD flatness -> catastrophic forgetting; what failed).
+                            _dkl = self.cfg.algorithm.get("distill_kl", "forward")
+                            if _dkl == "reverse":
+                                kl_tok = (ls.exp() * (ls - lt)).sum(dim=-1)
+                            elif _dkl == "jsd":
+                                # Generalized JSD (GKD, verified recommendation): beta->0 = forward
+                                # (mode-covering), beta->1 = reverse; bounded by log2 so NO off-support
+                                # blow-up, and closed-form so NO dropped state-visitation bias / no
+                                # REINFORCE variance. Small beta = the weak-student sweet spot.
+                                beta = float(self.cfg.algorithm.get("jsd_beta", 0.3))
+                                pt = lt.exp()
+                                ps = ls.exp()
+                                m = (beta * pt + (1.0 - beta) * ps).clamp_min(1e-8)
+                                lm = m.log()
+                                kl_tok = (
+                                    beta * (pt * (lt - lm)).sum(dim=-1)
+                                    + (1.0 - beta) * (ps * (ls - lm)).sum(dim=-1)
+                                )
+                            else:
+                                pt = lt.exp()  # teacher probs (detached)
+                                kl_tok = (pt * (lt - ls)).sum(dim=-1)  # forward KL, grad via ls
+                            # CONFIDENCE FILTER (kit): down-weight tokens where the TEACHER itself is
+                            # uncertain (high entropy = OOD / off-support state) so we don't distill the
+                            # teacher's garbage on the weak student's own drifted states.
+                            _conf_tau = float(self.cfg.algorithm.get("distill_conf_tau", 0.0))
+                            if _conf_tau > 0.0:
+                                with torch.no_grad():
+                                    pt_d = lt.exp()
+                                    t_ent = -(pt_d * lt).sum(dim=-1)  # teacher entropy per token
+                                    ent_max = torch.log(
+                                        torch.tensor(float(pt_d.shape[-1]), device=pt_d.device)
+                                    )
+                                    conf_w = (1.0 - t_ent / ent_max).clamp_min(0.0).pow(_conf_tau)
+                                kl_tok = kl_tok * conf_w
+                            if loss_mask is not None:
+                                # loss_mask is per-chunk [B, chunks]; expand to per-token to mask kl_tok
+                                mtok = (
+                                    loss_mask.to(kl_tok.dtype)
+                                    .unsqueeze(-1)
+                                    .expand(-1, -1, sad)
+                                    .reshape(kl_tok.shape[0], -1)
+                                )
+                                opd_distill_loss = (kl_tok * mtok).sum() / mtok.sum().clamp_min(1.0)
+                            else:
+                                opd_distill_loss = kl_tok.mean()
+
                     kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
                         "logprob_type": self.cfg.algorithm.logprob_type,
@@ -1473,7 +1622,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "critic_warmup": self.optimizer_steps
                         < self.critic_warmup_steps,
                     }
-                    loss, metrics_data = policy_loss(**kwargs)
+                    if (
+                        self.cfg.algorithm.adv_type == "opd"
+                        and self.cfg.algorithm.get("opd_mode", "distill") == "distill"
+                        and opd_distill_loss is not None
+                    ):
+                        # differentiable KL-distillation: minimize KL(student||teacher) directly,
+                        # skip the PPO/REINFORCE loss entirely (pi0 op_distill style).
+                        loss = opd_distill_loss
+                        metrics_data = {
+                            "actor/distill_loss": opd_distill_loss.detach().item()
+                        }
+                    else:
+                        loss, metrics_data = policy_loss(**kwargs)
+
+                    if opd_kl is not None:
+                        metrics_data["actor/opd_kl_stu_tea"] = opd_kl
+                    if opd_gap is not None:
+                        metrics_data["actor/opd_gap_raw"] = opd_gap
 
                     entropy_loss = torch.tensor(
                         0.0, device=Worker.torch_platform.current_device()

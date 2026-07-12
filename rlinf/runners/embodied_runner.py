@@ -15,6 +15,7 @@
 import logging
 import os
 import queue
+import shutil
 import threading
 import time
 from collections import defaultdict
@@ -90,6 +91,13 @@ class EmbodiedRunner:
         # the step here is GRPO step
         self.global_step = 0
 
+        # best-by-train-SR checkpoint tracking. Overwrites a single dir
+        # `checkpoints/best/` whenever env/success_at_end clears the prior
+        # best by more than `best_ckpt_min_gain` (default 0.02). Disable via
+        # runner.save_best_by_sr=False.
+        self.best_train_sr = -1.0
+        self.best_save_step = -1
+
         # compute `max_steps`
         self.set_max_steps()
 
@@ -156,6 +164,31 @@ class EmbodiedRunner:
         )
         self.actor.load_checkpoint(actor_checkpoint_path).wait()
         self.global_step = int(resume_dir.split("global_step_")[-1])
+
+        # Restore best-ckpt tracker sidecar so resumed runs don't overwrite
+        # the existing best/ with a lower-SR step. Sidecar = <ckpts_dir>/best/sr.txt
+        # and step.txt, written by _save_checkpoint when tag='best'.
+        best_sr_file = os.path.join(
+            os.path.dirname(resume_dir), "best", "sr.txt"
+        )
+        best_step_file = os.path.join(
+            os.path.dirname(resume_dir), "best", "step.txt"
+        )
+        if os.path.exists(best_sr_file):
+            try:
+                with open(best_sr_file) as f:
+                    self.best_train_sr = float(f.read().strip())
+                if os.path.exists(best_step_file):
+                    with open(best_step_file) as f:
+                        self.best_save_step = int(f.read().strip())
+                self.logger.info(
+                    f"[best-ckpt] restored best_train_sr={self.best_train_sr:.4f} "
+                    f"@ step {self.best_save_step} from sidecar."
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"[best-ckpt] sidecar restore failed: {e}; starting fresh."
+                )
 
     def update_rollout_weights(self):
         rollout_handle: Handle = self.rollout.sync_model_from_actor()
@@ -377,6 +410,31 @@ class EmbodiedRunner:
             ]
             env_metrics = compute_evaluate_metrics(env_results_list)
             env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
+
+            # Best-by-train-SR ckpt: save when env/success_at_end clears prior
+            # peak by `best_ckpt_min_gain` (default 0.02). Disable with
+            # runner.save_best_by_sr=False. Periodic save_interval snapshots
+            # still happen alongside (controlled by runner.save_interval above).
+            if self.cfg.runner.get("save_best_by_sr", True):
+                # During training rollouts, env/success_at_end is only emitted
+                # when env.train.ignore_terminations=True (eval-only by default).
+                # Fall back to env/success_once which is always emitted and
+                # equals env/return under the binary success reward used here.
+                cur_sr = float(env_metrics.get("env/success_at_end", -1.0))
+                if cur_sr < 0:
+                    cur_sr = float(env_metrics.get("env/success_once", -1.0))
+                # No min_gain threshold (was 0.02). Use >= so that ties also
+                # overwrite — when SR plateaus at e.g. 1.0 for multiple steps,
+                # the LAST plateau step is kept as best.
+                if cur_sr >= self.best_train_sr:
+                    self.logger.info(
+                        f"[best-ckpt] new best SR {cur_sr:.4f} "
+                        f"(prev {self.best_train_sr:.4f}) @ step "
+                        f"{self.global_step}; saving."
+                    )
+                    self.best_train_sr = cur_sr
+                    self.best_save_step = self.global_step
+                    self._save_checkpoint(tag="best")
             ranked_env_results = [
                 {"rank": rank, "env": rank_metrics}
                 for rank, rank_metrics in enumerate(env_results)
@@ -464,16 +522,36 @@ class EmbodiedRunner:
         self.log_queue.join()  # Wait for all queued logs to be processed
         self.log_thread.join(timeout=1.0)
 
-    def _save_checkpoint(self):
-        self.logger.info(f"Saving checkpoint at step {self.global_step}.")
+    def _save_checkpoint(self, tag: str | None = None):
+        # tag=None: periodic snapshot under checkpoints/global_step_<N>/
+        # tag="best" (or other): overwrite checkpoints/<tag>/, record step.
+        if tag is None:
+            subdir = f"checkpoints/global_step_{self.global_step}"
+            self.logger.info(f"Saving checkpoint at step {self.global_step}.")
+        else:
+            subdir = f"checkpoints/{tag}"
+            self.logger.info(
+                f"Saving '{tag}' checkpoint (overwrite) at step "
+                f"{self.global_step}."
+            )
         base_output_dir = os.path.join(
             self.cfg.runner.logger.log_path,
             self.cfg.runner.logger.experiment_name,
-            f"checkpoints/global_step_{self.global_step}",
+            subdir,
         )
         actor_save_path = os.path.join(base_output_dir, "actor")
+        if tag is not None and os.path.exists(actor_save_path):
+            shutil.rmtree(actor_save_path)
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        if tag is not None:
+            with open(os.path.join(base_output_dir, "step.txt"), "w") as f:
+                f.write(f"{self.global_step}\n")
+            # Sidecar: SR value so resumed runs can restore best_train_sr
+            # tracker (otherwise resume defaults to -1.0 and overwrites best).
+            if tag == "best":
+                with open(os.path.join(base_output_dir, "sr.txt"), "w") as f:
+                    f.write(f"{self.best_train_sr}\n")
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1

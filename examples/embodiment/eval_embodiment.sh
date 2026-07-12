@@ -4,8 +4,9 @@ export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
 
-export MUJOCO_GL="osmesa"
-export PYOPENGL_PLATFORM="osmesa"
+# respect a pre-set MUJOCO_GL (e.g. egl for GPU render via gpu_render_env.sh); default osmesa (CPU)
+export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
+export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-osmesa}"
 export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
 
 # Base path to the BEHAVIOR dataset, which is the BEHAVIOR-1k repo's dataset folder
@@ -56,6 +57,6 @@ echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
 mkdir -p "${LOG_DIR}"
-CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
+CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR} ${@:3}"
 echo ${CMD}
 ${CMD} 2>&1 | tee ${MEGA_LOG_FILE}

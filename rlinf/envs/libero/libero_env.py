@@ -425,6 +425,13 @@ class LiberoEnv(gym.Env):
 
         if not self.cfg.is_eval:
             self._generator_ordered.shuffle(reset_state_ids)
+        elif self.cfg.get("eval_shuffle_for_task_coverage", False):
+            # Opt-in: default eval order is np.arange(total), so reshape row 0 holds
+            # consecutive IDs [0..num_group-1] which all land in task 0
+            # (cumsum_trial_id_bins puts task 0 at [0, trials_per_task_0)). For
+            # bank-collection runs where the bank must span all tasks within a single
+            # batch, shuffle deterministically with cfg.seed for reproducibility.
+            np.random.default_rng(seed=self.cfg.seed).shuffle(reset_state_ids)
 
         # Ensure we have enough IDs for all processes by tiling if needed
         if len(reset_state_ids) < self.total_num_processes:

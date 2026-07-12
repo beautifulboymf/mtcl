@@ -572,5 +572,12 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             "entropy": entropy,
             "values": values,
         }
+        if compute_logprobs and kwargs.get("return_action_logits", False):
+            # 256 action-bin logits (temperature-scaled, masked). NOT detached: the student
+            # side needs gradient for the differentiable KL-distillation loss. (The teacher
+            # forward runs under torch.no_grad(), so its logits carry no grad regardless.)
+            result["action_logits"] = action_logits[
+                ..., self.vocab_size - self.config.n_action_bins : self.vocab_size
+            ]
 
         return result

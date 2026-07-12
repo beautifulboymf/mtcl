@@ -253,11 +253,85 @@ def get_model(cfg: DictConfig):
                 SupportedModel.OPENPI,
                 SupportedModel.CFG_MODEL,
             ):
-                module_to_lora = model.paligemma_with_expert.paligemma
-                module_to_lora = get_peft_model(module_to_lora, lora_config)
-                tag_vlm_subtree(model, False)
-                tag_vlm_subtree(module_to_lora, True)
-                model.paligemma_with_expert.paligemma = module_to_lora
+                # Flexible LoRA targeting via RLINF_LORA_TARGET (default 'vlm' = ORIGINAL behavior,
+                # byte-identical: get_peft_model on the VLM submodule, expert full-FT).
+                #   'vlm'    -> (unchanged) LoRA on paligemma submodule.
+                #   'expert' -> LoRA on the ACTION EXPERT (gemma_expert) + VLM frozen.
+                #   'both'   -> LoRA on BOTH paligemma and gemma_expert.
+                # For expert/both we use peft inject_adapter_in_model (IN-PLACE injection) instead of
+                # get_peft_model, so the top model stays a pi0 (GAVA shim + pi0's manual layer access
+                # `gemma_expert.model.layers` keep working). Any module NOT getting LoRA is FROZEN.
+                import os as _os, sys as _sys
+                _lt = _os.environ.get("RLINF_LORA_TARGET", "vlm").lower()
+                if _lt == "vlm":
+                    module_to_lora = model.paligemma_with_expert.paligemma
+                    module_to_lora = get_peft_model(module_to_lora, lora_config)
+                    tag_vlm_subtree(model, False)
+                    tag_vlm_subtree(module_to_lora, True)
+                    model.paligemma_with_expert.paligemma = module_to_lora
+                else:
+                    from peft import inject_adapter_in_model
+
+                    _do_vlm = _lt in ("both",)
+                    _do_exp = _lt in ("expert", "both")
+                    if _do_vlm:
+                        inject_adapter_in_model(
+                            lora_config, model.paligemma_with_expert.paligemma
+                        )
+                    if _do_exp:
+                        inject_adapter_in_model(
+                            lora_config, model.paligemma_with_expert.gemma_expert
+                        )
+                    # freeze EVERYTHING, then re-enable ONLY the injected LoRA params -> non-LoRA
+                    # modules (e.g. VLM when target=expert) end up frozen, LoRA params trainable.
+                    for _p in model.parameters():
+                        _p.requires_grad_(False)
+                    _ntr = 0
+                    for _n, _p in model.named_parameters():
+                        if "lora_" in _n:
+                            _p.requires_grad_(True)
+                            _ntr += _p.numel()
+                    # Do NOT separately per-leaf-wrap the LoRA leaves (set _to_lora=False
+                    # everywhere): with use_orig_params=True the transformer-layer wrap policy
+                    # wraps each decoder layer as ONE flat-param holding both the frozen base and
+                    # the trainable LoRA params, and use_orig_params handles the mixed requires_grad.
+                    # Separately wrapping the LoRA leaves (as the VLM path does) led to an FSDP
+                    # `_writeback_orig_params` shape error on the frozen base of the LoRA'd expert.
+                    tag_vlm_subtree(model, False)
+                    # BUGFIX (bf16 LoRA rounding): the LoRA'd module was cast to bf16 before
+                    # injection, so lora_A/B are bf16 and AdamW updates < bf16 ULP (~6e-5 near 0.01)
+                    # get rounded away -> LoRA stalls at ~0.01, model ~= base. Cast the WHOLE LoRA'd
+                    # module (frozen base + trainable LoRA) to fp32 so the FSDP flat param is uniform
+                    # fp32 and the optimizer steps at full precision (fp32 master). Gated by env
+                    # (default off -> byte-identical to prior behavior for other runs).
+                    if _os.environ.get("RLINF_EXPERT_FP32", "0") == "1":
+                        import torch as _torch
+                        # Cast ONLY the action-expert's transformer DECODER LAYERS to fp32 (that is
+                        # where all the injected LoRA lives: q/k/v/o/gate/up/down_proj). Each
+                        # GemmaDecoderLayer is its own FSDP unit -> becomes a uniform-fp32 flat param;
+                        # the VLM layers + all ROOT-level params (embeds, norms, action heads) stay
+                        # bf16, so the ROOT flat param stays uniform bf16 (no flatten ValueError) and
+                        # we avoid doubling the whole model's memory (only ~300M expert params -> fp32).
+                        # Pair with actor.model.precision=bf16 (bf16 compute, fp32 stored = optimizer
+                        # master) so tiny updates accumulate at full precision (fixes bf16 rounding).
+                        _n_fp32 = 0
+                        if _do_exp:
+                            for _lyr in model.paligemma_with_expert.gemma_expert.model.layers:
+                                _lyr.to(_torch.float32)
+                                _n_fp32 += 1
+                        if _do_vlm:
+                            for _lyr in model.paligemma_with_expert.paligemma.model.language_model.layers:
+                                _lyr.to(_torch.float32)
+                                _n_fp32 += 1
+                        _sys.stderr.write(
+                            f"[lora] RLINF_EXPERT_FP32=1 -> cast {_n_fp32} expert/vlm decoder layers to fp32 "
+                            "(fp32 master weights on LoRA'd layers; root stays bf16; fixes bf16 update-rounding)\n"
+                        )
+                    _sys.stderr.write(
+                        f"[lora] RLINF_LORA_TARGET={_lt} -> inject LoRA "
+                        f"(vlm={_do_vlm} expert={_do_exp}); non-LoRA modules FROZEN; "
+                        f"trainable LoRA params={_ntr}; per-leaf LoRA wrap DISABLED (transformer-wrap + use_orig_params)\n"
+                    )
             else:
                 model = get_peft_model(model, lora_config)
         else:
@@ -266,6 +340,19 @@ def get_model(cfg: DictConfig):
         if hasattr(model, "value_head"):
             for param in model.value_head.parameters():
                 param.requires_grad = True
+
+    import os as _osfp
+
+    if _osfp.environ.get("RLINF_MODEL_FP32", "0") == "1":
+        # Cast the ENTIRE pi0 model to fp32 (uniform dtype). to_bfloat16(..."float32") only touched
+        # paligemma_with_expert; the action heads (state_proj / action_in_proj / action_out_proj /
+        # action_time_mlp) live on the top pi0 model and stayed bf16 -> fp32 activation × bf16 weight
+        # mismatch in state_proj_func. model.float() makes every param uniform fp32 (fp32 master;
+        # pair with actor.model.precision=fp32 for uniform fp32 compute -> no dtype boundary anywhere).
+        model.float()
+        import sys as _sysfp
+
+        _sysfp.stderr.write("[lora] RLINF_MODEL_FP32=1 -> whole pi0 model cast to fp32 (uniform)\n")
 
     return model
 

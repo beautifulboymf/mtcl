@@ -121,6 +121,32 @@ def compute_grpo_advantages(
     return advantages, None
 
 
+@register_advantage("opd")
+def compute_opd_advantages(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    **kwargs,
+):
+    """VLA-OPD (arXiv 2603.26666) on-policy distillation advantage.
+
+    The per-token reverse-KL reward r_t = log pi_teacher(a_t) - log pi_student(a_t)
+    (already detached, assembled in the actor) is used DIRECTLY as the per-token
+    advantage — no group-relative normalization (paper: "raw reverse-KL reward
+    directly as the advantage signal"). Optional per-token baseline via
+    algorithm.opd_center to reduce REINFORCE variance (off by default = faithful).
+
+    Args:
+        rewards (torch.Tensor): per-token RKL reward, shape [B, T] (matches loss_mask).
+        loss_mask (torch.Tensor): valid action-token mask, shape [B, T].
+    """
+    advantages = rewards.to(loss_mask.device) * loss_mask
+    if kwargs.get("opd_center", False):
+        denom = loss_mask.sum().clamp_min(1.0)
+        mean = advantages.sum() / denom
+        advantages = (rewards.to(loss_mask.device) - mean) * loss_mask
+    return advantages, None
+
+
 @register_advantage("grpo_dynamic")
 def compute_grpo_dynamic_advantages(
     rewards: torch.Tensor,
