@@ -29,6 +29,29 @@ teacher. Config: **`libero_130full_opd_fromsft_2gpu.yaml`** (student = 130-Base-
 over the first 3 steps (toward the teacher's ~0.97) — OPD distillation works at full-130 scale, not just
 single-suite. (10 steps is enough to see the rising trajectory; post-hoc 4-suite eval confirms.)
 
+### Scaled-up 20-step run + post-hoc eval
+
+The 3-step `fromsft` run gave only ~1-2 rollouts/task (signal too sparse). We scaled up in
+**`libero_130full_opd_big_2gpu.yaml`** (`total_num_envs 32→48`, `rollout_epoch 2→4`, `max_steps 10→20`;
+same student/teacher/norm/rank). The step-20 checkpoint was converted to a merged HF model and evaluated
+post-hoc (50 env/suite, GPU render) on 4 representative suites:
+
+| Suite | success_once (solved at any point) | success_at_end (still solved at t=512) |
+|---|---|---|
+| Object     | 1.00 | 1.00 |
+| Long (10)  | 0.92 | 0.90 |
+| Goal       | 0.60 | 0.30 |
+| Spatial    | 1.00 | 0.20 |
+| **avg**    | **0.88** | **0.60** |
+
+`success_once` = solved at any point in the episode; `success_at_end` = still in the success state at the
+final step (eval runs the full 512 steps with `ignore_terminations: True`). Object/Long stay solved once
+achieved; Spatial/Goal often solve-then-drift. **NOTE:** this is the absolute post-distillation level — a
+matched before/after (the same model *pre*-OPD, evaluated the same way) is still needed to attribute each
+suite's number to real gain vs forgetting. Run the 4-suite eval with
+`opd_distill/scripts/eval_step20_4suite.sh` (sequential, 50 env, GPU2, EGL render; edit the checkpoint
+path inside).
+
 ## The 3 make-or-break factors
 
 1. **Norm alignment (crux).** Student and teacher must share the **same `unnorm_key`**. In
@@ -91,7 +114,8 @@ bash examples/embodiment/eval_embodiment.sh libero_object_g7_eval LIBERO \
 - `rlinf/models/__init__.py` — OpenVLA-OFT LoRA config (rank/alpha/target_modules).
 - `rlinf/models/embodiment/openvla_oft/rlinf/openvla_oft_action_model.py`, `rlinf/runners/embodied_runner.py`, `rlinf/envs/libero/libero_env.py`, `examples/embodiment/eval_embodiment.sh`.
 
-**Experiment configs:** `examples/embodiment/config/libero_object_opd_faithful{,130,BASE}_2gpu.yaml`
-and the per-suite eval configs `libero_{object,spatial,goal,10}_{g7,grpo_openvlaoft}_eval.yaml`.
+**Experiment configs:** `examples/embodiment/config/libero_object_opd_faithful{,130,BASE}_2gpu.yaml`,
+the 130-task full-OPD configs `libero_130full_opd_{fromsft,big}_2gpu.yaml` (`big` = the 20-step run),
+and the per-suite eval configs `libero_{object,spatial,goal,10}_{g2,g7,grpo_openvlaoft}_eval.yaml`.
 
-**Scripts:** `opd_distill/scripts/{run_opd_train_egl.sh, convert_oft_lora_ckpt.py, convert_oft_lora_ckpt.sh}`.
+**Scripts:** `opd_distill/scripts/{run_opd_train_egl.sh, convert_oft_lora_ckpt.py, convert_oft_lora_ckpt.sh, eval_step20_4suite.sh}`.
