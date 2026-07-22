@@ -108,6 +108,24 @@
 
 ## 进度记录(execution 时更新)
 
-- 状态:**Stage 0 起步**(2026-07-22)。
+**2026-07-22 自主执行:**
+- **Stage 0 基线**(GPU7,eval RUNNING):BASE(130-Base-Lora,is_lora=False)object-std `success_at_end=0.64` ✅ → 确认 is_lora=False 加载=130 通才(非裸 base),基线设置正确,base 锚有效。spatial/goal/long 顺序跑中 → `outputs/dualkl/baseline_BASE/`。
+- **Stage 1a infra 完成**(编译通过):
+  - `fsdp_actor_worker.py`:`_load_base_model`(冻结 base,is_lora=False,默认 = 学生 model_path)+ init 处 `anchor_lambda>0` 时加载;OPD 块内加 anchor 项 `g(H_base)·D_KL(p_B‖p_θ)`(forward-KL/mode-covering,熵门控);loss 组装加 `+anchor_lambda·anchor_loss`;metrics `actor/anchor_loss`。全 env 开关默认 0 → 现有 run 字节不变。
+  - config `libero_object_dualkl_2gpu.yaml`(= faithful130 + `anchor_lambda/anchor_gate/anchor_gate_tau` + `base_model_path/base_unnorm_key`,placement 4-5)。
+  - **smoke RUNNING**(GPU4-5,1步/micro2/rollout1):验 base 加载 + anchor_loss 非0 + 无 OOM。
+- **基线脚本备好**:`merge_wise.py`(WiSE-FT/RETAIN α 插值)、`merge_lines.py`(reverse-LiNeS 深度反向 ramp)、`dualkl_pro_eval.sh`(OFT PRO:liberopro PYTHONPATH + LIBERO_SUFFIX + prompt-fix)、`dualkl_baseline_std.sh`。
+- **OFT PRO recipe**(记牢):`PYTHONPATH=dev/scripts/pro_prompt_fix_inject:dev/envs/rlinf-openpi/libero_pro:$PYTHONPATH` + `LIBERO_TYPE=pro LIBERO_SUFFIX=<object|swap|lan>`(SUFFIX 覆盖 eval_embodiment.sh 强制的 =all)。
+
+**★ 指标纠正(用户 2026-07-22):主用 `success_once`**(领域标准,与 VLA-OPD/RETAIN 可比),at_end 仅补充诊断。GenRet 用 once。**BASE once 分母(已测全):object 0.64 / spatial 0.66 / goal 0.40 / long 0.72(avg 0.605)。** PRO once 分母跑中(GPU7,isolated 6530)。
+
+**★ 两个 infra bug 已修(smoke 迭代):**
+1. **ray 冲突**:RLinf `ray.init(address="auto")` 连任何现有集群 → 并发 train+eval 撞。解:`run_iso_train.sh`/`run_iso.sh`(私有 ray head:唯一 port+RAY_TMPDIR + `export RAY_ADDRESS`,清理只 targeted pkill,绝不 `ray stop`)。每个作业独占 ray → 可安全并发。
+2. **anchor KeyError**:base forward 要 `compute_logprobs=True` 才产 `action_logits`(我原写 False)。已修。
+
+**当前(smoke3 修复后运行中 GPU4-5 iso-6521;PRO 基线 GPU7 iso-6530):** 等 smoke3 的 `actor/anchor_loss` 非0 确认 infra 全通。
+
+**下一步(smoke 过后):** Stage 1b — 训 plain-OPD(anchor_lambda=0)+ dual-KL(=1),convert,merge 基线,全 post-hoc eval(std+PRO),GenRet(once)+Pareto。**每个训练/eval 作业都用 iso wrapper 独占 ray、不同 port。**
+
 - 空闲卡快照:启动每步前 `nvidia-smi` 现查。
 - checkpoint 清理:convert 后即删 DCP;废弃 arm 整目录删(删前 df + 记录)。

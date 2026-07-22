@@ -1034,6 +1034,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.cfg.actor.get("use_teacher_distill", False):
             self._load_teacher_model()
 
+        # dual-KL BASE anchor: frozen copy of the base/generalist (= student init) whose
+        # broad behavior we preserve via a mode-covering forward-KL term (data-free).
+        # Only loaded when the anchor is active (anchor_lambda>0), so default runs unchanged.
+        self.base_model = None
+        if float(self.cfg.algorithm.get("anchor_lambda", 0.0)) > 0.0:
+            self._load_base_model()
+
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
@@ -1066,6 +1073,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.log_info(
             f"[VLA-OPD] loaded frozen teacher from {self.cfg.actor.teacher_model_path}"
         )
+
+    def _load_base_model(self) -> None:
+        """Dual-KL anchor: frozen BASE (= student's init / the generalist) loaded full
+        (non-LoRA), eval + requires_grad_(False). Only SCORES anchor states; never acts.
+        Defaults to the student's own model_path when actor.base_model_path is unset."""
+        from copy import deepcopy
+
+        from omegaconf import open_dict
+
+        bcfg = deepcopy(self.cfg.actor.model)
+        with open_dict(bcfg):
+            bcfg.model_path = self.cfg.actor.get(
+                "base_model_path", self.cfg.actor.model.model_path
+            )
+            bcfg.is_lora = False
+            bcfg.lora_path = None
+            _buk = self.cfg.actor.get("base_unnorm_key", None)
+            if _buk:
+                bcfg.unnorm_key = _buk
+        self.base_model = get_model(bcfg)
+        self.base_model.eval()
+        for p in self.base_model.parameters():
+            p.requires_grad_(False)
+        self.log_info(f"[dual-KL] loaded frozen BASE anchor from {bcfg.model_path}")
 
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
@@ -1464,6 +1495,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     opd_kl = None   # KL(student||teacher) diagnostic, filled in the opd block
                     opd_gap = None  # mean(teacher_lp - student_rollout_lp) on executed actions
                     opd_distill_loss = None  # differentiable KL-distill loss (opd_mode=distill)
+                    anchor_loss = None  # dual-KL BASE anchor (forward-KL to frozen base)
 
                     kwargs = {}
                     if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -1600,6 +1632,59 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             else:
                                 opd_distill_loss = kl_tok.mean()
 
+                        # ---- dual-KL BASE anchor (data-free) ----
+                        # mode-COVERING forward-KL to the frozen base on the SAME rollout
+                        # states, entropy-gated by base confidence: preserve base's broad
+                        # support while the task term learns. Default anchor_lambda=0 -> off.
+                        _alam = float(self.cfg.algorithm.get("anchor_lambda", 0.0))
+                        if (
+                            _alam > 0.0
+                            and getattr(self, "base_model", None) is not None
+                            and "action_logits" in output_dict
+                        ):
+                            with torch.no_grad(), self.amp_context:
+                                base_out = self.base_model(
+                                    forward_inputs=forward_inputs,
+                                    compute_logprobs=True,  # needed so action_logits is produced
+                                    use_cache=False,
+                                    **kwargs,
+                                )
+                            lb = torch.log_softmax(
+                                base_out["action_logits"].float().detach(), dim=-1
+                            )
+                            ls_a = torch.log_softmax(
+                                output_dict["action_logits"].float(), dim=-1
+                            )
+                            pb = lb.exp()
+                            # forward-KL D_KL(p_base || p_student): student must COVER base support
+                            a_tok = (pb * (lb - ls_a)).sum(dim=-1)
+                            # entropy gate g(H_base): low_ent = preserve harder where base is confident
+                            _agate = self.cfg.algorithm.get("anchor_gate", "none")
+                            _atau = float(self.cfg.algorithm.get("anchor_gate_tau", 1.0))
+                            if _agate in ("low_ent", "high_ent"):
+                                with torch.no_grad():
+                                    b_ent = -(pb * lb).sum(dim=-1)
+                                    _emax = torch.log(
+                                        torch.tensor(float(pb.shape[-1]), device=pb.device)
+                                    )
+                                    conf = (1.0 - b_ent / _emax).clamp(0.0, 1.0)
+                                    gate = (
+                                        conf.pow(_atau)
+                                        if _agate == "low_ent"
+                                        else (1.0 - conf).pow(_atau)
+                                    )
+                                a_tok = a_tok * gate
+                            if loss_mask is not None:
+                                _amt = (
+                                    loss_mask.to(a_tok.dtype)
+                                    .unsqueeze(-1)
+                                    .expand(-1, -1, sad)
+                                    .reshape(a_tok.shape[0], -1)
+                                )
+                                anchor_loss = (a_tok * _amt).sum() / _amt.sum().clamp_min(1.0)
+                            else:
+                                anchor_loss = a_tok.mean()
+
                     kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
                         "logprob_type": self.cfg.algorithm.logprob_type,
@@ -1630,9 +1715,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         # differentiable KL-distillation: minimize KL(student||teacher) directly,
                         # skip the PPO/REINFORCE loss entirely (pi0 op_distill style).
                         loss = opd_distill_loss
+                        if anchor_loss is not None:
+                            loss = loss + float(
+                                self.cfg.algorithm.get("anchor_lambda", 0.0)
+                            ) * anchor_loss
                         metrics_data = {
                             "actor/distill_loss": opd_distill_loss.detach().item()
                         }
+                        if anchor_loss is not None:
+                            metrics_data["actor/anchor_loss"] = anchor_loss.detach().item()
                     else:
                         loss, metrics_data = policy_loss(**kwargs)
 

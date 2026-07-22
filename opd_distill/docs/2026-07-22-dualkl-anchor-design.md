@@ -90,9 +90,10 @@ L_anchor = E_{base rollout} Σ_pos  g(H_pos) · D_KL( p_B ‖ p_θ )
 
 ## 5. 评测协议(命门:防泄漏 + 诚实指标)
 
-**主成功率 = `success_at_end`**(结束时仍保持,跑满 512 步 `ignore_terminations=True`);`success_once` 只作附注(易饱和到 1.0、无区分度——上次 spatial once=1.0/at_end=0.2 的教训)。**全部 ≤50 env、GPU-pin、EGL、safe_run。**
+**主成功率 = `success_once`**(领域标准 —— LIBERO/VLA-OPD/RETAIN 都报 once,为**与文献可比**必须用它;用户明确纠正 2026-07-22)。`success_at_end`(结束仍保持)eval 时一并记录,仅作 solve-then-drift 的**补充诊断**,不作 headline。**全部 ≤50 env、GPU-pin、EGL、safe_run。**
 
-**泛化保留率(主指标):** `GenRet(axis) = SR_πθ(axis) / SR_BASE(axis)`,at_end。1.0=完全保住,<1=遗忘,>1=反涨。
+**泛化保留率(主指标):** `GenRet(axis) = SR_once_πθ(axis) / SR_once_BASE(axis)`。1.0=完全保住,<1=遗忘,>1=反涨。
+BASE once 分母(已测):object 0.64 / spatial 0.66 / goal 0.40 / long 0.72(avg 0.605)。
 
 **两条泛化轴 + 防泄漏:**
 | 轴 | 训练时锚看到? | 评测数据 | 泄漏? |
