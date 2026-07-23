@@ -1,0 +1,143 @@
+# Eval-only：测 RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT 在 libero_spatial 上的 base 成功率。
+# 用 eval_embodied_agent.py 跑（只起 rollout+env，不需要 actor/FSDP）。
+# 单 GPU、osmesa 渲染、不存 video。
+
+defaults:
+  - env/libero_spatial@env.train     # 占位；only_eval 不用，但 validate_cfg 仍会读 schema
+  - env/libero_spatial@env.eval
+  - model/pi0@actor.model
+  - training_backend/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: 6   # 钉到物理 GPU 6（hardware_rank, RLinf 走 pynvml 不读 launcher 的 CUDA_VISIBLE_DEVICES）
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: /share/fanruochen-local/outputs/rlinf-eval/spatial_pi0_sft_baseline
+    project_name: rlinf
+    experiment_name: "libero_spatial_pi0_sft_eval"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1
+  max_steps: -1
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  normalize_advantages: True
+  kl_penalty: kl
+  group_size: 1
+  reward_coef: 1.0
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: token_level
+  update_epoch: 1
+  adv_type: gae
+  loss_type: actor_critic
+  loss_agg_func: "token-mean"
+  kl_beta: 0.0
+  entropy_bonus: 0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+  gamma: 0.99
+  gae_lambda: 0.95
+  filter_rewards: False
+  rewards_lower_bound: 0.1
+  rewards_upper_bound: 0.9
+  sampling_params:
+    do_sample: True
+    temperature_train: 1.0
+    temperature_eval: 0.6
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: False
+  length_params:
+    max_new_token: null
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: "EnvGroup"
+  train:                              # only_eval=True 时不会用，留默认占位
+    total_num_envs: 1
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
+  eval:
+    total_num_envs: 50                # 10 task × 5 trial = 50；可改 100/200 求更稳
+    auto_reset: True
+    ignore_terminations: True
+    max_episode_steps: 240            # 真实 LIBERO episode 长度
+    max_steps_per_rollout_epoch: 240
+    group_size: 1
+    is_eval: True
+    video_cfg:
+      save_video: False               # OSMesa 软渲染慢；先看数字，要看 video 后面再开
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  recompute_logprobs: False
+  unnorm_key: libero_10
+  enable_offload: False
+  pipeline_stage_num: 1
+  model:
+    model_path: /share/fanruochen-local/checkpoints/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 1
+  global_batch_size: 1
+  seed: 42
+  enable_offload: False
+  model:
+    model_path: /share/fanruochen-local/checkpoints/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT
+    num_action_chunks: 5
+    add_value_head: True
+    openpi:
+      detach_critic_input: True
+  optim:
+    lr: 5.0e-6
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 1.0
+    critic_warmup_steps: 0
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

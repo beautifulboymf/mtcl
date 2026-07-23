@@ -1,0 +1,39 @@
+defaults:
+  - model/pi0@model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:REPO_PATH}/examples/embodiment/config
+
+convertor:
+  save_path: /path/to/save
+  merge_lora_weighs: False
+  ckpt_path: /path/to/full_weights.pt
+
+model:
+  model_type: "openpi"
+  model_path: "/path/to/source/RLinf-Pi0-LIBERO-Spatial-Object-Goal-SFT"
+  is_lora: False
+  num_action_chunks: 5
+  num_steps: 4
+  action_dim: 7
+  # Set via env var: True for PPO/critic ckpts, False for GRPO (actor-only).
+  add_value_head: ${oc.decode:${oc.env:RLINF_CONVERT_VALUE_HEAD,'True'}}
+  openpi:
+    detach_critic_input: True
+
+# pi0 model yaml uses interpolations like ${actor.model.num_action_chunks};
+# provide an `actor.model` shim so those resolve when the convertor builds it.
+actor:
+  model:
+    num_action_chunks: ${model.num_action_chunks}
+    num_steps: ${model.num_steps}
+    action_dim: ${model.action_dim}
+    add_value_head: ${model.add_value_head}
+    # GRPO yaml sets this on rollout but model code reads from actor.model
+    # path. Match the actor.model.add_value_head so the convertor builds the
+    # correct architecture.
