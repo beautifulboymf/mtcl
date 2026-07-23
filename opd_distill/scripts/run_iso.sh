@@ -3,6 +3,8 @@
 # never connects to (collides with) another job's cluster. Targeted cleanup only.
 # Usage: ISO_RAY_PORT=6530 run_iso.sh <command...>
 export PYTHONPATH="${PYTHONPATH:-}"; export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+# limit per-worker threads (eval env workers else thread-explode -> load inflation)
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 MUJOCO_NUM_THREADS=1
 source ~/.rlinf-env.sh
 source /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/activate
 RAY_BIN="$(command -v ray)"
