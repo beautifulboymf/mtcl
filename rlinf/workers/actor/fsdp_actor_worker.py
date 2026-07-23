@@ -1038,7 +1038,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # broad behavior we preserve via a mode-covering forward-KL term (data-free).
         # Only loaded when the anchor is active (anchor_lambda>0), so default runs unchanged.
         self.base_model = None
-        if float(self.cfg.algorithm.get("anchor_lambda", 0.0)) > 0.0:
+        if (
+            float(self.cfg.algorithm.get("anchor_lambda", 0.0)) > 0.0
+            or float(self.cfg.algorithm.get("visual_anchor_lambda", 0.0)) > 0.0
+        ):
             self._load_base_model()
 
         if self.enable_offload:
@@ -1496,6 +1499,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     opd_gap = None  # mean(teacher_lp - student_rollout_lp) on executed actions
                     opd_distill_loss = None  # differentiable KL-distill loss (opd_mode=distill)
                     anchor_loss = None  # dual-KL BASE anchor (forward-KL to frozen base)
+                    visual_loss = None  # visual-representation anchor (cosine to base mid-layer)
 
                     kwargs = {}
                     if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -1510,6 +1514,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         kwargs["return_action_logits"] = (
                             self.cfg.algorithm.adv_type == "opd"
                         )
+                        # visual-representation anchor: request mid-layer vision+prompt features
+                        if float(self.cfg.algorithm.get("visual_anchor_lambda", 0.0)) > 0.0:
+                            kwargs["return_mid_features"] = True
+                            kwargs["mid_layer"] = int(
+                                self.cfg.algorithm.get("visual_anchor_layer", 16)
+                            )
                     elif (
                         SupportedModel(self.cfg.actor.model.model_type)
                         == SupportedModel.GR00T
@@ -1632,58 +1642,71 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             else:
                                 opd_distill_loss = kl_tok.mean()
 
-                        # ---- dual-KL BASE anchor (data-free) ----
-                        # mode-COVERING forward-KL to the frozen base on the SAME rollout
-                        # states, entropy-gated by base confidence: preserve base's broad
-                        # support while the task term learns. Default anchor_lambda=0 -> off.
+                        # ---- data-free BASE anchors (action-KL + visual-representation) ----
+                        # (a) action anchor = mode-covering forward-KL to base on rollout states
+                        #     (preserve task behavior); (b) visual anchor = cosine of mid-layer
+                        #     vision+prompt features to base (preserve BROAD OOD generalization).
                         _alam = float(self.cfg.algorithm.get("anchor_lambda", 0.0))
-                        if (
-                            _alam > 0.0
-                            and getattr(self, "base_model", None) is not None
-                            and "action_logits" in output_dict
-                        ):
+                        _vlam = float(self.cfg.algorithm.get("visual_anchor_lambda", 0.0))
+                        if (_alam > 0.0 or _vlam > 0.0) and getattr(
+                            self, "base_model", None
+                        ) is not None:
                             with torch.no_grad(), self.amp_context:
                                 base_out = self.base_model(
                                     forward_inputs=forward_inputs,
-                                    compute_logprobs=True,  # needed so action_logits is produced
+                                    compute_logprobs=True,
                                     use_cache=False,
                                     **kwargs,
                                 )
-                            lb = torch.log_softmax(
-                                base_out["action_logits"].float().detach(), dim=-1
-                            )
-                            ls_a = torch.log_softmax(
-                                output_dict["action_logits"].float(), dim=-1
-                            )
-                            pb = lb.exp()
-                            # forward-KL D_KL(p_base || p_student): student must COVER base support
-                            a_tok = (pb * (lb - ls_a)).sum(dim=-1)
-                            # entropy gate g(H_base): low_ent = preserve harder where base is confident
-                            _agate = self.cfg.algorithm.get("anchor_gate", "none")
-                            _atau = float(self.cfg.algorithm.get("anchor_gate_tau", 1.0))
-                            if _agate in ("low_ent", "high_ent"):
-                                with torch.no_grad():
-                                    b_ent = -(pb * lb).sum(dim=-1)
-                                    _emax = torch.log(
-                                        torch.tensor(float(pb.shape[-1]), device=pb.device)
-                                    )
-                                    conf = (1.0 - b_ent / _emax).clamp(0.0, 1.0)
-                                    gate = (
-                                        conf.pow(_atau)
-                                        if _agate == "low_ent"
-                                        else (1.0 - conf).pow(_atau)
-                                    )
-                                a_tok = a_tok * gate
-                            if loss_mask is not None:
-                                _amt = (
-                                    loss_mask.to(a_tok.dtype)
-                                    .unsqueeze(-1)
-                                    .expand(-1, -1, sad)
-                                    .reshape(a_tok.shape[0], -1)
+                            # (a) ACTION anchor
+                            if (
+                                _alam > 0.0
+                                and "action_logits" in output_dict
+                                and "action_logits" in base_out
+                            ):
+                                lb = torch.log_softmax(
+                                    base_out["action_logits"].float().detach(), dim=-1
                                 )
-                                anchor_loss = (a_tok * _amt).sum() / _amt.sum().clamp_min(1.0)
-                            else:
-                                anchor_loss = a_tok.mean()
+                                ls_a = torch.log_softmax(
+                                    output_dict["action_logits"].float(), dim=-1
+                                )
+                                pb = lb.exp()
+                                a_tok = (pb * (lb - ls_a)).sum(dim=-1)  # forward-KL, mode-covering
+                                _agate = self.cfg.algorithm.get("anchor_gate", "none")
+                                _atau = float(self.cfg.algorithm.get("anchor_gate_tau", 1.0))
+                                if _agate in ("low_ent", "high_ent"):
+                                    with torch.no_grad():
+                                        b_ent = -(pb * lb).sum(dim=-1)
+                                        _emax = torch.log(
+                                            torch.tensor(float(pb.shape[-1]), device=pb.device)
+                                        )
+                                        conf = (1.0 - b_ent / _emax).clamp(0.0, 1.0)
+                                        gate = (
+                                            conf.pow(_atau)
+                                            if _agate == "low_ent"
+                                            else (1.0 - conf).pow(_atau)
+                                        )
+                                    a_tok = a_tok * gate
+                                if loss_mask is not None:
+                                    _amt = (
+                                        loss_mask.to(a_tok.dtype)
+                                        .unsqueeze(-1)
+                                        .expand(-1, -1, sad)
+                                        .reshape(a_tok.shape[0], -1)
+                                    )
+                                    anchor_loss = (a_tok * _amt).sum() / _amt.sum().clamp_min(1.0)
+                                else:
+                                    anchor_loss = a_tok.mean()
+                            # (b) VISUAL anchor: patch-wise cosine of mid-layer features to base
+                            if (
+                                _vlam > 0.0
+                                and "mid_features" in output_dict
+                                and "mid_features" in base_out
+                            ):
+                                fs = output_dict["mid_features"].float()
+                                fb = base_out["mid_features"].float().detach()
+                                cos = torch.nn.functional.cosine_similarity(fs, fb, dim=-1)
+                                visual_loss = (1.0 - cos).mean()
 
                     kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
@@ -1719,11 +1742,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             loss = loss + float(
                                 self.cfg.algorithm.get("anchor_lambda", 0.0)
                             ) * anchor_loss
+                        if visual_loss is not None:
+                            loss = loss + float(
+                                self.cfg.algorithm.get("visual_anchor_lambda", 0.0)
+                            ) * visual_loss
                         metrics_data = {
                             "actor/distill_loss": opd_distill_loss.detach().item()
                         }
                         if anchor_loss is not None:
                             metrics_data["actor/anchor_loss"] = anchor_loss.detach().item()
+                        if visual_loss is not None:
+                            metrics_data["actor/visual_loss"] = visual_loss.detach().item()
                     else:
                         loss, metrics_data = policy_loss(**kwargs)
 

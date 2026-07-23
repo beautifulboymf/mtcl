@@ -62,6 +62,9 @@ algorithm:
   anchor_lambda: 1.0
   anchor_gate: low_ent        # low_ent | high_ent | none  (entropy gate on base confidence)
   anchor_gate_tau: 1.0
+  # ---- visual-representation anchor (preserve BROAD OOD generalization, data-free) ----
+  visual_anchor_lambda: 0.0   # >0 = cosine-align mid-layer vision+prompt features to frozen base
+  visual_anchor_layer: 16
   distill_stage_num: 1
   loss_agg_func: "token-mean"
   kl_beta: 0.0

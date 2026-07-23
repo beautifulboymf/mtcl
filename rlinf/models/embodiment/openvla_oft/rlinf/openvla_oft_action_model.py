@@ -509,7 +509,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )
         multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
 
-        if compute_values:
+        if compute_values or kwargs.get("return_mid_features", False):
             output_hidden_states = True
 
         # Forward pass through language model
@@ -572,6 +572,14 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             "entropy": entropy,
             "values": values,
         }
+        # visual-representation anchor: mid-layer hidden states at the VISION+PROMPT positions
+        # (exclude the trailing action + STOP + space tokens, which SHOULD change during learning).
+        if kwargs.get("return_mid_features", False) and getattr(outputs, "hidden_states", None) is not None:
+            _hs = outputs.hidden_states
+            _ml = int(kwargs.get("mid_layer", len(_hs) // 2))
+            _ml = max(0, min(_ml, len(_hs) - 1))
+            _tail = self.action_dim * self.num_action_chunks + 2  # action + STOP + space
+            result["mid_features"] = _hs[_ml][:, :-_tail, :]  # [B, vision+prompt, D]
         if compute_logprobs and kwargs.get("return_action_logits", False):
             # 256 action-bin logits (temperature-scaled, masked). NOT detached: the student
             # side needs gradient for the differentiable KL-distillation loss. (The teacher
