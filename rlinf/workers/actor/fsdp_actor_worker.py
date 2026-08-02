@@ -1086,7 +1086,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         _tmap = self.cfg.actor.get("teacher_map", None)
         if _tmap:
-            _tmap = dict(OmegaConf.to_container(_tmap, resolve=True))
+            if OmegaConf.is_config(_tmap):
+                _tmap = OmegaConf.to_container(_tmap, resolve=True)
+            _tmap = dict(_tmap)
             self.teacher_models = {}  # unique ckpt path -> model (loaded once)
             self.teacher_suite_to_path = {}  # suite name -> ckpt path (routing table)
             for suite, path in _tmap.items():

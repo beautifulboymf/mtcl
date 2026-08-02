@@ -116,9 +116,13 @@ class LiberoEnv(gym.Env):
         # Applied to TRAINING sampling only (never eval). None -> uniform (unchanged).
         self.suite_sample_weights = cfg.get("suite_sample_weights", None)
         if self.suite_sample_weights is not None:
-            self.suite_sample_weights = dict(
-                OmegaConf.to_container(self.suite_sample_weights, resolve=True)
-            )
+            # ${oc.decode:...} yields a NATIVE python dict (not a DictConfig), so
+            # to_container would reject it; only convert when it really is a config.
+            if OmegaConf.is_config(self.suite_sample_weights):
+                self.suite_sample_weights = OmegaConf.to_container(
+                    self.suite_sample_weights, resolve=True
+                )
+            self.suite_sample_weights = dict(self.suite_sample_weights)
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
