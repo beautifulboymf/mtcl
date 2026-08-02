@@ -67,8 +67,13 @@ for STAGE in $(seq "$STAGE_START" "$STAGE_END"); do
   LOGFILE="$OUT_ROOT/seqcl_stage${STAGE}_${SEQCL_CURRENT_SUITE}.log"
 
   # ---- train this stage under the hard watchdog ----
+  # ionice -c3 (idle IO class) so training + its ray workers yield disk IO to
+  # everything else (sshd stays responsive -> SSH never hangs on our IO). This is
+  # redundant with safe_run's own ionice but guarantees the python process itself
+  # (and inherited children) are idle-classed even if the wrapper's class doesn't
+  # propagate. io_guard is the backstop if a job still jams the device.
   SR_PROC_MAX=800 "$SCRIPTS/safe_run.sh" "$LOGFILE" \
-    "$PY" examples/embodiment/train_embodied_agent.py --config-name "$CONFIG"
+    ionice -c3 "$PY" examples/embodiment/train_embodied_agent.py --config-name "$CONFIG"
   echo "SEQCL_STAGE_${STAGE}_TRAIN_DONE $(date '+%F %T')"
 
   # ---- locate the last DCP ckpt (val disabled -> no 'best', use newest global_step) ----
