@@ -25,7 +25,9 @@ import torch
 from omegaconf.omegaconf import OmegaConf
 
 from rlinf.envs.libero.utils import (
+    expand_active_suites_to_task_ids,
     get_benchmark_overridden,
+    get_libero130_task_id_to_suite,
     get_libero_image,
     get_libero_type,
     get_libero_wrist_image,
@@ -93,6 +95,30 @@ class LiberoEnv(gym.Env):
         self.task_id_filter = cfg.get("task_id_filter", None)
         if self.task_id_filter is not None:
             self.task_id_filter = list(self.task_id_filter)
+
+        # Sequential continual learning (rlinf.algorithms.embodied_seqcl): let a run name
+        # its active suites (e.g. ["libero_object", "libero_spatial"]) instead of raw task
+        # ids. Only valid for the aggregated libero_130 benchmark; expands to the union of
+        # those suites' task ids when task_id_filter was not given explicitly.
+        self.active_suites = cfg.get("active_suites", None)
+        if self.active_suites is not None:
+            self.active_suites = list(self.active_suites)
+        if self.task_id_filter is None and self.active_suites:
+            if str(cfg.task_suite_name).lower() != "libero_130":
+                raise ValueError(
+                    "active_suites requires task_suite_name == 'libero_130' "
+                    f"(got '{cfg.task_suite_name}')"
+                )
+            self.task_id_filter = expand_active_suites_to_task_ids(self.active_suites)
+
+        # Optional per-suite oversampling for rehearsal weighting: the new suite gets more
+        # on-policy data than each old suite ({suite_name: weight}, e.g. new=1.0/old=0.3).
+        # Applied to TRAINING sampling only (never eval). None -> uniform (unchanged).
+        self.suite_sample_weights = cfg.get("suite_sample_weights", None)
+        if self.suite_sample_weights is not None:
+            self.suite_sample_weights = dict(
+                OmegaConf.to_container(self.suite_sample_weights, resolve=True)
+            )
 
         self.ignore_terminations = cfg.ignore_terminations
         self.auto_reset = cfg.auto_reset
@@ -389,6 +415,41 @@ class LiberoEnv(gym.Env):
         else:
             self._valid_reset_state_ids = None
 
+        # Rehearsal weighting: oversample the current suite's reset states relative to old
+        # suites so the new task gets more on-policy data (== more teacher weight in the
+        # averaged OPD loss). TRAINING only; eval keeps uniform coverage. Built once here,
+        # consumed by _get_random_reset_state_ids. None -> uniform (unchanged behavior).
+        self._train_biased_reset_state_ids = None
+        if (
+            not self.cfg.is_eval
+            and getattr(self, "suite_sample_weights", None)
+            and self._valid_reset_state_ids is not None
+        ):
+            self._train_biased_reset_state_ids = self._build_suite_weighted_pool()
+
+    def _build_suite_weighted_pool(self):
+        """Tile ``_valid_reset_state_ids`` so each suite's share of the training sampling
+        pool is proportional to ``suite_sample_weights`` (integer repeats, smallest
+        positive weight -> 1x). Returns None if no active suite has a positive weight."""
+        id_to_suite = get_libero130_task_id_to_suite()
+        task_ids, _ = self._get_task_and_trial_ids_from_reset_state_ids(
+            self._valid_reset_state_ids
+        )
+        weights = [
+            float(self.suite_sample_weights.get(id_to_suite.get(int(t)), 0.0))
+            for t in task_ids
+        ]
+        positive = [w for w in weights if w > 0.0]
+        if not positive:
+            return None
+        min_w = min(positive)
+        pool = []
+        for reset_state_id, w in zip(self._valid_reset_state_ids, weights):
+            reps = int(round(w / min_w)) if w > 0.0 else 0
+            if reps > 0:
+                pool.extend([reset_state_id] * reps)
+        return np.array(pool) if pool else None
+
     def update_reset_state_ids(self):
         if self.cfg.is_eval or self.cfg.use_ordered_reset_state_ids:
             reset_state_ids = self._get_ordered_reset_state_ids(self.num_group)
@@ -407,10 +468,15 @@ class LiberoEnv(gym.Env):
                 (num_reset_states,), dtype=int
             )
         elif self._valid_reset_state_ids is not None:
+            # use the suite-weighted training pool when present (rehearsal oversampling),
+            # else uniform over all valid reset states.
+            pool = self._train_biased_reset_state_ids
+            if pool is None:
+                pool = self._valid_reset_state_ids
             indices = self._generator.integers(
-                low=0, high=len(self._valid_reset_state_ids), size=(num_reset_states,)
+                low=0, high=len(pool), size=(num_reset_states,)
             )
-            reset_state_ids = self._valid_reset_state_ids[indices]
+            reset_state_ids = pool[indices]
         else:
             reset_state_ids = self._generator.integers(
                 low=0, high=self.total_num_group_envs, size=(num_reset_states,)

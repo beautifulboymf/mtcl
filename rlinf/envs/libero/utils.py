@@ -173,3 +173,50 @@ def get_benchmark_overridden(benchmark_name) -> Benchmark:
     # Register for discoverability/help
     benchmark.BENCHMARK_MAPPING["libero_130"] = LIBERO_ALL
     return LIBERO_ALL
+
+
+def get_libero130_task_id_to_suite() -> dict:
+    """Map each ``libero_130`` aggregated task_id -> its origin suite name.
+
+    Mirrors the aggregation in ``get_benchmark_overridden("libero_130")`` EXACTLY (same
+    suite order from ``benchmark.libero_suites``, same de-dup by task name), so the
+    task_id index returned here equals the task_id ``LiberoEnv`` assigns when
+    ``task_suite_name == "libero_130"``. Used to translate suite names into task ids and
+    to weight suites for sequential continual learning (see rlinf.algorithms.embodied_seqcl).
+    """
+    id_to_suite: dict = {}
+    seen: set = set()
+    idx = 0
+    for suite_name in getattr(benchmark, "libero_suites", []):
+        suite_map = benchmark.task_maps.get(suite_name, {})
+        for task_name in suite_map:
+            if task_name not in seen:
+                seen.add(task_name)
+                id_to_suite[idx] = suite_name
+                idx += 1
+    return id_to_suite
+
+
+def get_libero130_suite_to_task_ids() -> dict:
+    """Inverse of :func:`get_libero130_task_id_to_suite`: suite name -> sorted task_ids."""
+    out: dict = {}
+    for tid, suite in get_libero130_task_id_to_suite().items():
+        out.setdefault(suite, []).append(tid)
+    for suite in out:
+        out[suite].sort()
+    return out
+
+
+def expand_active_suites_to_task_ids(active_suites) -> list:
+    """Translate suite names (e.g. ``["libero_object", "libero_spatial"]``) into a sorted,
+    de-duplicated ``task_id_filter`` over the ``libero_130`` benchmark. Unknown suites raise."""
+    suite_to_ids = get_libero130_suite_to_task_ids()
+    ids: list = []
+    for suite in active_suites:
+        if suite not in suite_to_ids:
+            raise ValueError(
+                f"active suite '{suite}' not found in libero_130 "
+                f"(known suites: {sorted(suite_to_ids)})"
+            )
+        ids.extend(suite_to_ids[suite])
+    return sorted(set(ids))

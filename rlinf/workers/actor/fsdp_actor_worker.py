@@ -1041,6 +1041,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if (
             float(self.cfg.algorithm.get("anchor_lambda", 0.0)) > 0.0
             or float(self.cfg.algorithm.get("visual_anchor_lambda", 0.0)) > 0.0
+            or float(self.cfg.algorithm.get("shift_beta", 0.0)) > 0.0
         ):
             self._load_base_model()
 
@@ -1051,31 +1052,64 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._setup_rollout_weight_dst_ranks()
 
     def _load_teacher_model(self) -> None:
-        """VLA-OPD frozen teacher: full (non-LoRA) OpenVLA-OFT loaded from the RL'd
-        teacher ckpt, eval + requires_grad_(False), resident on the training device."""
+        """VLA-OPD frozen teacher(s). Two forms:
+
+          * single  : ``actor.teacher_model_path`` (one teacher for everything).
+          * routed  : ``actor.teacher_map`` = {suite: ckpt_path} (sequential CL). Teachers
+            are DE-DUPLICATED by path, so mapping every suite to the one 130 generalist
+            (the current setup) loads exactly ONE model. Point a suite at its own expert
+            ckpt later to go true multi-teacher -- only the map changes.
+
+        Each teacher is full (non-LoRA), eval + requires_grad_(False), resident on the
+        training device, and only SCORES the student's rollouts (never acts)."""
         from copy import deepcopy
 
-        from omegaconf import open_dict
+        from omegaconf import OmegaConf, open_dict
 
-        tcfg = deepcopy(self.cfg.actor.model)
-        with open_dict(tcfg):
-            tcfg.model_path = self.cfg.actor.teacher_model_path
-            tcfg.is_lora = False
-            tcfg.lora_path = None
-            # teacher may have DIFFERENT native norm_stats than the student (e.g.
-            # spatial-init student + libero10 teacher). Teacher only SCORES (never
-            # acts), so its unnorm_key is a load-time validation only. Allow an
-            # optional override; default (None) = inherit student's key (unchanged).
-            _tuk = self.cfg.actor.get("teacher_unnorm_key", None)
-            if _tuk:
-                tcfg.unnorm_key = _tuk
-        self.teacher_model = get_model(tcfg)
-        self.teacher_model.eval()
-        for p in self.teacher_model.parameters():
-            p.requires_grad_(False)
-        self.log_info(
-            f"[VLA-OPD] loaded frozen teacher from {self.cfg.actor.teacher_model_path}"
-        )
+        def _load_one(path: str):
+            tcfg = deepcopy(self.cfg.actor.model)
+            with open_dict(tcfg):
+                tcfg.model_path = path
+                tcfg.is_lora = False
+                tcfg.lora_path = None
+                # teacher may have DIFFERENT native norm_stats than the student. Teacher
+                # only SCORES (never acts), so its unnorm_key is a load-time validation
+                # only. Optional override; default (None) = inherit student's key.
+                _tuk = self.cfg.actor.get("teacher_unnorm_key", None)
+                if _tuk:
+                    tcfg.unnorm_key = _tuk
+            m = get_model(tcfg)
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad_(False)
+            return m
+
+        _tmap = self.cfg.actor.get("teacher_map", None)
+        if _tmap:
+            _tmap = dict(OmegaConf.to_container(_tmap, resolve=True))
+            self.teacher_models = {}  # unique ckpt path -> model (loaded once)
+            self.teacher_suite_to_path = {}  # suite name -> ckpt path (routing table)
+            for suite, path in _tmap.items():
+                self.teacher_suite_to_path[suite] = path
+                if path not in self.teacher_models:
+                    self.teacher_models[path] = _load_one(path)
+            # Single handle used by the OPD loss. With one generalist teacher for all
+            # suites this IS that teacher. For true multi-teacher, select per suite via
+            # self.teacher_suite_to_path at the teacher-forward site (OPD block).
+            self.teacher_model = next(iter(self.teacher_models.values()))
+            self.log_info(
+                f"[VLA-OPD] teacher_map: loaded {len(self.teacher_models)} unique "
+                f"teacher(s) for {len(self.teacher_suite_to_path)} suite(s): "
+                f"{sorted(set(self.teacher_suite_to_path.values()))}"
+            )
+        else:
+            self.teacher_models = None
+            self.teacher_suite_to_path = None
+            self.teacher_model = _load_one(self.cfg.actor.teacher_model_path)
+            self.log_info(
+                f"[VLA-OPD] loaded frozen teacher from "
+                f"{self.cfg.actor.teacher_model_path}"
+            )
 
     def _load_base_model(self) -> None:
         """Dual-KL anchor: frozen BASE (= student's init / the generalist) loaded full
@@ -1550,6 +1584,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         # VLA-OPD: frozen teacher scores the SAME actions the student executed
                         # (forward_inputs holds the rollout action tokens); the reverse-KL
                         # log-ratio is the advantage (detached -> constant reward).
+                        # Sequential CL uses ONE generalist teacher for all suites, so
+                        # self.teacher_model is used directly here. For TRUE multi-teacher
+                        # (per-suite experts) route with self.teacher_suite_to_path using
+                        # the sample's suite -- the rest of this block is unchanged.
                         with torch.no_grad(), self.amp_context:
                             teacher_out = self.teacher_model(
                                 forward_inputs=forward_inputs,
@@ -1589,6 +1627,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             lt = torch.log_softmax(
                                 teacher_out["action_logits"].float().detach(), dim=-1
                             )
+                            # Base-Centered Policy-Shift MOPD (BCF-MOPD): distill toward
+                            #   q ∝ π_0 · exp((log π_tea − log π_0)/β)  i.e.
+                            #   log q = log_softmax( lb + (lt − lb)/β )
+                            # instead of the full teacher lt. Only the teacher's SHIFT relative
+                            # to base is transferred, base-anchored: β>1 → q between base and
+                            # expert (preserves base generalization); β=1 → q=teacher (vanilla).
+                            # ONE coherent target -> no dual-KL anchor conflict.
+                            _sbeta = float(self.cfg.algorithm.get("shift_beta", 0.0))
+                            if _sbeta > 0.0 and getattr(self, "base_model", None) is not None:
+                                with torch.no_grad(), self.amp_context:
+                                    _shift_base_out = self.base_model(
+                                        forward_inputs=forward_inputs,
+                                        compute_logprobs=True,
+                                        use_cache=False,
+                                        **kwargs,
+                                    )
+                                if "action_logits" in _shift_base_out:
+                                    _lb_s = torch.log_softmax(
+                                        _shift_base_out["action_logits"].float().detach(),
+                                        dim=-1,
+                                    )
+                                    lt = torch.log_softmax(
+                                        _lb_s + (lt - _lb_s) / _sbeta, dim=-1
+                                    )
                             # diagnostic: reverse KL(student||teacher) (comparable across runs)
                             opd_kl = (ls.exp() * (ls - lt)).sum(dim=-1).detach().mean().item()
                             # LOSS direction (distill_kl):
