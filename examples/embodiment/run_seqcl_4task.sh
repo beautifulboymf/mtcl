@@ -20,9 +20,14 @@ set -euo pipefail
 
 # ---- environment (mirror datafree_train.sh) --------------------------------------------
 cd /home/fanruochen/CL/RLinf
+# The external env scripts (rlinf-env, venv activate, gpu_render_env) are NOT `set -u`
+# clean -- venv activate references $PYTHONPATH before defining it -- so relax -u across
+# them, then re-arm it for our own logic.
+set +u
 source /home/fanruochen/.rlinf-env.sh
 source /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/activate
 source /share/fanruochen-local/dev/gpu_render_env.sh
+set -u
 export EMBODIED_PATH="/home/fanruochen/CL/RLinf/examples/embodiment"
 export REPO_PATH="/home/fanruochen/CL/RLinf"
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
