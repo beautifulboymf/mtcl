@@ -154,6 +154,18 @@ def stage_plan(
     }
 
 
+def _omega_list(items) -> str:
+    """OmegaConf inline list with UNQUOTED elements: ``[a, b]``. The config parses these
+    via ``${oc.decode:...}``, whose grammar REJECTS the double-quoted strings JSON emits
+    (``GrammarParseError: mismatched input '"'``), so never use json.dumps here."""
+    return "[" + ", ".join(str(x) for x in items) + "]"
+
+
+def _omega_dict(d) -> str:
+    """OmegaConf inline dict with UNQUOTED keys: ``{a: 1.0, b: 0.3}`` (same reason)."""
+    return "{" + ", ".join(f"{k}: {v}" for k, v in d.items()) + "}"
+
+
 def _emit_shell(stage_idx: int) -> str:
     """Print ``export VAR=...`` lines the bash driver can ``eval``.
 
@@ -164,10 +176,10 @@ def _emit_shell(stage_idx: int) -> str:
     lines = [
         f"export SEQCL_STAGE_IDX={stage_idx}",
         f"export SEQCL_CURRENT_SUITE={plan['current_suite']}",
-        # JSON strings so the YAML can parse them via ${oc.decode:${oc.env:...}}.
-        "export SEQCL_ACTIVE_SUITES='%s'" % json.dumps(plan["active_suites"]),
-        "export SEQCL_SUITE_WEIGHTS='%s'"
-        % json.dumps(plan["suite_sample_weights"]),
+        # OmegaConf ${oc.decode:...} grammar: UNQUOTED elements/keys only (NOT JSON).
+        "export SEQCL_ACTIVE_SUITES='%s'" % _omega_list(plan["active_suites"]),
+        "export SEQCL_SUITE_WEIGHTS='%s'" % _omega_dict(plan["suite_sample_weights"]),
+        # informational only (the config hardcodes teacher_map); not oc.decoded, JSON ok.
         "export SEQCL_TEACHER_MAP='%s'" % json.dumps(plan["teacher_map"]),
     ]
     return "\n".join(lines)

@@ -106,7 +106,7 @@ env:
   train:
     task_suite_name: libero_130
     # active suites (new + rehearsed) by NAME; env expands to libero_130 task ids.
-    active_suites: ${oc.decode:${oc.env:SEQCL_ACTIVE_SUITES,'["libero_spatial"]'}}
+    active_suites: ${oc.decode:${oc.env:SEQCL_ACTIVE_SUITES,'[libero_spatial]'}}
     # rehearsal oversampling: new suite heavy, old suites light. null -> uniform.
     suite_sample_weights: ${oc.decode:${oc.env:SEQCL_SUITE_WEIGHTS,'null'}}
     total_num_envs: 16       # small + safe; scale up if VRAM headroom
@@ -117,7 +117,7 @@ env:
     reset_gripper_open: False
   eval:
     task_suite_name: libero_130
-    active_suites: ${oc.decode:${oc.env:SEQCL_ACTIVE_SUITES,'["libero_spatial"]'}}
+    active_suites: ${oc.decode:${oc.env:SEQCL_ACTIVE_SUITES,'[libero_spatial]'}}
     # no suite_sample_weights on eval: uniform coverage of the learned suites.
     total_num_envs: 50
     auto_reset: True
