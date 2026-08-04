@@ -70,6 +70,28 @@ base 参考:object 0.64 / PRO-object 0.38 / swap 0.68 / lan 0.70 / spatial 0.66 
 **下一步二选一**:(A) 150 次(3-seed)坐实 both>dual-KL 的广度优势;(B) 换外部 DINOv2 视觉 teacher 攻"未见外观"轴。
 **代码状态**:双通道锚已在 `fsdp_actor_worker.py`(base forward + action/visual 双锚)+ `openvla_oft_action_model.py`(mid_features 抽取)+ config `visual_anchor_lambda/layer`,默认全 0 = plain-OPD 逐字节等价。
 
+## 7. PRO task/env 轴实验 + 关键结论(2026-07-23 晚)
+先探路 VLABench:它的 OpenVLA wrapper 是给**原版**OpenVLA(单步7维delta)、动作归一化/相机全是 VLABench 专用,连它自家 baseline 都在 vlabench_primitive 上微调过 → **我们的 LIBERO-OFT 专才零样本进去≈0(插头不对,非泛化)**。外部 bench 对 LIBERO 专才是死的。
+
+转而扒 LIBERO-PRO:它有 5 种扰动(object/swap/lan 已测 + **task 新任务 / env 新场景** 未测)+ ~81 个真新物体网格(GSO/HOPE/TurboSquid,ood_object.yaml 现用的却只是颜色变体)。测了两条新轴(success_once,50-trial):
+
+| 模型 | task(新目标) | env(新场景) | object-std |
+|---|---|---|---|
+| BASE | **0.06** | 0.68 | 0.64 |
+| plain-OPD | — | 0.92 | 0.86 |
+| visual | — | 0.92 | 0.92 |
+| dual-KL | — | 0.96 | 0.92 |
+| both | — | 0.96 | 0.86 |
+
+**结论(硬道理)**:
+1. **task 轴 base=0.06**(扰动合法、场景里真有目标物体 → base 过拟合"此场景抓此物",无组合泛化)→ 没有可保的泛化,废弃。
+2. **env 轴:蒸馏"提升"不"侵蚀"**(base 0.68 → 蒸后 0.92-0.96);env ≈ 各模型 object-std(换场景扰动很弱);锚不帮不坏(0.92 vs 0.96 = 噪声)。
+3. **推论**:object/swap/lan/env 全是"训练任务鲁棒性",蒸馏只会让它变好;真新任务 base 又够不着。**蒸馏真正侵蚀、锚真正能救的,只有 held-out 别的任务**(spatial/goal/long,见 §dual-KL 150-trial:plain 0.571 < base 0.593,锚 0.664)。
+4. **"把泛化升级成新物体/新场景"经验上没走通**。可保的泛化仍是"同域别的任务"(窄)。
+
+**方向三选一(待用户定)**:(A) 打磨现有 held-out 保持故事(真实但窄);(B) 换设定让广泛泛化真存在且会被侵蚀(少任务 base / vanilla-OpenVLA,但各有坎:base 对真新≈0 / SimplerEnv Vulkan堵);**(C) 改成发现驱动**:"持续蒸馏提升训练任务鲁棒性、侵蚀 held-out;data-free 锚救回 held-out 且不牺牲鲁棒性提升"。CC 倾向 C。
+代码:`dualkl_pro_taskenv.sh`(PERTURBS=env|task 可选)。safe_run 教训:50-env 满血≈420 进程,SR_PROC_MAX 需 ≥800,≤2 并行。
+
 ## 关键文献
 - OOD 泛化机制:**Don't Blind Your VLA**(2510.25616,视觉表征对齐,data-free)← 核心。
 - 泛化 benchmark:**Colosseum V2**(2605.27759)、**VLABench**(ICCV'25,2412.18194)、SimplerEnv。
