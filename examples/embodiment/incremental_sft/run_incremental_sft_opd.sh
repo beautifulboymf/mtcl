@@ -27,7 +27,7 @@ mkdir -p "$ROOT"
 
 SFT_GPUS="${SFT_GPUS:-4,5}"     # SFT: torchrun, comma list
 OPD_GPUS="${OPD_GPUS:-4-5}"     # OPD: RLinf contiguous range
-SFT_STEPS="${SFT_STEPS:-2000}"
+SFT_STEPS="${SFT_STEPS:-15000}"   # verl/OFT recipe, B-lite budget (LR constant 5e-4 = OFT below 30K)
 OPD_STEPS="${OPD_STEPS:-15}"
 DF_MIN_G="${DF_MIN_G:-120}"     # abort a stage if < this many GB free on the shared disk
 

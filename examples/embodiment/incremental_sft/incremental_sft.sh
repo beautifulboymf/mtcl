@@ -10,9 +10,12 @@
 # Usage: incremental_sft.sh <spatial|object> <base_model_dir> <out_dir> [max_steps=2000] [save_steps=2000] [gpus=4,5]
 set -o pipefail   # NOT -u: venv activate references unbound vars
 SUITE="${1:?spatial|object}"; BASE="${2:?base model dir}"; OUT="${3:?out dir}"
-MAXSTEPS="${4:-2000}"; SAVESTEPS="${5:-2000}"; GPUS="${6:-4,5}"
+MAXSTEPS="${4:-15000}"; SAVESTEPS="${5:-$MAXSTEPS}"; GPUS="${6:-4,5}"
 NPROC=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
 DSET="libero_${SUITE}_no_noops"
+# Match verl/OpenVLA-OFT effective batch = 64 (their 8 GPU x batch 8). grad_accum = 64/(8*NPROC):
+# 2 GPU -> 4, 4 GPU -> 2, 8 GPU -> 1.  (batch/GPU stays 8; lr 5e-4 constant = OFT below 30K steps.)
+GACC=$(( 64 / (8 * NPROC) )); [ "$GACC" -lt 1 ] && GACC=1
 
 REPO=/home/fanruochen/CL/RLinf
 NORM130=/share/fanruochen-local/checkpoints/norm_override_libero130.json
@@ -34,7 +37,7 @@ export SFT_NORM_OVERRIDE="$NORM130"    # <-- forces libero_130 action norm in th
 
 mkdir -p "$OUT"
 echo "== df =="; df -h /share/fanruochen-local | tail -1
-echo "==== INC-SFT [$SUITE] base=$(basename "$BASE") norm=libero_130 steps=$MAXSTEPS gpus=$GPUS  $(date '+%F %T') ===="
+echo "==== INC-SFT [$SUITE] base=$(basename "$BASE") norm=libero_130 steps=$MAXSTEPS gpus=$GPUS(np$NPROC) batch=8 grad_accum=$GACC eff_batch=$((8*NPROC*GACC)) lr=5e-4  $(date '+%F %T') ===="
 cd /tmp   # neutral cwd so the repo's prismatic/ never shadows the venv's OFT prismatic
 torchrun --standalone --nnodes 1 --nproc-per-node "$NPROC" "$FINE_ALIGNED" \
   --vla_path "$BASE" \
@@ -43,10 +46,10 @@ torchrun --standalone --nnodes 1 --nproc-per-node "$NPROC" "$FINE_ALIGNED" \
   --run_root_dir "$OUT" \
   --adapter_tmp_dir "${OUT}/adapter-tmp" \
   --lora_rank 32 --lora_dropout 0.0 \
-  --batch_size 8 --grad_accumulation_steps 1 \
+  --batch_size 8 --grad_accumulation_steps "$GACC" \
   --learning_rate 5e-4 --image_aug True \
   --max_steps "$MAXSTEPS" --save_steps "$SAVESTEPS" \
-  --save_latest_checkpoint_only False \
+  --save_latest_checkpoint_only True \
   --wandb_project inc_sft --wandb_entity none
 rc=${PIPESTATUS[0]}
 echo "INC_SFT_TRAIN_DONE rc=$rc $(date '+%F %T')"
