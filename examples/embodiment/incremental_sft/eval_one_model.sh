@@ -12,9 +12,11 @@ OUT=/share/fanruochen-local/outputs/inc_sft_opd
 mkdir -p "$OUT"
 [ -f "$MODEL/model.safetensors.index.json" ] || { echo "ABORT: not an HF model dir: $MODEL"; exit 1; }
 
+set +u   # venv activate references unbound PYTHONPATH under set -u
 source /home/fanruochen/.rlinf-env.sh 2>/dev/null
 source /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/activate
 source /share/fanruochen-local/dev/gpu_render_env.sh
+set -u
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export RLINF_CONVERT_VALUE_HEAD=False
