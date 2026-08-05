@@ -28,7 +28,11 @@ SEQCL_GPUS="$OPD_GPUS" SEQCL_STUDENT_PATH="$INIT" \
 SEQCL_ACTIVE_SUITES="[libero_${SUITE}]" SEQCL_SUITE_WEIGHTS='null' \
 SEQCL_MAX_STEPS="$OPD_STEPS" SEQCL_CURRENT_SUITE="$TAG" \
 ISO_RAY_PORT="${OPD_RAY_PORT:-28000}" bash "$SCRIPTS/run_iso.sh" \
-  "$PY" "$REPO/examples/embodiment/train_embodied_agent.py" --config-name libero_seqcl_opd_2gpu
+  "$PY" "$REPO/examples/embodiment/train_embodied_agent.py" --config-name libero_seqcl_opd_2gpu \
+    algorithm.rollout_epoch="${OPD_ROLLOUT_EPOCH:-4}" \
+    env.train.total_num_envs="${OPD_ENVS:-16}" \
+    env.train.max_episode_steps="${OPD_EP_STEPS:-512}" \
+    env.train.max_steps_per_rollout_epoch="${OPD_EP_STEPS:-512}"
 echo "OPD_TRAIN_DONE $(date '+%F %T')"
 
 CKPT=$(find "$LOGP" -name full_weights.pt -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
