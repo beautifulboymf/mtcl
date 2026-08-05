@@ -49,19 +49,21 @@ torchrun --standalone --nnodes 1 --nproc-per-node "$NPROC" "$FINE_ALIGNED" \
   --batch_size 8 --grad_accumulation_steps "$GACC" \
   --learning_rate 5e-4 --image_aug True \
   --max_steps "$MAXSTEPS" --save_steps "$SAVESTEPS" \
-  --save_latest_checkpoint_only True \
+  --save_latest_checkpoint_only "${SFT_SAVE_LATEST:-True}" \
   --wandb_project inc_sft --wandb_entity none
 rc=${PIPESTATUS[0]}
 echo "INC_SFT_TRAIN_DONE rc=$rc $(date '+%F %T')"
 [ "$rc" -ne 0 ] && exit "$rc"
 
-# finetune.py MERGES + saves a full HF model (model.safetensors.index.json). Locate the newest
-# such dir (exclude the raw LoRA adapter-tmp).
-MERGED=$(ls -dt "$OUT"/*/ 2>/dev/null | grep -v adapter-tmp | while read -r d; do
-  [ -f "${d}model.safetensors.index.json" ] && { echo "${d%/}"; break; }; done)
-[ -z "$MERGED" ] && { echo "ABORT: no merged HF model under $OUT"; exit 1; }
-
-# Align dataset_statistics to libero_130 (key + values) so downstream uses unnorm_key=libero_130.
-cp "$STATS130" "$MERGED/dataset_statistics.json"
-echo "INC_SFT_MERGED=$MERGED"
+# finetune.py MERGES + saves a full HF model (model.safetensors.index.json) at each save_step
+# (and run_dir). Copy the libero_130 dataset_statistics into EVERY merged dir so any checkpoint
+# (incl. intermediate ones, for picking a target-SR weak init) is directly eval-ready.
+FOUND=0
+for d in $(ls -dt "$OUT"/*/ 2>/dev/null | grep -v adapter-tmp); do
+  [ -f "${d}model.safetensors.index.json" ] || continue
+  cp "$STATS130" "${d}dataset_statistics.json"
+  echo "INC_SFT_MERGED=${d%/}"
+  FOUND=$((FOUND+1))
+done
+[ "$FOUND" -eq 0 ] && { echo "ABORT: no merged HF model under $OUT"; exit 1; }
 echo "INC_SFT_DONE $(date '+%F %T')"
