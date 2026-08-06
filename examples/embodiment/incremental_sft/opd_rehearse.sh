@@ -18,7 +18,9 @@ PY=/share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/python
 OPD_GPUS="${OPD_GPUS:-4-7}"; OPD_ENVS="${OPD_ENVS:-32}"
 OPD_ROLLOUT_EPOCH="${OPD_ROLLOUT_EPOCH:-1}"; OPD_STEPS="${OPD_STEPS:-15}"
 OPD_SUITES="${OPD_SUITES:-[libero_spatial,libero_object]}"
-OPD_WEIGHTS="${OPD_WEIGHTS:-{libero_spatial:0.3,libero_object:1.0}}"
+# NB: do NOT use ${OPD_WEIGHTS:-{...}} — the nested { } inside a :- default makes bash leave a
+# stray trailing } (=> "{...}}" => broken dict). Set the default on its own line instead.
+: "${OPD_WEIGHTS:=}"; [ -n "$OPD_WEIGHTS" ] || OPD_WEIGHTS='{libero_spatial:0.3,libero_object:1.0}'
 LOGP="/share/fanruochen-local/outputs/seqcl_${TAG}"
 [ -f "$INIT/model.safetensors.index.json" ] || { echo "ABORT: init not an HF model dir: $INIT"; exit 1; }
 
