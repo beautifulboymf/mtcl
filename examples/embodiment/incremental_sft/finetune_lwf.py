@@ -276,9 +276,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         ids = sbatch["input_ids"].to(device_id)
         attn = sbatch["attention_mask"].to(device_id)
         pix = sbatch["pixel_values"].to(torch.bfloat16).to(device_id)
-        lbl = sbatch["labels"]  # pass labels so both fwds take the SAME path as the object fwd
-        # (the no-labels path computes position_ids via bool attention_mask.cumsum() -> TypeError).
-        # We ignore .loss here and only use .logits for the KL.
+        # pass labels so both fwds take the SAME path as the object fwd (the no-labels path computes
+        # position_ids via bool attention_mask.cumsum() -> TypeError). Move labels to device: the raw
+        # (non-DDP) teacher does NOT auto-move them, so CPU labels vs GPU logits -> device mismatch in
+        # its loss. We ignore .loss here and only use .logits for the KL.
+        lbl = sbatch["labels"].to(device_id)
         s_out = vla(input_ids=ids, attention_mask=attn, pixel_values=pix, labels=lbl)  # student (grad)
         with torch.no_grad():
             t_out = teacher(input_ids=ids, attention_mask=attn, pixel_values=pix, labels=lbl)  # teacher (frozen)
