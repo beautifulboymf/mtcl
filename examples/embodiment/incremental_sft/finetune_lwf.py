@@ -276,9 +276,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         ids = sbatch["input_ids"].to(device_id)
         attn = sbatch["attention_mask"].to(device_id)
         pix = sbatch["pixel_values"].to(torch.bfloat16).to(device_id)
-        s_out = vla(input_ids=ids, attention_mask=attn, pixel_values=pix)            # student (grad)
+        lbl = sbatch["labels"]  # pass labels so both fwds take the SAME path as the object fwd
+        # (the no-labels path computes position_ids via bool attention_mask.cumsum() -> TypeError).
+        # We ignore .loss here and only use .logits for the KL.
+        s_out = vla(input_ids=ids, attention_mask=attn, pixel_values=pix, labels=lbl)  # student (grad)
         with torch.no_grad():
-            t_out = teacher(input_ids=ids, attention_mask=attn, pixel_values=pix)     # teacher (frozen)
+            t_out = teacher(input_ids=ids, attention_mask=attn, pixel_values=pix, labels=lbl)  # teacher (frozen)
         # mirror finetune.py's action slicing, then restrict vocab to the 256 action bins
         s_logits = s_out.logits[:, num_patches:-1, action_bin_start:]
         t_logits = t_out.logits[:, num_patches:-1, action_bin_start:]
