@@ -50,5 +50,7 @@ ISO_RAY_PORT="${RL_RAY_PORT:-35000}" bash "$SCRIPTS/run_iso.sh" \
     actor.micro_batch_size="$RL_MICRO" \
     env.train.total_num_envs="$RL_ENVS" \
     env.eval.total_num_envs="$RL_EVAL_ENVS" \
-    ${RL_ROLLOUT_EPOCH:+algorithm.rollout_epoch=$RL_ROLLOUT_EPOCH}
+    ${RL_ROLLOUT_EPOCH:+algorithm.rollout_epoch=$RL_ROLLOUT_EPOCH} \
+    ${RL_GLOBAL_BATCH:+actor.global_batch_size=$RL_GLOBAL_BATCH}
 echo "RL_OBJECT_DONE rc=${PIPESTATUS[0]} $(date '+%F %T')"
+# NB: rollout_size(=rollout_epoch*512) must be divisible by batch_per_rank(=global_batch/n_gpu).
