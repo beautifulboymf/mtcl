@@ -13,8 +13,11 @@ INIT="${1:?spatial-SFT model dir}"; TAG="${2:?tag}"
 REPO=/home/fanruochen/CL/RLinf
 SCRIPTS=/share/fanruochen-local/dev/scripts
 PY=/share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/python
-RL_GPUS="${RL_GPUS:-4,5,6,7}"
-RL_MICRO="${RL_MICRO:-32}"; RL_ENVS="${RL_ENVS:-32}"     # 32 train env -> dproc~550<800 (64 blew the 800 proc red line)
+# GPU selection is via the config component_placement RANGE (RL_PLACEMENT), NOT CUDA_VISIBLE_DEVICES
+# (RLinf/ray ignore CUDA_VISIBLE_DEVICES here and see all 8 -> use a range like "4-7"). n_gpu in the
+# range sets env_world_size; total_num_envs // n_gpu // pipeline(1) must be divisible by group_size(8).
+RL_PLACEMENT="${RL_PLACEMENT:-4-7}"
+RL_MICRO="${RL_MICRO:-32}"; RL_ENVS="${RL_ENVS:-32}"     # 4 GPU (4-7) x 32 env: 32//4//1=8=group_size; dproc~550<800 (64 blew the 800 proc red line)
 RL_EVAL_ENVS="${RL_EVAL_ENVS:-8}"                        # cap eval envs (config default 500 = proc explosion if instantiated)
 RL_MAX_EPOCHS="${RL_MAX_EPOCHS:-200}"; RL_SAVE="${RL_SAVE:-25}"
 RL_UNNORM="${RL_UNNORM:-libero_130_no_noops_trajall}"
@@ -29,12 +32,13 @@ set -u
 export EMBODIED_PATH="$REPO/examples/embodiment" REPO_PATH="$REPO"
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export ROBOT_PLATFORM=LIBERO
-export CUDA_VISIBLE_DEVICES="$RL_GPUS"
-NGPU=$(echo "$RL_GPUS" | tr ',' '\n' | grep -c .)
+export RL_PLACEMENT                                       # config component_placement reads this range
+# n_gpu from range "A-B" = B-A+1 (else count comma list)
+if [[ "$RL_PLACEMENT" == *-* ]]; then NGPU=$(( ${RL_PLACEMENT#*-} - ${RL_PLACEMENT%-*} + 1 )); else NGPU=$(echo "$RL_PLACEMENT" | tr ',' '\n' | grep -c .); fi
 
 mkdir -p "$LOGP"
 echo "== df =="; df -h /share/fanruochen-local | tail -1
-echo "======== GRPO-RL [spatial] init=$(basename "$INIT") unnorm=$RL_UNNORM gpus=$RL_GPUS(n$NGPU) micro=$RL_MICRO envs=$RL_ENVS max_epochs=$RL_MAX_EPOCHS save=$RL_SAVE  $(date '+%F %T') ========"
+echo "======== GRPO-RL [spatial] init=$(basename "$INIT") unnorm=$RL_UNNORM placement=$RL_PLACEMENT(n$NGPU) micro=$RL_MICRO envs=$RL_ENVS max_epochs=$RL_MAX_EPOCHS save=$RL_SAVE  $(date '+%F %T') ========"
 # NB: total_num_envs//n_gpu//pipeline_stage(1) must be divisible by group_size(8): 64//4=16=2*8 OK.
 ISO_RAY_PORT="${RL_RAY_PORT:-32000}" bash "$SCRIPTS/run_iso.sh" \
   "$PY" "$REPO/examples/embodiment/train_embodied_agent.py" --config-name libero_spatial_grpo_openvlaoft \
