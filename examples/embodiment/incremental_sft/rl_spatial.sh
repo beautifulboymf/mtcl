@@ -50,5 +50,6 @@ ISO_RAY_PORT="${RL_RAY_PORT:-32000}" bash "$SCRIPTS/run_iso.sh" \
     runner.max_epochs="$RL_MAX_EPOCHS" \
     actor.micro_batch_size="$RL_MICRO" \
     env.train.total_num_envs="$RL_ENVS" \
-    env.eval.total_num_envs="$RL_EVAL_ENVS"
+    env.eval.total_num_envs="$RL_EVAL_ENVS" \
+    ${RL_ROLLOUT_EPOCH:+algorithm.rollout_epoch=$RL_ROLLOUT_EPOCH}
 echo "RL_SPATIAL_DONE rc=${PIPESTATUS[0]} $(date '+%F %T')"
