@@ -23,7 +23,11 @@ export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export RLINF_CONVERT_VALUE_HEAD=False
 
 echo "== df =="; df -h /share/fanruochen-local | tail -1
-echo "======== OPD [$SUITE] init=$(basename "$INIT") teacher=130 gpus=$OPD_GPUS steps=$OPD_STEPS  $(date '+%F %T') ========"
+# Optional: override this suite's teacher (default config teacher_map = 130 generalist). Set
+# OPD_TEACHER to a matched specialist (e.g. spatial_opd_student_098) to distill toward it instead.
+TEACHER_OVR=""
+[ -n "${OPD_TEACHER:-}" ] && TEACHER_OVR="actor.teacher_map.libero_${SUITE}=${OPD_TEACHER}"
+echo "======== OPD [$SUITE] init=$(basename "$INIT") teacher=${OPD_TEACHER:-130(default)} gpus=$OPD_GPUS steps=$OPD_STEPS  $(date '+%F %T') ========"
 SEQCL_GPUS="$OPD_GPUS" SEQCL_STUDENT_PATH="$INIT" \
 SEQCL_ACTIVE_SUITES="[libero_${SUITE}]" SEQCL_SUITE_WEIGHTS='null' \
 SEQCL_MAX_STEPS="$OPD_STEPS" SEQCL_CURRENT_SUITE="$TAG" \
@@ -32,7 +36,8 @@ ISO_RAY_PORT="${OPD_RAY_PORT:-28000}" bash "$SCRIPTS/run_iso.sh" \
     algorithm.rollout_epoch="${OPD_ROLLOUT_EPOCH:-4}" \
     env.train.total_num_envs="${OPD_ENVS:-16}" \
     env.train.max_episode_steps="${OPD_EP_STEPS:-512}" \
-    env.train.max_steps_per_rollout_epoch="${OPD_EP_STEPS:-512}"
+    env.train.max_steps_per_rollout_epoch="${OPD_EP_STEPS:-512}" \
+    ${TEACHER_OVR}
 echo "OPD_TRAIN_DONE $(date '+%F %T')"
 
 CKPT=$(find "$LOGP" -name full_weights.pt -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
