@@ -1067,11 +1067,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         from omegaconf import OmegaConf, open_dict
 
         def _load_one(path: str):
+            # A teacher may be given either as a full HF dir, or as "<base_dir>::<adapter_dir>"
+            # (base + PEFT LoRA adapter). The latter lets N per-suite expert teachers that all
+            # sit on the SAME base be expressed as N small adapters (our spatial/goal/object
+            # teachers are exactly this); get_model applies the adapter via is_lora/lora_path.
+            _adapter = None
+            if "::" in str(path):
+                path, _adapter = str(path).split("::", 1)
             tcfg = deepcopy(self.cfg.actor.model)
             with open_dict(tcfg):
                 tcfg.model_path = path
-                tcfg.is_lora = False
-                tcfg.lora_path = None
+                tcfg.is_lora = _adapter is not None
+                tcfg.lora_path = _adapter
                 # teacher may have DIFFERENT native norm_stats than the student. Teacher
                 # only SCORES (never acts), so its unnorm_key is a load-time validation
                 # only. Optional override; default (None) = inherit student's key.
@@ -1089,12 +1096,56 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if OmegaConf.is_config(_tmap):
                 _tmap = OmegaConf.to_container(_tmap, resolve=True)
             _tmap = dict(_tmap)
+            # Only keep suites we actually roll out on. The stock config maps ALL FOUR suites to
+            # the 130 generalist; a run over a subset would otherwise load teachers for suites
+            # that never appear in a batch (wasting a full 7B each -> OOM) and would also break
+            # the shared-base fast path below (one stale non-adapter entry disables it).
+            try:
+                _act = self.cfg.env.train.get("active_suites", None)
+                if _act:
+                    _act = set(OmegaConf.to_container(_act, resolve=True)
+                               if OmegaConf.is_config(_act) else _act)
+                    _drop = [s for s in _tmap if s not in _act]
+                    if _drop and len(_act & set(_tmap)) > 0:
+                        for s in _drop:
+                            _tmap.pop(s)
+                        self.log_info(
+                            f"[VLA-OPD] teacher_map restricted to active suites "
+                            f"{sorted(_act)}; dropped {sorted(_drop)}"
+                        )
+            except Exception:
+                pass
             self.teacher_models = {}  # unique ckpt path -> model (loaded once)
             self.teacher_suite_to_path = {}  # suite name -> ckpt path (routing table)
-            for suite, path in _tmap.items():
-                self.teacher_suite_to_path[suite] = path
-                if path not in self.teacher_models:
-                    self.teacher_models[path] = _load_one(path)
+            # SHARED-BASE FAST PATH: when every teacher is "<same base>::<adapter>", load the
+            # 7B base ONCE and attach the adapters to it (PEFT multi-adapter). N experts then
+            # cost 1 base + N small adapters instead of N full models -- without this, 3
+            # teachers + the student = 4x7B and the run OOMs on 2 GPUs.
+            _paths = list(dict.fromkeys(_tmap.values()))
+            _bases = {p.split("::", 1)[0] for p in _paths}
+            _all_adapters = all("::" in str(p) for p in _paths)
+            self.teacher_adapter_of_path = None
+            if _all_adapters and len(_bases) == 1 and len(_paths) > 1:
+                _shared = _load_one(_paths[0])          # base + first adapter (name "default")
+                _pm = _shared if hasattr(_shared, "load_adapter") else getattr(_shared, "model", None)
+                self.teacher_adapter_of_path = {_paths[0]: "default"}
+                for _i, _p in enumerate(_paths[1:], start=1):
+                    _name = f"t{_i}"
+                    _pm.load_adapter(_p.split("::", 1)[1], adapter_name=_name)
+                    self.teacher_adapter_of_path[_p] = _name
+                for _p in _paths:
+                    self.teacher_models[_p] = _shared   # same object; adapter switched per suite
+                self.log_info(
+                    f"[VLA-OPD] SHARED-BASE teachers: 1 base + {len(_paths)} adapters "
+                    f"{list(self.teacher_adapter_of_path.values())}"
+                )
+                for suite, path in _tmap.items():
+                    self.teacher_suite_to_path[suite] = path
+            else:
+                for suite, path in _tmap.items():
+                    self.teacher_suite_to_path[suite] = path
+                    if path not in self.teacher_models:
+                        self.teacher_models[path] = _load_one(path)
             # Single handle used by the OPD loss. With one generalist teacher for all
             # suites this IS that teacher. For true multi-teacher, select per suite via
             # self.teacher_suite_to_path at the teacher-forward site (OPD block).
@@ -1104,6 +1155,56 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"teacher(s) for {len(self.teacher_suite_to_path)} suite(s): "
                 f"{sorted(set(self.teacher_suite_to_path.values()))}"
             )
+            # TRUE multi-teacher routing table. The batch reaching the actor carries the
+            # tokenized task prompt (input_ids); each LIBERO task's language instruction is
+            # unique, so prompt -> task -> suite -> teacher is an exact lookup. We key on the
+            # LOWERCASED instruction text (matching how the prompt is built) and resolve at
+            # forward time by decoding input_ids once per micro-batch.
+            self.teacher_prompt_to_suite = None
+            if len(self.teacher_models) > 1:
+                try:
+                    # Build prompt->suite the SAME way get_libero130_task_id_to_suite()
+                    # builds task_id->suite (iterate benchmark.libero_suites -> task_maps,
+                    # de-dup by task name) so the two are guaranteed consistent.
+                    from libero.libero import benchmark as _lb
+
+                    # Only the suites we actually route (the teacher_map keys). LIBERO's 130
+                    # tasks have 112 unique instructions; the 2 cross-suite duplicates both
+                    # involve libero_90, which is never a teacher_map key -> restricting to
+                    # the mapped suites makes the prompt key EXACT for our routing.
+                    _want = set(self.teacher_suite_to_path.keys())
+                    _p2s, _seen, _dupe = {}, set(), 0
+                    for _suite_name in getattr(_lb, "libero_suites", []):
+                        if _suite_name not in _want:
+                            continue
+                        for _tname, _task in _lb.task_maps.get(_suite_name, {}).items():
+                            if _tname in _seen:
+                                continue
+                            _seen.add(_tname)
+                            _lang = getattr(_task, "language", None)
+                            if not _lang:
+                                continue
+                            _k = _lang.strip().lower()
+                            if _k in _p2s and _p2s[_k] != _suite_name:
+                                _dupe += 1  # ambiguous across ROUTED suites -> would misroute
+                            _p2s[_k] = _suite_name
+                    if not _p2s:
+                        raise RuntimeError("empty prompt->suite map")
+                    if _dupe:
+                        self.log_warning(
+                            f"[VLA-OPD] {_dupe} instruction(s) are ambiguous across routed "
+                            "suites; those samples may be routed to the wrong expert."
+                        )
+                    self.teacher_prompt_to_suite = _p2s
+                    self.log_info(
+                        f"[VLA-OPD] multi-teacher routing ON: {len(_p2s)} task prompts -> "
+                        f"suites {sorted(set(_p2s.values()))}"
+                    )
+                except Exception as e:  # routing table optional; fall back to single teacher
+                    self.log_warning(
+                        f"[VLA-OPD] could not build prompt->suite routing table ({e}); "
+                        "falling back to the FIRST teacher for all suites."
+                    )
         else:
             self.teacher_models = None
             self.teacher_suite_to_path = None
@@ -1112,6 +1213,94 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"[VLA-OPD] loaded frozen teacher from "
                 f"{self.cfg.actor.teacher_model_path}"
             )
+
+    def _teacher_forward(self, forward_inputs, kwargs):
+        """Score the student's rollout with the teacher(s).
+
+        Single teacher (or no routing table) -> one forward, unchanged behaviour.
+        TRUE multi-teacher -> split the micro-batch by the sample's SUITE (derived from its
+        task instruction in ``forward_inputs['input_ids']``) and run each group through its
+        own expert, then scatter the per-group outputs back into full-batch tensors. This is
+        what makes "one student, N per-suite expert teachers" work: every sample is scored by
+        the expert for ITS suite, never by another suite's expert.
+        """
+        _route = getattr(self, "teacher_prompt_to_suite", None)
+        _models = getattr(self, "teacher_models", None)
+        if not _route or not _models or len(_models) <= 1:
+            return self.teacher_model(
+                forward_inputs=forward_inputs, compute_logprobs=True,
+                use_cache=False, **kwargs,
+            )
+
+        ids = forward_inputs["input_ids"]
+        bsz = ids.shape[0]
+        # decode prompts once -> suite -> teacher path (unknown prompt falls back to default).
+        # The embodied actor has no self.tokenizer; the (frozen) teacher model carries the
+        # OFT input_processor, whose .tokenizer decodes the rollout prompts.
+        _tok = getattr(self, "_route_tokenizer", None)
+        if _tok is None:
+            _proc = getattr(self.teacher_model, "input_processor", None)
+            _tok = getattr(_proc, "tokenizer", None) if _proc is not None else None
+            self._route_tokenizer = _tok
+        if _tok is None:
+            return self.teacher_model(
+                forward_inputs=forward_inputs, compute_logprobs=True,
+                use_cache=False, **kwargs,
+            )
+        texts = _tok.batch_decode(ids, skip_special_tokens=True)
+        _default_path = next(iter(_models))
+        groups: dict = {}
+        for i, t in enumerate(texts):
+            tl = t.strip().lower()
+            suite = None
+            for k, v in _route.items():   # instruction is a substring of the full prompt
+                if k in tl:
+                    suite = v
+                    break
+            path = self.teacher_suite_to_path.get(suite, _default_path) if suite else _default_path
+            groups.setdefault(path, []).append(i)
+
+        if len(groups) == 1:  # whole micro-batch is one suite -> single forward
+            only_path = next(iter(groups))
+            _m1 = _models[only_path]
+            _ad1 = getattr(self, "teacher_adapter_of_path", None)
+            if _ad1:  # shared base -> must still select THIS suite's adapter
+                _pm1 = _m1 if hasattr(_m1, "set_adapter") else getattr(_m1, "model", None)
+                _pm1.set_adapter(_ad1[only_path])
+            return _m1(
+                forward_inputs=forward_inputs, compute_logprobs=True,
+                use_cache=False, **kwargs,
+            )
+
+        out: dict = {}
+        _ad_of = getattr(self, "teacher_adapter_of_path", None)
+        for path, idxs in groups.items():
+            sel = torch.as_tensor(idxs, device=ids.device, dtype=torch.long)
+            sub_inputs = {
+                k: (v[sel] if torch.is_tensor(v) and v.shape[:1] == (bsz,) else v)
+                for k, v in forward_inputs.items()
+            }
+            _m = _models[path]
+            if _ad_of:  # shared base: all paths map to ONE model -> switch the adapter
+                _pm = _m if hasattr(_m, "set_adapter") else getattr(_m, "model", None)
+                _pm.set_adapter(_ad_of[path])
+            sub_out = _m(
+                forward_inputs=sub_inputs, compute_logprobs=True,
+                use_cache=False, **kwargs,
+            )
+            for k, v in sub_out.items():
+                if not torch.is_tensor(v) or v.shape[:1] != (len(idxs),):
+                    continue
+                if k not in out:
+                    out[k] = v.new_zeros((bsz,) + tuple(v.shape[1:]))
+                out[k][sel] = v
+        if not hasattr(self, "_mt_logged"):
+            self._mt_logged = True
+            self.log_info(
+                f"[VLA-OPD] multi-teacher forward: micro-batch split across "
+                f"{len(groups)} expert(s)"
+            )
+        return out
 
     def _load_base_model(self) -> None:
         """Dual-KL anchor: frozen BASE (= student's init / the generalist) loaded full
@@ -1591,11 +1780,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         # (per-suite experts) route with self.teacher_suite_to_path using
                         # the sample's suite -- the rest of this block is unchanged.
                         with torch.no_grad(), self.amp_context:
-                            teacher_out = self.teacher_model(
-                                forward_inputs=forward_inputs,
-                                compute_logprobs=True,
-                                use_cache=False,
-                                **kwargs,
+                            teacher_out = self._teacher_forward(
+                                forward_inputs, kwargs
                             )
                         t_lp = teacher_out["logprobs"].detach()
                         # per-token reverse-KL -> aggregate to per-chunk (num_action_chunks) so it
