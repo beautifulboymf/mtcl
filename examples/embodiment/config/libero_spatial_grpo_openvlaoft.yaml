@@ -3,7 +3,7 @@ defaults:
   - env/libero_spatial@env.eval
   - model/openvla_oft@actor.model
   - training_backend/fsdp@actor.fsdp_config
-  - weight_syncer/patch_syncer@weight_syncer
+  - weight_syncer/bucket_syncer@weight_syncer   # was patch_syncer: patch's CPU snapshot+delta+cpu-transport spikes CPU RAM at sync -> cgroup OOM-kills a worker on 4-GPU. bucket=GPU 512MB buckets, no CPU snapshot.
   - override hydra/job_logging: stdout
 
 hydra:

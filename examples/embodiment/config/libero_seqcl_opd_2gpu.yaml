@@ -18,7 +18,12 @@ defaults:
   - env/libero_130@env.eval
   - model/openvla_oft@actor.model
   - training_backend/fsdp@actor.fsdp_config
-  - weight_syncer/patch_syncer@weight_syncer
+  # patch_syncer keeps a FULL CPU snapshot of the 7B model + delta buffers per rank at every
+  # sync_model_to_rollout; with 5 ranks that pushed the container cgroup past its 477G max ->
+  # kernel oom_kill (3x) -> a worker died mid-collective -> "NCCL watchdog stuck 480s" and the
+  # whole stage hung (stage2 died at step 2/10; RAM was already peaking at 472/476G on 3 GPUs).
+  # bucket_syncer streams the weights through 512MB GPU buckets instead (no CPU snapshot).
+  - weight_syncer/bucket_syncer@weight_syncer
   - override hydra/job_logging: stdout
 
 hydra:
