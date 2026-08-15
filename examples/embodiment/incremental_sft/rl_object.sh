@@ -33,6 +33,11 @@ set -u
 export EMBODIED_PATH="$REPO/examples/embodiment" REPO_PATH="$REPO"
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export ROBOT_PLATFORM=LIBERO
+# Safety nets for the sync_model_to_rollout memory spike (see rl_spatial.sh / project_openvla_grpo_rl_pipeline):
+# bucket_syncer (in the object config) is the real fix; these guard the residual cgroup pressure.
+export RAY_memory_monitor_refresh_ms="${RAY_memory_monitor_refresh_ms:-0}"
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
 export RL_PLACEMENT
 if [[ "$RL_PLACEMENT" == *-* ]]; then NGPU=$(( ${RL_PLACEMENT#*-} - ${RL_PLACEMENT%-*} + 1 )); else NGPU=$(echo "$RL_PLACEMENT" | tr ',' '\n' | grep -c .); fi
 
@@ -51,6 +56,8 @@ ISO_RAY_PORT="${RL_RAY_PORT:-35000}" bash "$SCRIPTS/run_iso.sh" \
     env.train.total_num_envs="$RL_ENVS" \
     env.eval.total_num_envs="$RL_EVAL_ENVS" \
     ${RL_ROLLOUT_EPOCH:+algorithm.rollout_epoch=$RL_ROLLOUT_EPOCH} \
-    ${RL_GLOBAL_BATCH:+actor.global_batch_size=$RL_GLOBAL_BATCH}
+    ${RL_GLOBAL_BATCH:+actor.global_batch_size=$RL_GLOBAL_BATCH} \
+    ${RL_IS_LORA:+actor.model.is_lora=True} \
+    ${RL_LORA_RANK:+actor.model.lora_rank=$RL_LORA_RANK}
 echo "RL_OBJECT_DONE rc=${PIPESTATUS[0]} $(date '+%F %T')"
 # NB: rollout_size(=rollout_epoch*512) must be divisible by batch_per_rank(=global_batch/n_gpu).

@@ -238,15 +238,23 @@ def finetune(cfg: FinetuneConfig) -> None:
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
     )
-    # SPATIAL dataset (LwF anchor) — same transform/collator, forced to 130 norm by the monkeypatch
-    spatial_dataset = RLDSDataset(
-        cfg.data_root_dir,
-        cfg.spatial_dataset_name,
-        batch_transform,
-        resize_resolution=tuple(vla.module.config.image_sizes),
-        shuffle_buffer_size=cfg.shuffle_buffer_size,
-        image_aug=cfg.image_aug,
-    )
+    # ANCHOR dataset(s) (LwF) — same transform/collator, forced to 130 norm by the monkeypatch.
+    # spatial_dataset_name accepts a COMMA-SEPARATED list so several old suites can be anchored at
+    # once (e.g. "libero_spatial_no_noops,libero_object_no_noops"); anchoring only one of them is
+    # what wiped object (0.90 -> 0.02) when goal was learned on top of a spatial+object student.
+    _anchor_names = [n.strip() for n in str(cfg.spatial_dataset_name).split(",") if n.strip()]
+    spatial_datasets = [
+        RLDSDataset(
+            cfg.data_root_dir,
+            _n,
+            batch_transform,
+            resize_resolution=tuple(vla.module.config.image_sizes),
+            shuffle_buffer_size=cfg.shuffle_buffer_size,
+            image_aug=cfg.image_aug,
+        )
+        for _n in _anchor_names
+    ]
+    spatial_dataset = spatial_datasets[0]
 
     if distributed_state.is_main_process:
         save_dataset_statistics(vla_dataset.dataset_statistics, run_dir)
@@ -257,10 +265,16 @@ def finetune(cfg: FinetuneConfig) -> None:
     dataloader = DataLoader(
         vla_dataset, batch_size=cfg.batch_size, sampler=None, collate_fn=collator, num_workers=0
     )
-    spatial_dataloader = DataLoader(
-        spatial_dataset, batch_size=cfg.batch_size, sampler=None, collate_fn=collator, num_workers=0
-    )
-    spatial_iter = iter(spatial_dataloader)
+    spatial_dataloaders = [
+        DataLoader(_ds, batch_size=cfg.batch_size, sampler=None, collate_fn=collator, num_workers=0)
+        for _ds in spatial_datasets
+    ]
+    spatial_dataloader = spatial_dataloaders[0]
+    # one iterator per anchor suite; each optimizer step anchors on ONE of them, round-robin, so
+    # over grad_accumulation_steps every old suite gets rehearsed.
+    spatial_iters = [iter(_dl) for _dl in spatial_dataloaders]
+    spatial_iter = spatial_iters[0]
+    _anchor_rr = [0]  # mutable round-robin cursor
 
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"lwf+{exp_id}")
@@ -268,11 +282,15 @@ def finetune(cfg: FinetuneConfig) -> None:
     def _spatial_distill_loss():
         """forward-KL( frozen spatial teacher || student ) on the spatial batch's action tokens."""
         nonlocal spatial_iter
+        # round-robin over the anchor suites (single suite -> identical to before)
+        _k = _anchor_rr[0] % len(spatial_iters)
+        _anchor_rr[0] = _k + 1
         try:
-            sbatch = next(spatial_iter)
+            sbatch = next(spatial_iters[_k])
         except StopIteration:
-            spatial_iter = iter(spatial_dataloader)
-            sbatch = next(spatial_iter)
+            spatial_iters[_k] = iter(spatial_dataloaders[_k])
+            sbatch = next(spatial_iters[_k])
+        spatial_iter = spatial_iters[_k]
         ids = sbatch["input_ids"].to(device_id)
         attn = sbatch["attention_mask"].to(device_id)
         pix = sbatch["pixel_values"].to(torch.bfloat16).to(device_id)
@@ -375,8 +393,21 @@ def finetune(cfg: FinetuneConfig) -> None:
                     save_dir = adapter_dir if cfg.use_lora else run_dir
                     processor.save_pretrained(run_dir)
                     vla.module.save_pretrained(save_dir)
+                    # ADAPTER-ONLY (SFT_ADAPTER_ONLY=1): snapshot this step's adapter and SKIP the
+                    # full-model merge below. The merge reloads a whole 7B on GPU and OOMs whenever a
+                    # co-tenant holds most of the card; it also writes 15G per checkpoint.
+                    if os.environ.get("SFT_ADAPTER_ONLY", "0") == "1":
+                        import shutil as _sh
+                        step_adir = run_dir / "adapters" / f"step_{gradient_step_idx}"
+                        _sh.rmtree(step_adir, ignore_errors=True)
+                        _sh.copytree(save_dir, step_adir)
+                        try:
+                            save_dataset_statistics(vla_dataset.dataset_statistics, step_adir)
+                        except Exception:
+                            pass
+                        print(f"[adapter-only] per-step adapter -> {step_adir}", flush=True)
                 dist.barrier()
-                if cfg.use_lora:
+                if cfg.use_lora and os.environ.get("SFT_ADAPTER_ONLY", "0") != "1":
                     base_vla = AutoModelForVision2Seq.from_pretrained(
                         cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
                     )

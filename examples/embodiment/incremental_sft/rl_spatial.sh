@@ -32,6 +32,17 @@ set -u
 export EMBODIED_PATH="$REPO/examples/embodiment" REPO_PATH="$REPO"
 export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export ROBOT_PLATFORM=LIBERO
+# ROOT-CAUSE FIX for the sync crash: at sync_model_to_rollout the FSDP actor reloads its offloaded
+# 7B weights from CPU + reads ckpt shards -> page cache fills the LXC cgroup. Ray's memory monitor
+# reads cgroup memory.usage (INCLUDES reclaimable page cache) and false-fires OOM (saw 98.5% while
+# true MemAvailable was 235G) -> kills a worker -> the sync NCCL collective loses a rank -> hangs
+# (last run's "NCCL watchdog stuck 480s" was THIS same worker-kill). 4-GPU shards are 2x bigger than
+# the 130's 8-GPU -> bigger transient spike -> crosses ray's 0.95 threshold (130 stayed under).
+# Disable ray's (miscounting) killer; safe_run still guards TRUE MemAvailable (SR_RAM_MIN) for the node.
+export RAY_memory_monitor_refresh_ms="${RAY_memory_monitor_refresh_ms:-0}"
+# NCCL watchdog: keep a generous timeout too (belt-and-suspenders; the offload reload sync is slow on 4 GPU).
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC="${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-3600}"
+export NCCL_TIMEOUT="${NCCL_TIMEOUT:-3600}"
 export RL_PLACEMENT                                       # config component_placement reads this range
 # n_gpu from range "A-B" = B-A+1 (else count comma list)
 if [[ "$RL_PLACEMENT" == *-* ]]; then NGPU=$(( ${RL_PLACEMENT#*-} - ${RL_PLACEMENT%-*} + 1 )); else NGPU=$(echo "$RL_PLACEMENT" | tr ',' '\n' | grep -c .); fi

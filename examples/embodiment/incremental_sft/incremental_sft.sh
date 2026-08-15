@@ -45,15 +45,30 @@ torchrun --standalone --nnodes 1 --nproc-per-node "$NPROC" "$FINE_ALIGNED" \
   --dataset_name "$DSET" \
   --run_root_dir "$OUT" \
   --adapter_tmp_dir "${OUT}/adapter-tmp" \
-  --lora_rank 32 --lora_dropout 0.0 \
+  --lora_rank "${SFT_RANK:-32}" --lora_dropout 0.0 \
   --batch_size 8 --grad_accumulation_steps "$GACC" \
-  --learning_rate 5e-4 --image_aug True \
+  --learning_rate "${SFT_LR:-5e-4}" --image_aug True \
   --max_steps "$MAXSTEPS" --save_steps "$SAVESTEPS" \
   --save_latest_checkpoint_only "${SFT_SAVE_LATEST:-True}" \
   --wandb_project inc_sft --wandb_entity none
 rc=${PIPESTATUS[0]}
 echo "INC_SFT_TRAIN_DONE rc=$rc $(date '+%F %T')"
 [ "$rc" -ne 0 ] && exit "$rc"
+
+# ADAPTER-ONLY mode: finetune.py wrote per-step LoRA adapters under $OUT/adapters/step_N (no merged HF,
+# no RAM spike). Force-copy STATS130 into each (belt-and-suspenders) and stop — eval merges base+adapter post-hoc.
+if [ "${SFT_ADAPTER_ONLY:-0}" = "1" ]; then
+  N=0
+  for d in "$OUT"/*/adapters/step_*/; do
+    [ -f "${d}adapter_config.json" ] || continue
+    cp -f "$STATS130" "${d}dataset_statistics.json"
+    echo "INC_SFT_ADAPTER=${d%/}"
+    N=$((N+1))
+  done
+  [ "$N" -eq 0 ] && { echo "ABORT: no per-step adapter under $OUT/*/adapters"; exit 1; }
+  echo "INC_SFT_DONE (adapter-only, $N adapters) $(date '+%F %T')"
+  exit 0
+fi
 
 # finetune.py MERGES + saves a full HF model (model.safetensors.index.json) at each save_step
 # (and run_dir). Copy the libero_130 dataset_statistics into EVERY merged dir so any checkpoint

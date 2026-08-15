@@ -17,8 +17,11 @@ TEACHER="${2:?spatial teacher dir (frozen spatial specialist)}"
 OUT="${3:?out dir}"
 LAMBDA="${4:-1.0}"; MAXSTEPS="${5:-1500}"; SAVESTEPS="${6:-500}"; GPUS="${7:-4,5,6,7}"
 NPROC=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
-OBJ_DSET="libero_object_no_noops"      # NEW task (SFT, ground-truth)
-SPA_DSET="libero_spatial_no_noops"     # anchor (KL to frozen spatial teacher)
+# NEW task (SFT, ground-truth) and ANCHOR data (KL to the frozen teacher). Both are env-
+# configurable so the SAME script does stage-2 (new=object, anchor=spatial) and stage-3
+# (new=goal, anchor=spatial or object — anchor the suites the teacher already knows).
+OBJ_DSET="${LWF_NEW_DSET:-libero_object_no_noops}"
+SPA_DSET="${LWF_ANCHOR_DSET:-libero_spatial_no_noops}"
 GACC=$(( 64 / (8 * NPROC) )); [ "$GACC" -lt 1 ] && GACC=1
 
 REPO=/home/fanruochen/CL/RLinf
@@ -30,7 +33,10 @@ FINE_LWF="$REPO/examples/embodiment/incremental_sft/finetune_lwf.py"
 [ -f "$INIT/model.safetensors.index.json" ]    || { echo "ABORT: init not an HF model: $INIT"; exit 1; }
 [ -f "$TEACHER/model.safetensors.index.json" ] || { echo "ABORT: teacher not an HF model: $TEACHER"; exit 1; }
 [ -d "$DROOT/$OBJ_DSET" ] || { echo "ABORT: object RLDS missing: $DROOT/$OBJ_DSET"; exit 1; }
-[ -d "$DROOT/$SPA_DSET" ] || { echo "ABORT: spatial RLDS missing: $DROOT/$SPA_DSET"; exit 1; }
+# SPA_DSET may be a COMMA-SEPARATED list of anchor suites -> validate each one
+for _a in ${SPA_DSET//,/ }; do
+  [ -d "$DROOT/$_a" ] || { echo "ABORT: anchor RLDS missing: $DROOT/$_a"; exit 1; }
+done
 [ -f "$NORM130" ]         || { echo "ABORT: norm override missing: $NORM130"; exit 1; }
 
 source /home/fanruochen/.rlinf-env.sh 2>/dev/null
@@ -64,6 +70,17 @@ torchrun --standalone --nnodes 1 --nproc-per-node "$NPROC" "$FINE_LWF" \
 rc=${PIPESTATUS[0]}
 echo "LWF_SFT_TRAIN_DONE rc=$rc $(date '+%F %T')"
 [ "$rc" -ne 0 ] && exit "$rc"
+
+if [ "${SFT_ADAPTER_ONLY:-0}" = "1" ]; then
+  N=0
+  for d in "$OUT"/*/adapters/step_*/; do
+    [ -f "${d}adapter_config.json" ] || continue
+    cp -f "$STATS130" "${d}dataset_statistics.json"
+    echo "LWF_SFT_ADAPTER=${d%/}"; N=$((N+1))
+  done
+  [ "$N" -eq 0 ] && { echo "ABORT: no per-step adapter under $OUT/*/adapters"; exit 1; }
+  echo "LWF_SFT_DONE (adapter-only, $N adapters) $(date '+%F %T')"; exit 0
+fi
 
 FOUND=0
 for d in $(ls -dt "$OUT"/*/ 2>/dev/null | grep -v adapter-tmp); do
