@@ -271,6 +271,27 @@ class WorkerGroup(Generic[WorkerClsType]):
                     accelerator_type, placement.visible_accelerators
                 )
             )
+            # Forward the driver's OFFSCREEN-RENDER environment to every worker. Ray workers are
+            # forked from the raylet, which inherits the LOGIN shell env -- NOT the env the launch
+            # script exported -- so MUJOCO_GL/EGL never reached the env workers and MuJoCo's EGL
+            # init failed, silently falling back to CPU rendering. Measured on one LIBERO env:
+            # physics is only 0.19 ms/step but a step with GPU-EGL render is 27.7 ms vs ~70 ms in
+            # training, i.e. rendering (not physics) is the rollout bottleneck and it was running
+            # on the CPU. LD_LIBRARY_PATH in particular MUST be set before the process starts
+            # (the dynamic linker reads it at exec), so it has to come in through runtime_env.
+            # Only variables actually present in the driver are forwarded -> no behaviour change
+            # for setups that don't use the isolated GL stack.
+            for _rv in (
+                "MUJOCO_GL",
+                "PYOPENGL_PLATFORM",
+                "LD_LIBRARY_PATH",
+                "__EGL_VENDOR_LIBRARY_FILENAMES",
+                "VK_ICD_FILENAMES",
+                "MUJOCO_EGL_DEVICE_ID",
+            ):
+                _val = os.environ.get(_rv)
+                if _val:
+                    env_vars.setdefault(_rv, _val)
 
             worker = self._cluster.allocate(
                 cls=self._worker_cls,
