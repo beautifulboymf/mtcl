@@ -192,14 +192,24 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla = vla.to(device_id)
 
     if cfg.use_lora:
-        lora_config = LoraConfig(
-            r=cfg.lora_rank,
-            lora_alpha=min(cfg.lora_rank, 16),
-            lora_dropout=cfg.lora_dropout,
-            target_modules="all-linear",
-            init_lora_weights="gaussian",
-        )
-        vla = get_peft_model(vla, lora_config)
+        # RESUME (SFT_INIT_ADAPTER=<dir>): continue training an EXISTING LoRA adapter of the same
+        # rank instead of a fresh gaussian init -- same mechanism as vla-scripts/finetune.py:174.
+        # This is what makes a long run restartable: it can be stopped, and picked back up from any
+        # saved `adapters/step_N` (optionally on MORE gpus, since only the adapter carries state).
+        # The optimizer state is NOT restored; with the constant lr it re-warms within a few steps.
+        _init_adapter = os.environ.get("SFT_INIT_ADAPTER", "")
+        if _init_adapter:
+            print(f"[resume] init LoRA from existing adapter: {_init_adapter}", flush=True)
+            vla = PeftModel.from_pretrained(vla, _init_adapter, is_trainable=True)
+        else:
+            lora_config = LoraConfig(
+                r=cfg.lora_rank,
+                lora_alpha=min(cfg.lora_rank, 16),
+                lora_dropout=cfg.lora_dropout,
+                target_modules="all-linear",
+                init_lora_weights="gaussian",
+            )
+            vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
 
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)

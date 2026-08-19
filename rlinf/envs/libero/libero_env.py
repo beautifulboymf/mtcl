@@ -619,6 +619,37 @@ class LiberoEnv(gym.Env):
         episode_info["reward"] = episode_info["return"] / np.maximum(
             episode_len_for_reward, 1
         )
+
+        # PER-SUITE success, for multi-teacher CL. The combined success_once averages the
+        # suites together, which hides exactly what we need to see: whether the suites move
+        # ANTI-CORRELATED step to step (= the teachers really are fighting) or all drift down
+        # together (= a shared capacity/drift problem, not a conflict).
+        # Emitted as numerator/denominator PAIRS rather than a ratio: a rank may hold zero envs
+        # of a given suite, and a per-rank ratio would be undefined there and poison the
+        # cross-rank average. num/den each aggregate linearly, so suite SR = mean(num)/mean(den)
+        # is correct no matter how many envs of that suite a rank happens to hold.
+        # NB: only the id->suite dict is cached. self.task_ids is re-drawn every reset
+        # (update_reset_state_ids -> _init_task_and_trial_ids), so caching the per-env suite
+        # array would go stale and mis-attribute successes to the wrong suite.
+        if getattr(self, "_id_to_suite", None) is None:
+            self._id_to_suite = get_libero130_task_id_to_suite()
+            # FIXED key set, computed from the id->suite map (identical on every rank), NOT from
+            # the suites this rank happens to hold. all_reduce_dict packs the metric dict into ONE
+            # tensor whose size is the KEY COUNT, so if rank 0 emits {spatial,object} and rank 1
+            # emits {goal,libero_10} the two ranks all-reduce different-sized tensors and the
+            # collective blocks forever -- which is what hung the 4-GPU 4-teacher run on 2026-08-19
+            # (85 min of zero log output with all four GPUs pinned at 100%: NCCL spin-waits, so a
+            # deadlock looks exactly like full utilisation). Single-rank and single-suite runs never
+            # exposed it because every rank emitted the same keys by luck.
+            self._all_suites = sorted(set(self._id_to_suite.values())) + ["unknown"]
+        suite_of_env = np.array(
+            [str(self._id_to_suite.get(int(t), "unknown")) for t in self.task_ids]
+        )
+        for _s in self._all_suites:
+            _m = (suite_of_env == _s).astype(np.float32)   # all-zero when this rank holds none
+            episode_info[f"succ_num_{_s}"] = self.success_once.astype(np.float32) * _m
+            episode_info[f"succ_den_{_s}"] = _m
+
         infos["episode"] = to_tensor(episode_info)
         return infos
 

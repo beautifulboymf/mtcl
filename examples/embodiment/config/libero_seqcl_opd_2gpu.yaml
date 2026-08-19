@@ -90,7 +90,20 @@ algorithm:
 
   sampling_params:
     do_sample: True
-    temperature_train: 1.6
+    # 1.0, NOT 1.6. This knob does double duty: it sets the rollout sampling temperature AND it
+    # scales the logits that become `action_logits`
+    # (models/embodiment/openvla_oft/rlinf/openvla_oft_action_model.py:537
+    #  `processed_logits_tensor = logits / kwargs["temperature"]`),
+    # which are exactly the tensors the OPD forward-KL is computed on for BOTH student and teacher.
+    # At 1.6 the KL is taken between two flattened distributions, so the peak contributes almost
+    # nothing and the argmax goes essentially unsupervised. Measured consequence (2026-08-17):
+    # the teacher's top-1 action ends up at rank ~3.7 in the student, greedy eval collapses to 0.16
+    # on spatial while the same weights score 0.86 at temperature 1.3, and the model's optimal
+    # deployment temperature drifts up to ~the training temperature. At 1.0 the KL is taken between
+    # the true distributions and the argmax is supervised normally.
+    # Side effect to keep in mind: rollout exploration drops with it (1.6 -> 1.0). If state
+    # diversity turns out to matter, decouple the two uses rather than raising this back up.
+    temperature_train: 1.0
     temperature_eval: 1.6
     top_k: -1
     top_p: 1.0

@@ -42,9 +42,21 @@ echo "OPD_TRAIN_DONE $(date '+%F %T')"
 
 CKPT=$(find "$LOGP" -name full_weights.pt -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
 [ -z "$CKPT" ] && { echo "ABORT: no full_weights.pt under $LOGP"; exit 1; }
-CONV="$LOGP/converted/${TAG}"
-echo "======== CONVERT $CKPT -> $CONV (base=$(basename "$INIT")) ========"
-bash "$SCRIPTS/convert_oft_lora_ckpt.sh" "$CKPT" "$CONV" "$INIT"
-[ -f "$CONV/model.safetensors.index.json" ] || { echo "ABORT: convert failed"; exit 1; }
-echo "OPD_CONVERTED=$CONV"
+# OPD_NO_MERGE=1: keep the result as a standalone PEFT adapter (~1G) instead of merging it into a
+# 15G HF model. The artifact stays `base + adapter`, which is what the teacher set wants, and it
+# writes 15x less to disk. Default stays the merge so existing callers are unchanged.
+if [ "${OPD_NO_MERGE:-0}" = "1" ]; then
+  CONV="$LOGP/adapter/${TAG}"
+  echo "======== EXTRACT ADAPTER $CKPT -> $CONV (base=$(basename "$INIT")) ========"
+  CUDA_VISIBLE_DEVICES="" nice -n 10 ionice -c 3 \
+    "$PY" "$SCRIPTS/extract_lora_adapter.py" "$CKPT" "$CONV" "$INIT" "${OPD_LORA_RANK:-128}"
+  [ -f "$CONV/adapter_model.safetensors" ] || { echo "ABORT: adapter extract failed"; exit 1; }
+  echo "OPD_ADAPTER=$CONV"
+else
+  CONV="$LOGP/converted/${TAG}"
+  echo "======== CONVERT $CKPT -> $CONV (base=$(basename "$INIT")) ========"
+  bash "$SCRIPTS/convert_oft_lora_ckpt.sh" "$CKPT" "$CONV" "$INIT"
+  [ -f "$CONV/model.safetensors.index.json" ] || { echo "ABORT: convert failed"; exit 1; }
+  echo "OPD_CONVERTED=$CONV"
+fi
 echo "OPD_${TAG}_DONE $(date '+%F %T')"

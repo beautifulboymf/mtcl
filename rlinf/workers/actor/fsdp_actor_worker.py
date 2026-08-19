@@ -1122,21 +1122,34 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             # cost 1 base + N small adapters instead of N full models -- without this, 3
             # teachers + the student = 4x7B and the run OOMs on 2 GPUs.
             _paths = list(dict.fromkeys(_tmap.values()))
-            _bases = {p.split("::", 1)[0] for p in _paths}
             _all_adapters = all("::" in str(p) for p in _paths)
             self.teacher_adapter_of_path = None
-            if _all_adapters and len(_bases) == 1 and len(_paths) > 1:
-                _shared = _load_one(_paths[0])          # base + first adapter (name "default")
-                _pm = _shared if hasattr(_shared, "load_adapter") else getattr(_shared, "model", None)
-                self.teacher_adapter_of_path = {_paths[0]: "default"}
-                for _i, _p in enumerate(_paths[1:], start=1):
-                    _name = f"t{_i}"
-                    _pm.load_adapter(_p.split("::", 1)[1], adapter_name=_name)
-                    self.teacher_adapter_of_path[_p] = _name
+            if _all_adapters and len(_paths) > 1:
+                # GROUP BY BASE, rather than demanding a single base for all teachers. The 4-teacher
+                # set has two lineages -- spatial/object/goal sit on base_stats130 while the long
+                # teacher sits on the CL student's own merged model -- and the old "len(bases)==1"
+                # test failed that outright, silently falling back to loading FOUR full 7B teachers
+                # (the 78.5 GiB OOM). Per base we pay one 7B and attach that base's adapters, so
+                # here it is 2 bases + 4 adapters instead of 4 full models.
+                # Adapter names only have to be unique WITHIN one model, so each group may reuse
+                # "default"; the routing code looks up teacher_models[path] first, then switches to
+                # teacher_adapter_of_path[path] on THAT model.
+                _by_base = {}
                 for _p in _paths:
-                    self.teacher_models[_p] = _shared   # same object; adapter switched per suite
+                    _by_base.setdefault(_p.split("::", 1)[0], []).append(_p)
+                self.teacher_adapter_of_path = {}
+                for _gi, (_b, _ps) in enumerate(_by_base.items()):
+                    _shared = _load_one(_ps[0])         # base + its first adapter (name "default")
+                    _pm = _shared if hasattr(_shared, "load_adapter") else getattr(_shared, "model", None)
+                    self.teacher_adapter_of_path[_ps[0]] = "default"
+                    for _i, _p in enumerate(_ps[1:], start=1):
+                        _name = f"g{_gi}t{_i}"
+                        _pm.load_adapter(_p.split("::", 1)[1], adapter_name=_name)
+                        self.teacher_adapter_of_path[_p] = _name
+                    for _p in _ps:
+                        self.teacher_models[_p] = _shared  # one object per BASE; adapter per suite
                 self.log_info(
-                    f"[VLA-OPD] SHARED-BASE teachers: 1 base + {len(_paths)} adapters "
+                    f"[VLA-OPD] SHARED-BASE teachers: {len(_by_base)} base(s) + {len(_paths)} adapters "
                     f"{list(self.teacher_adapter_of_path.values())}"
                 )
                 for suite, path in _tmap.items():
@@ -1224,6 +1237,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         what makes "one student, N per-suite expert teachers" work: every sample is scored by
         the expert for ITS suite, never by another suite's expert.
         """
+        # OPD_DUMP_STATES=<path>: save ONE micro-batch of the student's OWN on-policy rollout
+        # states, then exit. Offline teacher-comparison studies otherwise have to use expert DEMO
+        # states, which is the wrong distribution -- OPD's whole point is that the teacher scores
+        # the states the STUDENT actually visits (and the measured teacher-student gap there was
+        # far larger than on demo states). Env-gated, off by default, writes once.
+        _dump = os.environ.get("OPD_DUMP_STATES", "")
+        if _dump and not getattr(self, "_states_dumped", False):
+            self._states_dumped = True
+            try:
+                torch.save(
+                    {k: v.detach().cpu() for k, v in forward_inputs.items() if torch.is_tensor(v)},
+                    _dump,
+                )
+                self.log_info(f"[VLA-OPD] dumped on-policy states -> {_dump}")
+                print(f"OPD_STATES_DUMPED={_dump}", flush=True)
+            except Exception as e:
+                print(f"OPD_STATES_DUMP_FAILED {e}", flush=True)
+
         _route = getattr(self, "teacher_prompt_to_suite", None)
         _models = getattr(self, "teacher_models", None)
         if not _route or not _models or len(_models) <= 1:
@@ -1259,6 +1290,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     break
             path = self.teacher_suite_to_path.get(suite, _default_path) if suite else _default_path
             groups.setdefault(path, []).append(i)
+
+        # Expose the routing so the OPD loss can (a) build per-suite masks and (b) CROSS-SCORE:
+        # re-score suite i's states with suite j's expert. Cross-scoring is the functional-space
+        # test of "do the teachers fight" -- if KL(expert_j || student) RISES on suite i's states
+        # while KL(expert_i || student) falls, the student is paying for one teacher with another.
+        # Note the teachers never meet in the loss itself (each scores only its own suite), so any
+        # conflict has to be parameter-level interference; this measures its behavioural shadow.
+        self._last_groups = groups
 
         if len(groups) == 1:  # whole micro-batch is one suite -> single forward
             only_path = next(iter(groups))
@@ -1300,6 +1339,257 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"[VLA-OPD] multi-teacher forward: micro-batch split across "
                 f"{len(groups)} expert(s)"
             )
+        return out
+
+    @torch.no_grad()
+    def _cross_score(self, forward_inputs, kwargs, ls, loss_mask, sad):
+        """DIAGNOSTIC ONLY (no grad, no effect on the loss): on each suite's own rollout states,
+        measure forward-KL(expert_j || student) for EVERY expert j, not just that suite's own.
+
+        Returns {"actor/xkl_<states_suite>_by_<expert_suite>": float}. The diagonal
+        (states_suite == expert_suite) is the quantity training actually minimises; the
+        off-diagonal is the one nobody optimises. Reading them together over training answers
+        "are the teachers fighting" in behaviour space:
+          diagonal down + off-diagonal UP   -> the student buys one teacher by selling another
+          both down                          -> the experts are compatible, conflict is not the story
+          off-diagonal flat                  -> the experts simply live in disjoint state regions
+
+        Requires the shared-base setup (all experts = one base + different LoRA adapters), which is
+        what makes this cheap: swapping an adapter costs nothing next to loading another 7B.
+        """
+        out: dict = {}
+        groups = getattr(self, "_last_groups", None)
+        ad_of = getattr(self, "teacher_adapter_of_path", None)
+        if not groups or not ad_of or len(groups) < 2:
+            return out
+        suite_of_path = {v: k for k, v in getattr(self, "teacher_suite_to_path", {}).items()}
+        models = getattr(self, "teacher_models", None) or {}
+
+        for st_path, idxs in groups.items():
+            st_name = str(suite_of_path.get(st_path, "unk")).replace("libero_", "")
+            sel = torch.as_tensor(idxs, device=ls.device, dtype=torch.long)
+            sub_inputs = {
+                k: (v[sel] if torch.is_tensor(v) and v.shape[0] == ls.shape[0] else v)
+                for k, v in forward_inputs.items()
+            }
+            ls_sub = ls[sel]
+            if loss_mask is not None:
+                m = (
+                    loss_mask[sel]
+                    .to(ls.dtype)
+                    .unsqueeze(-1)
+                    .expand(-1, -1, sad)
+                    .reshape(ls_sub.shape[0], -1)
+                )
+            else:
+                m = torch.ones(ls_sub.shape[:2], dtype=ls.dtype, device=ls.device)
+            for ex_path, ex_ad in ad_of.items():
+                ex_name = str(suite_of_path.get(ex_path, "unk")).replace("libero_", "")
+                mdl = models.get(ex_path, None)
+                if mdl is None:
+                    continue
+                pm = mdl if hasattr(mdl, "set_adapter") else getattr(mdl, "model", None)
+                if pm is None:
+                    continue
+                pm.set_adapter(ex_ad)
+                o = mdl(
+                    forward_inputs=sub_inputs, compute_logprobs=True, use_cache=False, **kwargs
+                )
+                if "action_logits" not in o:
+                    continue
+                # Skip when this group has NO valid positions: dividing by clamp_min(1.0) would
+                # emit a literal 0.0 that _probe_emit then reports as a MEASURED zero (n=1),
+                # dragging the cross-rank average down with a value that means "nothing to
+                # measure". Observed on 2026-08-17 as xkl_object_by_object=0.0 at n=0.25.
+                denom = m.sum()
+                if denom.item() <= 0:
+                    continue
+                lt_x = torch.log_softmax(o["action_logits"].float(), dim=-1)
+                kl = (lt_x.exp() * (lt_x - ls_sub)).sum(dim=-1)  # forward KL, per action token
+                out[f"actor/xkl_{st_name}_by_{ex_name}"] = ((kl * m).sum() / denom).item()
+        return out
+
+    # ---- probe metric plumbing -------------------------------------------------------------
+    # all_reduce_dict (rlinf/utils/distributed.py) packs the metric dict into ONE tensor whose
+    # length is the NUMBER OF KEYS, then all_reduces it. Every rank must therefore emit the
+    # IDENTICAL key set, or the collective is called with mismatched sizes and NCCL hangs until
+    # the 30-minute watchdog fires. That is exactly what killed the 2026-08-17 diagnostic run:
+    # the cross-scoring probe only fires on micro-batches containing >=2 suites, which is
+    # data-dependent and therefore rank-dependent, so rank 1 packed a different-length tensor
+    # than ranks 0/2/3 and all four deadlocked.
+    #
+    # Fix, made structural rather than careful: the key list is computed ONCE from teacher_map
+    # (identical on every rank) and EVERY key is emitted on EVERY rank, every step. A probe that
+    # did not run contributes 0.0 plus a companion "<key>__n"=0.0. Since the reduction is AVG,
+    # the true mean over the ranks that measured is reduced("<key>")/reduced("<key>__n") -- the
+    # 1/world_size factor cancels between the two.
+    def _probe_key_list(self):
+        if getattr(self, "_probe_keys", None) is not None:
+            return self._probe_keys
+        suites = sorted(
+            str(s).replace("libero_", "")
+            for s in (getattr(self, "teacher_suite_to_path", None) or {})
+        )
+        if not suites:
+            # called before the teacher map exists -> do NOT cache an empty list, or the probe
+            # keys would be permanently missing (silently, which is how the last two bugs hid)
+            return []
+        keys: list[str] = []
+        if self.cfg.algorithm.get("cross_score", False):
+            keys += [f"actor/xkl_{a}_by_{b}" for a in suites for b in suites]
+        if self.cfg.algorithm.get("signal_stats", False):
+            keys += [
+                "actor/stu_entropy",
+                "actor/tea_entropy",
+                "actor/topk5_overlap",
+                "actor/tea_top1_rank_in_stu",
+            ]
+            keys += [
+                f"actor/{p}_{q}"
+                for p in ("frac", "klmass")
+                for q in ("hiH_hiKL", "hiH_loKL", "loH_hiKL", "loH_loKL")
+            ]
+        if self.cfg.algorithm.get("grad_conflict", False):
+            keys += [f"actor/gnorm_{s}" for s in suites]
+            keys += [
+                f"actor/gcos_{suites[i]}_{suites[j]}"
+                for i in range(len(suites))
+                for j in range(i + 1, len(suites))
+            ]
+        self._probe_keys = sorted(keys)
+        return self._probe_keys
+
+    def _probe_emit(self):
+        """Fixed-shape probe metrics for THIS rank. Always the same keys, on every rank."""
+        measured: dict = {}
+        for d in (
+            getattr(self, "_last_xkl", None),
+            getattr(self, "_last_sig", None),
+            getattr(self, "_last_gconf", None),
+        ):
+            if d:
+                measured.update(d)
+        out: dict = {}
+        for k in self._probe_key_list():
+            v = measured.get(k, None)
+            out[k] = float(v) if v is not None else 0.0
+            out[f"{k}__n"] = 1.0 if v is not None else 0.0
+        return out
+
+    @torch.no_grad()
+    def _signal_stats(self, ls, lt, kl_tok, mtok):
+        """DIAGNOSTIC ONLY: is this teacher's signal even ABSORBABLE, and where does it live?
+
+        (a) ABSORBABILITY. If the teacher's preferred action bin sits deep in the student's tail,
+            the student cannot move there in reasonable steps and the whole distillation target is
+            out of reach -- that would make every reweighting scheme moot, so it must be checked
+            BEFORE tuning any of them.
+              topk5_overlap        share of the teacher's top-5 bins that are also in the student's
+              tea_top1_rank_in_stu rank of the teacher's argmax under the student (0 = same choice;
+                                   large = the teacher is pointing somewhere the student ignores)
+
+        (b) WHERE THE SIGNAL IS. Split positions by student entropy and by KL, and report both the
+            share of POSITIONS and the share of total KL MASS in each quadrant. The mass share is
+            the one that matters: it says which region actually drives the gradient.
+              loH_hiKL = "confidently wrong" -- student is sure and disagrees with the teacher
+              hiH_*    = "unsure"            -- student has no opinion yet
+            Splits are at the batch median, so no threshold needs tuning.
+
+        No extra forward pass: ls/lt/kl_tok are already computed for the loss.
+        """
+        out: dict = {}
+        m = mtok > 0
+        if m.sum() < 8:
+            return out
+        # ls/lt are [B, tokens, V]; kl_tok/mtok are [B, tokens]
+        ps, pt = ls.exp(), lt.exp()
+        H_s = -(ps * ls).sum(-1)
+        H_t = -(pt * lt).sum(-1)
+        out["actor/stu_entropy"] = H_s[m].mean().item()
+        out["actor/tea_entropy"] = H_t[m].mean().item()
+
+        k = 5
+        t_top = lt.topk(k, dim=-1).indices
+        s_top = ls.topk(k, dim=-1).indices
+        inboth = (t_top.unsqueeze(-1) == s_top.unsqueeze(-2)).any(-1).float().mean(-1)
+        out[f"actor/topk{k}_overlap"] = inboth[m].mean().item()
+
+        t_arg = lt.argmax(-1, keepdim=True)
+        # rank of the teacher's argmax under the student = #bins the student prefers over it
+        rank = (ls > ls.gather(-1, t_arg)).sum(-1).float()
+        out["actor/tea_top1_rank_in_stu"] = rank[m].mean().item()
+
+        h, kv = H_s[m], kl_tok[m]
+        hm, km = h.median(), kv.median()
+        tot = kv.sum().clamp_min(1e-12)
+        n = float(h.numel())
+        for tag, sel in (
+            ("hiH_hiKL", (h > hm) & (kv > km)),
+            ("hiH_loKL", (h > hm) & (kv <= km)),
+            ("loH_hiKL", (h <= hm) & (kv > km)),
+            ("loH_loKL", (h <= hm) & (kv <= km)),
+        ):
+            out[f"actor/frac_{tag}"] = (sel.sum().item() / n) if n > 0 else 0.0
+            out[f"actor/klmass_{tag}"] = (kv[sel].sum() / tot).item()
+        return out
+
+    def _grad_conflict(self, kl_tok, mtok):
+        """DIAGNOSTIC ONLY: per-suite gradients of the distill loss, then pairwise cosine + norms.
+
+        Answers two DIFFERENT questions that "the teachers fight" conflates:
+          cos < 0            -> genuine directional conflict; gradient surgery (PCGrad) is justified
+          cos ~ 0            -> the experts are simply orthogonal; conflict is NOT the mechanism
+          |g_i| >> |g_j|     -> not conflict but DOMINANCE; a per-suite weight fixes it, and no
+                                amount of gradient surgery would
+        Cosine is a local first-order quantity and does NOT by itself explain the final SR gap --
+        it is used here to RULE OUT mechanisms, not to prove one.
+
+        Cost: one extra backward per suite on the probe micro-batch (retain_graph). Intended for
+        the small single-GPU debug run: at world_size=1 FSDP does no gradient sharding, so the
+        numbers are exact without any cross-rank reduction. On a sharded multi-GPU run these are
+        LOCAL-SHARD cosines and would need an all_reduce of the dot products to be meaningful.
+        """
+        out: dict = {}
+        groups = getattr(self, "_last_groups", None)
+        if not groups or len(groups) < 2:
+            return out
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        if not params:
+            return out
+        suite_of_path = {v: k for k, v in getattr(self, "teacher_suite_to_path", {}).items()}
+        grads: dict = {}
+        for path, idxs in groups.items():
+            name = str(suite_of_path.get(path, "unk")).replace("libero_", "")
+            rows = torch.zeros(kl_tok.shape[0], device=kl_tok.device, dtype=kl_tok.dtype)
+            rows[torch.as_tensor(idxs, device=kl_tok.device, dtype=torch.long)] = 1.0
+            m_s = mtok * rows.unsqueeze(-1)
+            den = m_s.sum()
+            if den.item() <= 0:
+                continue
+            loss_s = (kl_tok * m_s).sum() / den
+            g = torch.autograd.grad(
+                loss_s, params, retain_graph=True, allow_unused=True
+            )
+            # keep per-parameter (no torch.cat) -- concatenating would add a full extra copy
+            grads[name] = [None if gi is None else gi.detach().float() for gi in g]
+
+        names = sorted(grads)
+        norms = {}
+        for n in names:
+            sq = sum(float((gi * gi).sum()) for gi in grads[n] if gi is not None)
+            norms[n] = sq**0.5
+            out[f"actor/gnorm_{n}"] = norms[n]
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                a, b = grads[names[i]], grads[names[j]]
+                dot = sum(
+                    float((x * y).sum())
+                    for x, y in zip(a, b)
+                    if x is not None and y is not None
+                )
+                den = norms[names[i]] * norms[names[j]]
+                out[f"actor/gcos_{names[i]}_{names[j]}"] = dot / den if den > 0 else 0.0
+        del grads
         return out
 
     def _load_base_model(self) -> None:
@@ -1455,6 +1745,42 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
             rollout_batch["loss_mask"] = loss_mask
             rollout_batch["loss_mask_sum"] = loss_mask_sum
+
+        # FAILURE-ONLY distillation support (algorithm.distill_on_failure).
+        # "traj_fail" = 1 where the RETURN-TO-GO of this trajectory is zero, i.e. from this state
+        # onward the rollout never succeeded again. Computed HERE because this is the only place
+        # the data still carries its trajectory structure -- the shape is documented above as
+        # [n_chunk_step, rollout_epoch x bsz, num_action_chunks], so a trajectory is a fixed index
+        # in dim 1 running along dim 0. Doing it later (in the OPD loss, on a micro-batch) is what
+        # broke the first attempt: there each row is a single 8-action chunk, LIBERO's reward is
+        # ~1 only at the success instant, so "this row earned no reward" was true for 98% of rows
+        # regardless of whether its episode succeeded -- it just deleted the 2% of chunks that
+        # carried the success, the exact opposite of the intent (measured fail_frac=0.977 against
+        # success_once=0.736).
+        # env.train has auto_reset=False and ignore_terminations=False, so one trajectory slot
+        # holds exactly ONE episode and a plain reverse cumsum needs no per-done segment reset.
+        # Arm the cross-scoring probe ONCE per step. _process_received_rollout_batch runs exactly
+        # once per training step, whereas the loss body runs once per micro-batch (dozens of times
+        # a step) -- gating on "first micro-batch" there would fire once per global batch, not once
+        # per step. A latch set here and cleared by the first micro-batch is the cheap correct gate.
+        if self.cfg.algorithm.get("cross_score", False):
+            self._xscore_armed = True
+        if self.cfg.algorithm.get("grad_conflict", False):
+            self._gconf_armed = True
+        if self.cfg.algorithm.get("signal_stats", False):
+            self._sig_armed = True
+
+        if self.cfg.algorithm.get("distill_on_failure", False):
+            with torch.no_grad():
+                rw = rollout_batch["rewards"]  # [T, B, C]
+                T, B, C = rw.shape
+                # -> [B, T*C] laid out in trajectory time order, reverse-cumsum, back to [T, B, C]
+                r = rw.transpose(0, 1).reshape(B, T * C)
+                rtg = r.flip(-1).cumsum(-1).flip(-1)
+                fail = (rtg <= 0).to(rw.dtype)
+                rollout_batch["traj_fail"] = (
+                    fail.reshape(B, T, C).transpose(0, 1).contiguous()
+                )
 
         # filter data by rewards
         if self.cfg.algorithm.get("filter_rewards", False):
@@ -1880,6 +2206,29 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                     )
                                     conf_w = (1.0 - t_ent / ent_max).clamp_min(0.0).pow(_conf_tau)
                                 kl_tok = kl_tok * conf_w
+                            # FAILURE-ONLY distillation (distill_on_failure=True): only distill where
+                            # the student's own rollout FAILED. Where it already succeeds, the
+                            # teacher's disagreement is style, not substance -- we measured that
+                            # three models which ALL solve object still disagree on 25-42% of
+                            # actions, i.e. as much as the student-teacher gap itself, so copying it
+                            # wastes the shared LoRA capacity and is what makes several per-suite
+                            # experts fight each other.
+                            # The flag is "traj_fail", precomputed in _process_received_rollout_batch
+                            # where the trajectory structure still exists (see the comment there for
+                            # why computing it from this micro-batch's rewards is WRONG).
+                            _fail_only = bool(
+                                self.cfg.algorithm.get("distill_on_failure", False)
+                            )
+                            fail_m = None
+                            if _fail_only:
+                                fail_m = batch.get("traj_fail", None)
+                                if fail_m is None:
+                                    raise RuntimeError(
+                                        "distill_on_failure=True but 'traj_fail' is missing from the "
+                                        "batch -- it must be built in _process_received_rollout_batch; "
+                                        "refusing to silently fall back to distilling everything."
+                                    )
+                                fail_m = fail_m.to(kl_tok.dtype)
                             if loss_mask is not None:
                                 # loss_mask is per-chunk [B, chunks]; expand to per-token to mask kl_tok
                                 mtok = (
@@ -1888,9 +2237,78 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                     .expand(-1, -1, sad)
                                     .reshape(kl_tok.shape[0], -1)
                                 )
-                                opd_distill_loss = (kl_tok * mtok).sum() / mtok.sum().clamp_min(1.0)
                             else:
-                                opd_distill_loss = kl_tok.mean()
+                                mtok = torch.ones_like(kl_tok)
+                            if fail_m is not None:
+                                # traj_fail is per-chunk [B, chunks] like loss_mask -> expand the same way
+                                fm = (
+                                    fail_m.unsqueeze(-1)
+                                    .expand(-1, -1, sad)
+                                    .reshape(kl_tok.shape[0], -1)
+                                )
+                                mtok = mtok * fm
+                                # fraction of the VALID (loss_mask'd) positions we actually distil on.
+                                # SELF-CHECK: this must land near (1 - success_rate), NOT ~0.98.
+                                with torch.no_grad():
+                                    _base = (
+                                        loss_mask.to(kl_tok.dtype)
+                                        .unsqueeze(-1)
+                                        .expand(-1, -1, sad)
+                                        .reshape(kl_tok.shape[0], -1)
+                                        if loss_mask is not None
+                                        else torch.ones_like(kl_tok)
+                                    )
+                                    self._last_fail_frac = (
+                                        mtok.sum() / _base.sum().clamp_min(1.0)
+                                    ).item()
+                            opd_distill_loss = (kl_tok * mtok).sum() / mtok.sum().clamp_min(1.0)
+
+                            # How many suites this micro-batch actually contains. Both probes are
+                            # meaningless on a single-suite micro-batch (there is no other expert
+                            # to compare against), and whether the data mixes suites at all is an
+                            # empirical question about the rollout/shuffle pipeline -- so MEASURE
+                            # it instead of assuming. If this sits at 1.0 the probes are silently
+                            # inert and the routing/group_size has to change first.
+                            _ngrp = len(getattr(self, "_last_groups", {}) or {})
+                            self._last_nsuites = float(_ngrp)
+
+                            # absorbability / signal-location probe. NOT gated on multi-suite:
+                            # it asks about ONE teacher-student pair, so a single-suite micro-batch
+                            # is perfectly valid input.
+                            if getattr(self, "_sig_armed", False):
+                                self._sig_armed = False
+                                try:
+                                    self._last_sig = self._signal_stats(
+                                        ls.detach(), lt, kl_tok.detach(), mtok
+                                    )
+                                except Exception as _e:
+                                    self._last_sig = {}
+                                    self.log_warning(f"[VLA-OPD] signal_stats failed: {_e}")
+
+                            # Probes run on the first MIXED micro-batch of the step. The latch is
+                            # NOT cleared on a single-suite batch: clearing it there would spend
+                            # the step's one probe on a batch that can produce nothing.
+                            if getattr(self, "_xscore_armed", False) and _ngrp >= 2:
+                                try:
+                                    self._last_xkl = self._cross_score(
+                                        forward_inputs, kwargs, ls.detach(), loss_mask, sad
+                                    )
+                                    self._xscore_armed = False
+                                except Exception as _e:  # never let a probe kill a training run
+                                    self._last_xkl = {}
+                                    self._xscore_armed = False
+                                    self.log_warning(f"[VLA-OPD] cross_score failed: {_e}")
+
+                            # per-suite gradient conflict probe: first mixed micro-batch of the
+                            # step. MUST run before the real backward frees the graph.
+                            if getattr(self, "_gconf_armed", False) and _ngrp >= 2:
+                                try:
+                                    self._last_gconf = self._grad_conflict(kl_tok, mtok)
+                                    self._gconf_armed = False
+                                except Exception as _e:
+                                    self._last_gconf = {}
+                                    self._gconf_armed = False
+                                    self.log_warning(f"[VLA-OPD] grad_conflict failed: {_e}")
 
                         # ---- data-free BASE anchors (action-KL + visual-representation) ----
                         # (a) action anchor = mode-covering forward-KL to base on rollout states
@@ -1999,10 +2417,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         metrics_data = {
                             "actor/distill_loss": opd_distill_loss.detach().item()
                         }
+                        if getattr(self, "_last_fail_frac", None) is not None:
+                            # share of rollout samples that never succeeded = what we distill on
+                            metrics_data["actor/fail_frac"] = self._last_fail_frac
                         if anchor_loss is not None:
                             metrics_data["actor/anchor_loss"] = anchor_loss.detach().item()
                         if visual_loss is not None:
                             metrics_data["actor/visual_loss"] = visual_loss.detach().item()
+                        # cross-suite KL probe (diagonal = what training minimises, off-diagonal =
+                        # what nobody optimises); emitted on the probe micro-batch only, so it is
+                        # carried on self and re-emitted for the rest of the step's micro-batches.
+                        # ALWAYS emit, ALWAYS the same keys -- see _probe_key_list for why a
+                        # rank-dependent key set deadlocks the metric all_reduce.
+                        # 1.0 => micro-batches are single-suite => the cross-suite probes are inert
+                        metrics_data["actor/n_suites_in_batch"] = float(
+                            getattr(self, "_last_nsuites", 0.0) or 0.0
+                        )
+                        metrics_data.update(self._probe_emit())
                     else:
                         loss, metrics_data = policy_loss(**kwargs)
 

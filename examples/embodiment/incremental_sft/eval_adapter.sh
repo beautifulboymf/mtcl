@@ -40,7 +40,7 @@ ISO_RAY_PORT="${ISO_RAY_PORT:-29000}" bash /share/fanruochen-local/dev/scripts/r
     +rollout.model.is_lora=True +rollout.model.lora_path="$ADIR" +rollout.model.lora_rank="$RANK" \
     actor.model.is_lora=True actor.model.lora_path="$ADIR" actor.model.lora_rank="$RANK" \
     actor.model.unnorm_key=libero_130_no_noops_trajall \
-    algorithm.sampling_params.temperature_eval=0 \
+    algorithm.sampling_params.temperature_eval="${EVAL_TEMP:-0}" \
     env.eval.total_num_envs=50 env.train.total_num_envs=50 \
     env.eval.video_cfg.save_video=False \
   2>&1 | tee "$OUT/eval_${TAG}_${SUITE}.log"

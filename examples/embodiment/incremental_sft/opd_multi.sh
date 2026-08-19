@@ -62,6 +62,9 @@ ISO_RAY_PORT="${OPD_RAY_PORT:-28000}" bash "$SCRIPTS/run_iso.sh" \
     env.train.max_steps_per_rollout_epoch="${OPD_EP_STEPS:-512}" \
     actor.micro_batch_size="${OPD_MICRO:-8}" \
     ${OPD_GLOBAL_BATCH:+actor.global_batch_size=$OPD_GLOBAL_BATCH} \
+    ${OPD_SHIFT_BETA:+"+algorithm.shift_beta=$OPD_SHIFT_BETA"} \
+    ${OPD_FAIL_ONLY:+"+algorithm.distill_on_failure=$OPD_FAIL_ONLY"} \
+    ${OPD_EXTRA:+$OPD_EXTRA} \
     "${OVR[@]}"
 echo "OPD_TRAIN_DONE $(date '+%F %T')"
 

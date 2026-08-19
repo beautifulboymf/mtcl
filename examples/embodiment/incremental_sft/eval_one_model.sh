@@ -29,13 +29,20 @@ if [ ! -f "$WANT" ]; then
   echo "[eval_one] created $(basename "$WANT")"
 fi
 
+# EVAL_TEMP: decoding temperature. Default 0 = greedy, which is what every historical number in
+# this project was measured at -- do NOT change the default or past results stop being comparable.
+# Worth sweeping because the distill loss is FORWARD KL (mode-covering): it makes the student cover
+# the teacher's mass but does NOT preserve the argmax. The probes measured the teacher's top-1
+# sitting at rank ~3.7 in the student, i.e. greedy decoding plays an action the teacher would not,
+# so temp>0 can beat temp=0 for a mode-covering-distilled student.
+EVAL_TEMP="${EVAL_TEMP:-0}"
 echo "== df =="; df -h /share/fanruochen-local | tail -1
-echo "======== EVAL greedy [$TAG] $SUITE | $(basename "$MODEL") | GPU$GPU  $(date '+%F %T') ========"
+echo "======== EVAL temp=$EVAL_TEMP [$TAG] $SUITE | $(basename "$MODEL") | GPU$GPU  $(date '+%F %T') ========"
 ISO_RAY_PORT="${ISO_RAY_PORT:-29000}" bash "$SCRIPTS/run_iso.sh" \
   bash "$REPO/examples/embodiment/eval_embodiment.sh" "libero_${SUITE}_g${GPU}_eval" LIBERO \
     rollout.model.model_path="$MODEL" actor.model.model_path="$MODEL" \
     actor.model.unnorm_key=libero_130_no_noops_trajall actor.model.is_lora=False \
-    algorithm.sampling_params.temperature_eval=0 \
+    algorithm.sampling_params.temperature_eval="$EVAL_TEMP" \
     env.eval.total_num_envs=50 env.train.total_num_envs=50 \
     env.eval.video_cfg.save_video=False \
   2>&1 | tee "$OUT/eval_${TAG}_${SUITE}.log"
