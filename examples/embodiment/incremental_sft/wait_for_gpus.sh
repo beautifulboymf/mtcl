@@ -1,0 +1,136 @@
+#!/bin/bash
+# wait_for_gpus.sh — block until enough GPUs are genuinely idle, then run a command with GPUS= set.
+#
+#   wait_for_gpus.sh <command> [args...]
+#
+# WHY THIS EXISTS. Every card on this box belongs to someone at any given moment, and the useful
+# window opens without warning when a tenant's job ends. Sitting on `watch nvidia-smi` wastes the
+# window; launching on top of a tenant wastes their compute for hours. This waits, checks, and
+# only then hands over -- and it re-checks EVERY red line at the moment of launch, not once at the
+# start of the wait, because a volume that had room when the wait began may not when it ends.
+#
+# WHAT "IDLE" MEANS HERE, and why it is not just memory. This project once co-launched on top of
+# another tenant's compute-bound job that showed under 2% memory and 73-97% utilization, and ran
+# that way for a quarter of an hour. So a card counts as idle only if BOTH hold:
+#   * memory.used < MEM_MAX_MIB
+#   * at least UTIL_OK_N of UTIL_N utilization samples are under UTIL_MAX_PCT
+# Utilization is sampled repeatedly on purpose: one instantaneous reading lands in the gap between
+# kernels as often as not, and reads as free.
+#
+# CARD SELECTION.
+#   NEED_ALL   every one of these must be idle. Default 5,6,7.
+#   PICK_FROM  the remaining slots are filled from here, least-loaded first, and each candidate
+#              must pass the SAME idle test -- "least loaded" is a tie-break among idle cards, not
+#              a licence to take a busy one. Default 0,1,2,3,4.
+#   PICK_N     how many to take from PICK_FROM. Default 1, i.e. four cards total.
+# Note GPU 4-7 are frequently one four-GPU job, so when it ends GPU4 usually becomes the least
+# loaded card in PICK_FROM and gets chosen without anyone having to intervene.
+#
+# The command is exec'd with GPUS=<csv> exported. Everything else about it is the command's own
+# business -- this script does not know or care whether it is a smoke test or the real run.
+set -uo pipefail
+
+NEED_ALL="${NEED_ALL:-5,6,7}"
+PICK_FROM="${PICK_FROM:-0,1,2,3,4}"
+PICK_N="${PICK_N:-1}"
+MEM_MAX_MIB="${MEM_MAX_MIB:-5000}"
+UTIL_MAX_PCT="${UTIL_MAX_PCT:-20}"
+UTIL_N="${UTIL_N:-5}"
+UTIL_OK_N="${UTIL_OK_N:-4}"
+MEM_BUCKET_MIB="${MEM_BUCKET_MIB:-4096}"   # candidates within one bucket are ranked by utilization
+POLL_S="${POLL_S:-120}"
+MAX_WAIT_H="${MAX_WAIT_H:-12}"
+NEED_GB="${NEED_GB:-175}"
+ANON_MAX_G="${ANON_MAX_G:-200}"
+LOG="${WAIT_LOG:-/share/fanruochen-local/outputs/wait_for_gpus.log}"
+LOCK="${WAIT_LOCK:-/tmp/wait_for_gpus.lock}"
+
+(( $# >= 1 )) || { echo "usage: wait_for_gpus.sh <command> [args...]"; exit 2; }
+
+# Single instance. Two waiters would both fire into the same window and fight over the same cards.
+exec 9>"$LOCK" || { echo "cannot open lock $LOCK"; exit 1; }
+flock -n 9 || { echo "another wait_for_gpus.sh already holds $LOCK -- refusing to start a second"; exit 1; }
+
+say() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
+
+# Returns 0 if the card is idle by both measures. Echoes "mem util_mean n_busy" on stdout.
+probe_gpu() {
+  local g="$1" mem util busy=0 sum=0 i
+  mem=$(nvidia-smi -i "$g" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null) || return 2
+  for (( i = 0; i < UTIL_N; i++ )); do
+    util=$(nvidia-smi -i "$g" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null)
+    util=${util:-100}
+    sum=$(( sum + util ))
+    (( util < UTIL_MAX_PCT )) || busy=$(( busy + 1 ))
+    sleep 1
+  done
+  echo "$mem $(( sum / UTIL_N )) $busy"
+  (( mem < MEM_MAX_MIB )) || return 1
+  (( UTIL_N - busy >= UTIL_OK_N )) || return 1
+  return 0
+}
+
+say "waiting: NEED_ALL=$NEED_ALL  PICK_FROM=$PICK_FROM  PICK_N=$PICK_N"
+say "idle test: mem<${MEM_MAX_MIB}MiB AND >=${UTIL_OK_N}/${UTIL_N} samples under ${UTIL_MAX_PCT}%"
+say "gates at launch: disk>=${NEED_GB}G, cgroup anon<${ANON_MAX_G}G;  poll ${POLL_S}s, give up after ${MAX_WAIT_H}h"
+say "target: $*"
+
+DEADLINE=$(( $(date +%s) + MAX_WAIT_H * 3600 ))
+ROUND=0
+
+while :; do
+  ROUND=$(( ROUND + 1 ))
+  (( $(date +%s) < DEADLINE )) || { say "GIVING UP after ${MAX_WAIT_H}h -- window never opened"; exit 3; }
+
+  status=""; all_ok=1
+  for g in ${NEED_ALL//,/ }; do
+    read -r mem umean busy < <(probe_gpu "$g"); rc=$?
+    status+="$g:${mem}MiB/${umean}% "
+    (( rc == 0 )) || all_ok=0
+  done
+
+  chosen=""
+  if (( all_ok == 1 )); then
+    # Rank the candidates by memory, then by mean utilization, and keep only the idle ones.
+    cands=""
+    for g in ${PICK_FROM//,/ }; do
+      case ",$NEED_ALL," in *",$g,"*) continue ;; esac
+      read -r mem umean busy < <(probe_gpu "$g"); rc=$?
+      status+="($g:${mem}MiB/${umean}%)"
+      # Bucket the memory before ranking. On this box every candidate carries the same ~1960 MiB
+      # tenant footprint, so raw memory order is decided by a few MiB of noise and would happily
+      # pick a card at 69% utilization over one at 41%. Memory picks the tier; utilization picks
+      # within it -- which is the right way round, since compute is what we actually contend for.
+      (( rc == 0 )) && cands+="$(( mem / MEM_BUCKET_MIB )) $umean $mem $g"$'\n'
+    done
+    n_ok=$(printf '%s' "$cands" | grep -c . || true)
+    if (( n_ok >= PICK_N )); then
+      chosen=$(printf '%s' "$cands" | sort -k1,1n -k2,2n | head -n "$PICK_N" | awk '{print $4}' | paste -sd, -)
+    fi
+  fi
+
+  if [ -n "$chosen" ]; then
+    GPUS_SEL=$(printf '%s\n%s\n' "${NEED_ALL//,/$'\n'}" "${chosen//,/$'\n'}" | sort -n | paste -sd, -)
+    say "WINDOW OPEN round=$ROUND -> GPUS=$GPUS_SEL   [$status]"
+
+    # Re-check the red lines HERE, not at the top. The wait may have been hours; the volume and
+    # the container's memory are shared and move underneath us.
+    free=$(df -BG --output=avail /share/fanruochen-local 2>/dev/null | tail -1 | tr -dc '0-9')
+    if (( ${free:-0} < NEED_GB )); then
+      say "HOLDING: only ${free}G free on /share/fanruochen-local, need >=${NEED_GB}G. Free space; still waiting."
+      sleep "$POLL_S"; continue
+    fi
+    anon=$(awk '/^anon /{a=$2} /^slab /{s=$2} /^kernel_stack /{k=$2} END{printf "%.0f",(a+s+k)/1073741824}' /sys/fs/cgroup/memory.stat 2>/dev/null)
+    if (( ${anon:-999} >= ANON_MAX_G )); then
+      say "HOLDING: cgroup anon already ${anon}G (limit ${ANON_MAX_G}G). Still waiting."
+      sleep "$POLL_S"; continue
+    fi
+
+    say "LAUNCH  disk=${free}G anon=${anon}G  GPUS=$GPUS_SEL  cmd: $*"
+    export GPUS="$GPUS_SEL"
+    exec "$@"
+  fi
+
+  say "round=$ROUND not ready  [$status]"
+  sleep "$POLL_S"
+done

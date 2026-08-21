@@ -242,13 +242,19 @@ actor:
       # one suite's gradient into another suite's slot.
       slot_order: [libero_10, libero_goal, libero_spatial, libero_object]
       # Rank ~ each suite's DEFICIT at the starting model (long .56, goal .68, spatial .76,
-      # object .96): the further a suite is from its teacher, the more subspace it gets.
-      # Sum R = 128 + 64 + 48 + 16 = 256.
+      # object .96): the further a suite is from its teacher, the more subspace it gets --
+      # but with a FLOOR of 32. A rank-16 slot spans too thin a subspace to express much of an
+      # update no matter how small its deficit, and a slot that cannot move is indistinguishable
+      # from one that is never routed to.
+      # Sum R = 128 + 64 + 64 + 32 = 288. The tightest constraint is R <= d_in on every adapted
+      # module; the smallest adapted d_in in this model is 1024 (measured off mt4's own
+      # checkpoint: d_in histogram 1024x72, 1152x85, 2176x1, 4096x218, 4304x28, 8704x1,
+      # 11008x32), so 288 leaves a 3.5x margin.
       slot_ranks:
         libero_10: 128
         libero_goal: 64
-        libero_spatial: 48
-        libero_object: 16
+        libero_spatial: 64
+        libero_object: 32
       # Scale the A-side so a slot of rank r starts with the same update magnitude mt4's single
       # rank-128 LoRA had; without it the big and small slots would learn at different effective
       # rates and the rank split would confound the comparison.

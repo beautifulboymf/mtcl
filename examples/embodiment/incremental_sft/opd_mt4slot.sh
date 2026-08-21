@@ -4,7 +4,7 @@
 #
 #   student  = inc_sft_opd/lwf_long_e1000_merged      (byte-for-byte mt4's starting point)
 #   teachers = spatial | object | goal | long, routed per suite (mt4's exact set)
-#   slots    = libero_10:128  libero_goal:64  libero_spatial:48  libero_object:16   (R = 256)
+#   slots    = read from the config's actor.model.slot_lora (never restated here)
 #   config   = examples/embodiment/config/libero_mt4slot_6gpu.yaml
 #
 # WHY THE CONTROLS COST NOTHING. mt4 (4-suite mean 0.745) and mt4w2 (0.750) already ran this
@@ -54,7 +54,7 @@ LOGP="$O/seqcl_${TAG}"
 # and 15 plus `best` overwritten repeatedly, and mt4's surviving directories measure 32G each
 # (17G DCP shards + 15G full_weights.pt) -- 128G concurrent, already over the old floor.
 #
-#   R1 arithmetic: R = 256 is twice mt4's rank-128 LoRA, so ~36G per directory.
+#   R1 arithmetic: R = 288 is ~2.25x mt4's rank-128 LoRA, so ~36G per directory.
 #     STEPS/SAVE_INTERVAL = 15/5 = 3 periodic saves, + 1 for `best`   -> 4 x 36G = 144G peak
 #     + the merged HF model the convert step writes (~15G, measured)  -> 159G total after
 #   Floor 175G = 159G + ~16G of headroom for tensorboard/logs and a checkpoint that comes out
@@ -132,10 +132,26 @@ for row in "${TEACHERS[@]}"; do
   echo "  teacher ok  $s  r=$r  $(basename "$b")::$(basename "$a")"
 done
 
+# ---- slot layout -----------------------------------------------------------------------------
+# Derived from the config, never restated. The final review counted FOUR copies of this rank list
+# (YAML, this script, the converter's default, the converter wrapper's default) and only the SUM
+# is checkable against a checkpoint -- a wrong ORDER is undetectable because the merge sums over
+# every slot and is blind to where the partition falls. One source of truth is the only fix.
+read -r SLOT_ORDER_CSV SLOT_RANKS_CSV SLOT_R < <("$PY" - "$REPO/examples/embodiment/config/$CFG.yaml" <<'PYEOF'
+import sys
+from omegaconf import OmegaConf
+sl = OmegaConf.load(sys.argv[1]).actor.model.slot_lora
+order = list(sl.slot_order)
+ranks = [int(sl.slot_ranks[s]) for s in order]
+print(",".join(order), ",".join(map(str, ranks)), sum(ranks))
+PYEOF
+) || { echo "ABORT: could not read actor.model.slot_lora out of $CFG.yaml"; exit 1; }
+[ -n "$SLOT_RANKS_CSV" ] || { echo "ABORT: empty slot layout in $CFG.yaml"; exit 1; }
+
 echo "[preflight] disk=${free}G  gpus=$GPUS  student=$(basename "$STUDENT")  steps=$STEPS  port=$PORT"
 echo "== df =="; df -h /share/fanruochen-local | tail -1
 echo "======== SLOT-LORI R1 [$TAG] config=$CFG init=$(basename "$STUDENT") gpus=$GPUS steps=$STEPS  $(date '+%F %T') ========"
-echo "         slots: libero_10:128 libero_goal:64 libero_spatial:48 libero_object:16  (R=256)"
+echo "         slots: $SLOT_ORDER_CSV = $SLOT_RANKS_CSV  (R=$SLOT_R)"
 echo "         controls: mt4 0.745 (opd_mt4i_driver.log) / mt4w2 0.750 (opd_mt4w2_driver.log)"
 
 # ---- checkpoint reaper -------------------------------------------------------------------------
@@ -217,7 +233,7 @@ if [ ! -x "$CONVERTER" ]; then
   exit 0
 fi
 echo "======== CONVERT $CKPT -> $CONV (base=$(basename "$STUDENT")) ========"
-SLOT_RANKS=128,64,48,16 SLOT_SCALE_MODE=match_mt4 SLOT_REF_RANK=128 SLOT_EPS=1e-6 \
+SLOT_RANKS="$SLOT_RANKS_CSV" SLOT_SCALE_MODE=match_mt4 SLOT_REF_RANK=128 SLOT_EPS=1e-6 \
   bash "$CONVERTER" "$CKPT" "$CONV" "$STUDENT" libero_130_no_noops_trajall \
   || { echo "WARN: slot conversion failed; the training checkpoint is intact at $CKPT"; exit 0; }
 [ -f "$CONV/model.safetensors.index.json" ] || {
