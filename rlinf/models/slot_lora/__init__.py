@@ -14,6 +14,12 @@
 
 """slot-LoRI: per-suite LoRA slots on mutually orthogonal input subspaces."""
 
+from rlinf.models.slot_lora.inject import (
+    SlotInjection,
+    collect_slot_diag,
+    enable_slot_diag,
+    inject_slot_lora,
+)
 from rlinf.models.slot_lora.modules import (
     SlotGate,
     SlotLoRALinear,
@@ -31,4 +37,8 @@ __all__ = [
     "SlotOut",
     "SlotLoRALinear",
     "match_suite_ids",
+    "inject_slot_lora",
+    "SlotInjection",
+    "enable_slot_diag",
+    "collect_slot_diag",
 ]
