@@ -32,7 +32,13 @@ cd /home/fanruochen/CL/RLinf
 ```python
 from rlinf.models.slot_lora import SlotGate
 
-gate = SlotGate(strict=True)      # 每个模型一个，注入时创建，所有 gated 模块共享同一个引用
+gate = SlotGate(num_slots=len(slot_ranks), strict=True)   # 每个模型一个，注入时创建，所有 gated 模块共享同一引用
+# num_slots 是第一个位置参数，strict 必须按关键字传；SlotGate(True) 会 raise（bool 被显式拒绝，
+# 否则它会绑到 num_slots 上、悄悄建出一个单 slot 的 gate）。
+# 每个共享该 gate 的 SlotOut 都必须满足 len(slot_ranks) == gate.num_slots，否则构造期 raise ——
+# 否则 gate 说 4 而 B 只有 3 个 slot 时，id=3 能过范围校验却匹配不到任何 slot，同一个静默失败换个门进来。
+# num_slots=None 时 gate 拒绝安装任何非 None 的路由（单 suite 无路由的 run 不受影响）：跳过范围校验
+# 等于把保证悄悄降级，而『越界 id 与 -1 不可区分』正是这条校验存在的理由。
 
 class SlotOut(nn.Module):
     def __init__(self, out_features, slot_ranks, gate, ...):
@@ -47,7 +53,7 @@ with gate.scoped(ids):            # ids: LongTensor[B]，B = 本 micro-batch，-
 ```
 
 - `gate.current()` 严格读取（strict 下未设置就 raise）；`gate.current_unchecked()` 是唯一的逃生口，只给 metrics 用，故意起得难看以便在 diff 里显眼。
-- `SlotGate(strict=False)` 用于单 suite 无路由的 run；`gate.ungated()` 在 strict 模型里开一个不门控的窗口（eval / rollout）。
+- `SlotGate(num_slots=None, strict=False)` 用于单 suite 无路由的 run；`gate.ungated()` 在 strict 模型里开一个不门控的窗口（eval / rollout）。
 - **strict 还堵住了 holder 本身堵不住的一个洞**：作用域在 `.backward()` 之前就退出。这种情况现在 raise，而不是静默地重算成 ungated。
 - ids 的 device 归调用方管（读路径每次前向要跑 200-400 次，不能在那里 `.to(device)`）。
 - `self.gate = gate` 是普通对象属性，不增加 children 也不增加 parameter，所以 `utils.py:306` 的 FSDP 叶子判定仍然成立。
