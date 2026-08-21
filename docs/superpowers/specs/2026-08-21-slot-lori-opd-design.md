@@ -39,7 +39,7 @@ joint 4-teacher routed OPD 跑了两次，都只**搬运**能力、不**增加**
 
     Ā = (Z Zᵀ)^(-1/2) · Z          （对称/Löwdin 正交化）
 
-整个式子对 Z 可微（`torch.linalg.eigh` 支持反向），autograd 直接给出约束梯度，**不需要任何 optimizer 之后的投影/retraction 步骤**。正交性由构造保证，任何时刻 ĀĀᵀ = I。
+整个式子对 Z 可微（逆平方根用 Newton–Schulz 迭代实现，只含矩阵乘，全程可微；见下方数值细节），autograd 直接给出约束梯度，**不需要任何 optimizer 之后的投影/retraction 步骤**。正交性由构造保证，任何时刻 ĀĀᵀ = I。
 
 选它而不是"训完再正交化"的理由：后者是 optimizer.step() 之后的事后处理，不进计算图，训练目标和实际参数更新之间有一层不可见的修正；Z 参数化没有这个缝。
 
@@ -84,25 +84,27 @@ R = 256。d_in 最小的被 LoRA 模块（vision 侧约 1024）也远大于 256�
 新建 `SlotLoRALinear`，替换学生侧的 PEFT LoRA 注入（teacher / anchor 侧完全不动，仍走 PEFT）。
 
 ```
-SlotLoRALinear(base_linear, slot_ranks, scale)
+gate = SlotGate(num_slots=K, strict=True)        # 每个模型一个，注入时创建，全部 slot 模块共享
+
+SlotLoRALinear(base_linear, slot_ranks, scale, gate)
 ├── base   : nn.Linear，frozen（requires_grad=False）
 ├── slot_A : SlotProj  — weight = Z (R × d_in)，trainable，叶子模块
-└── slot_B : SlotOut   — weight = B (d_out × R)，trainable，零初始化，叶子模块
+└── slot_B : SlotOut   — weight = B (d_out × R)，trainable，零初始化，叶子模块，持有 gate 引用
 ```
 
 前向：
 
 ```
-h  = slot_A(x)                    # 内部：Ā = orth(Z); return F.linear(x, s·Ā)  -> (..., R)
-out = base(x) + slot_B(h, gates)  # 内部：按 rank 块切 h，逐 slot 算贡献后带门求和
+h  = slot_A(x)              # 内部：Ā = orth(Z); return F.linear(x, s·Ā)  -> (..., R)
+out = base(x) + slot_B(h)   # 路由从共享 gate 取，不走调用参数
 ```
 
-`SlotOut.forward(h, gates)`：
+`SlotOut.forward(h)`：
 
 ```
+ids = self.gate.current()                                           # strict：未安装路由就 raise
 c_k = F.linear(h[..., off_k:off_k+r_k], B[:, off_k:off_k+r_k])      # slot k 的贡献
-out = Σ_k [ c_k                if 该样本属于 suite k
-          | c_k.detach()       otherwise ]
+out = Σ_k torch.where(ids == k, c_k, c_k.detach())
 ```
 
 **为什么必须逐 slot 算贡献再 detach，而不是在 h 上乘门**（这条论证 2026-08-21 被变异测试纠正过一次，记下正确版本）：在 h 上乘 mask 的**梯度路由其实是对的** —— ∂L/∂B_j = Σ_i grad_out_i ⊗ (mask_i⊙h_i)_j，非归属块为 0。错的是**前向值**：out_i 只剩 owner slot 的贡献，模型不再是四个 slot 合并后的整体，训练和推理对不上，「全 slot 永远激活」这个前提直接没了。实测变异（把实现换成 mask h）只有「前向值等于全 slot 和」那一条测试失败，**所有梯度测试都通过** —— 所以那条测试是这一整类错误实现的唯一防线，不可删。
