@@ -1629,7 +1629,7 @@ git commit -m "feat(slot-lora): B,B,A alternating schedule with forced B ending 
 |---|---|---|
 | `slot/orth_err`（**fp32 口径**） | < 1e-3 | 1e-3~5e-2 = Z 正在退化；> 5e-2 = 已塌，结果无效。**不能读 bf16 的 Ā**：cond(Z) 10→20 时 fp32 误差涨 16 倍而 bf16 读数纹丝不动（0.01887→0.01894） |
 | `slot/cos_s_t`（6 个） | \|·\| < 1e-3 | > 5e-2 = 塌。与 orth_err 复用同一个 fp32 gram |
-| `slot/route_fallback_frac` | 0 | 路由表有洞，先修再跑 |
+| `slot/route_fallback_frac` | **必须恰为 0** | 非 0 = 路由表有洞。这类样本被「恰好第一个加载的」teacher 打分并计入 loss，梯度却进不了任何 slot —— 硬错误，停下修表，不要接着看结果 |
 | `slot/phase_is_A` | 约 1/3 | 交替调度没生效 |
 | `actor/dynw_*` | 随步数变化 | 恒为 1.000 = 动态权重仍是死的 |
 | `slot/dw_norm_k` | 逐步增长，long 最大 | 某个 slot 恒 0 = 该 suite 从未被路由到 |
@@ -1904,7 +1904,7 @@ bash /share/fanruochen-local/dev/scripts/safe_run.sh \
 
 1. 启动日志里 `[slot-lora] injected N SlotLoRALinear ... R=256`，N 与 mt4 的 LoRA 层数一致；
 2. `slot/orth_err` < 1e-3、6 个 `slot/cos_*` 全 < 1e-3（**fp32 口径**）—— 超过 5e-2 就是正交性塌了，整个 run 无意义；落在 1e-3~5e-2 之间说明 Z 在退化，别硬跑；
-3. `slot/route_fallback_frac` == 0；
+3. `slot/route_fallback_frac` **恰为 0**（非 0 是硬错误，不是警告——见 Task 11 的表）；
 4. `actor/dynw_*` 从第 2 步起不再是 1.000；
 5. **步 1-2 慢 5-6 倍是 inductor 预热，不是 bug**，第 3 步之前不要判断性能、也不要给 ETA。
 

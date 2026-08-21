@@ -126,7 +126,8 @@ frozen 的 `base` 是叶子但 `weight.requires_grad=False`，不会被单独包
 - **顺序陷阱（必须处理）**：学生前向在 `fsdp_actor_worker.py:2131`，`_teacher_forward` 在 `:2155` —— teacher 在**后**。所以 `self._last_groups`（`:1300` 才写入）在学生前向时是**上一个 micro-batch 的**，直接拿来当 gate 会整体错位一个 micro-batch。必须把"decode prompt → suite"抽成 `_route_prepare(forward_inputs)`，在**学生前向之前**调用，`_teacher_forward` 复用其结果（顺带省掉一次 `batch_decode`）。
 - 每个 micro-batch：`_route_prepare` 产出的 per-sample gate 张量通过**共享 holder** 交给所有 `SlotOut`（`with gate.scoped(ids):`）。**不能用 `ContextVar`** —— autograd 在 CUDA 上用每设备 worker 线程跑反向，gradient checkpointing 的重算发生在那里，ContextVar 会读到 `None` 从而静默地整个不门控（已实测复现）。holder 是普通对象属性，不受线程和重算影响。
 - **作用域必须同时覆盖 forward 和 backward**：checkpoint 会重跑 forward，若作用域在 `.backward()` 前就退出，strict 模式下会 raise（而不是静默 ungated）。
-- prompt 匹配不上时的 fallback：与 teacher 侧**完全一致**（落到 default），并记录 `route_fallback_frac`。这四个 suite 的 40 个任务 prompt 都在表里，预期为 0；非 0 说明路由表有洞，必须先修再看结果。
+- **未匹配样本：两侧行为本质不对称，所以 `route_fallback_frac != 0` 必须当作硬错误，不是警告。** teacher 侧（`fsdp_actor_worker.py:1291`）匹配不上时静默回落到 `_default_path`，也就是「恰好第一个加载的那个 teacher」；slot 侧 `match_suite_ids` 返回 `-1`，不归任何 slot。于是这样的样本会**被错误的专家打分并计入 `opd_distill_loss`**（污染 loss 读数），而梯度进不了任何 slot（base 冻结，slot 是唯一可训路径，全部 detach → 梯度恰好为零）。四个 suite 的 40 个任务 prompt 都在表里，预期为 0；**非 0 就停下修路由表，不要接着看结果**。
+- 顺带记录一个 teacher 侧的既有隐患（本次不改）：`path = ... if suite else _default_path` 判的是 `suite` 的真值而非 `is not None`，suite 名为空串时真匹配会被当成没匹配、静默转给 default teacher。今天 suite 名都非空所以是惰性的；`match_suite_ids` 用的是 `is not None`。
 
 ## 5. 交替训练调度
 
