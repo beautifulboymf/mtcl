@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from rlinf.models.slot_lora.modules import SlotGate, SlotProj
+from rlinf.models.slot_lora.modules import SlotGate, SlotOut, SlotProj
 
 
 def _ids(*values):
@@ -498,3 +498,229 @@ class TestSlotProjExtraState:
         assert list(p.named_children()) == []
         assert len(list(p.parameters())) == 1
         assert p.weight.requires_grad
+
+
+class TestSlotOut:
+    RANKS = (3, 5)  # slot0 -> columns 0:3, slot1 -> columns 3:8
+
+    def _out(self, out_features=6, strict=True):
+        torch.manual_seed(1)
+        gate = SlotGate(strict=strict)
+        m = SlotOut(out_features, self.RANKS, gate, dtype=torch.float64)
+        with torch.no_grad():
+            m.weight.copy_(
+                torch.randn_like(m.weight)
+            )  # B must be non-zero to test gating
+        return m, gate
+
+    def _h(self, batch=4):
+        return torch.randn(
+            batch, sum(self.RANKS), dtype=torch.float64, requires_grad=True
+        )
+
+    def test_offsets_and_total_rank(self):
+        m, _ = self._out()
+        assert m.total_rank == 8
+        assert m.offsets == (0, 3)
+
+    def test_b_is_zero_initialized(self):
+        assert (
+            torch.count_nonzero(SlotOut(6, self.RANKS, SlotGate(strict=False)).weight)
+            == 0
+        )
+
+    def test_is_a_leaf_module_so_fsdp_wraps_it_alone(self):
+        m, _ = self._out()
+        assert list(m.named_children()) == []
+        assert len(list(m.parameters())) == 1
+        assert m.weight.requires_grad
+
+    def test_forward_value_is_the_full_slot_sum_regardless_of_routing(self):
+        m, gate = self._out()
+        h = self._h()
+        with gate.ungated():
+            ungated = m(h)
+        with gate.scoped(torch.tensor([0, 1, 0, -1])):
+            routed = m(h)
+        assert torch.allclose(ungated, routed, atol=1e-12)
+
+    def test_forward_equals_a_plain_linear(self):
+        m, gate = self._out()
+        h = self._h()
+        with gate.ungated():
+            out = m(h)
+        assert torch.allclose(out, torch.nn.functional.linear(h, m.weight), atol=1e-12)
+
+    def test_gradient_reaches_only_the_owning_slot_columns(self):
+        m, gate = self._out()
+        h = self._h()
+        with gate.scoped(torch.tensor([0, 0, 0, 0])):
+            m(h).sum().backward()
+        assert m.weight.grad[:, 0:3].abs().sum() > 0
+        assert torch.count_nonzero(m.weight.grad[:, 3:8]) == 0
+
+    def test_gradient_to_h_is_blocked_outside_the_owning_block(self):
+        m, gate = self._out()
+        h = self._h()
+        with gate.scoped(torch.tensor([1, 1, 1, 1])):
+            m(h).sum().backward()
+        assert torch.count_nonzero(h.grad[:, 0:3]) == 0
+        assert h.grad[:, 3:8].abs().sum() > 0
+
+    def test_unrouted_samples_produce_no_gradient_at_all(self):
+        m, gate = self._out()
+        h = self._h()
+        with gate.scoped(torch.tensor([-1, -1, -1, -1])):
+            m(h).sum().backward()
+        assert torch.count_nonzero(m.weight.grad) == 0
+        assert torch.count_nonzero(h.grad) == 0
+
+    def test_mixed_batch_routes_each_sample_to_its_own_slot(self):
+        m, gate = self._out()
+        h = self._h()
+        with gate.scoped(torch.tensor([0, 1, -1, -1])):
+            m(h).sum().backward()
+        assert torch.count_nonzero(h.grad[0, 3:8]) == 0
+        assert h.grad[0, 0:3].abs().sum() > 0
+        assert torch.count_nonzero(h.grad[1, 0:3]) == 0
+        assert h.grad[1, 3:8].abs().sum() > 0
+        assert torch.count_nonzero(h.grad[2]) == 0
+        assert torch.count_nonzero(h.grad[3]) == 0
+
+    def test_per_slot_gradient_equals_the_isolated_reference(self):
+        # The gated gradient for slot k must equal what you would get by training slot k
+        # alone on its own samples -- gating must not merely zero the others, it must
+        # leave the owner's gradient numerically untouched.
+        m, gate = self._out()
+        h = self._h()
+        with gate.scoped(torch.tensor([0, 0, 1, 1])):
+            m(h).sum().backward()
+        gated = m.weight.grad.clone()
+
+        m2, gate2 = self._out()
+        h2 = self._h()
+        with gate2.ungated():
+            m2(h2[:2]).sum().backward()
+        assert torch.allclose(gated[:, 0:3], m2.weight.grad[:, 0:3], atol=1e-12)
+
+    def test_works_with_a_sequence_dimension(self):
+        m, gate = self._out()
+        h = torch.randn(4, 7, 8, dtype=torch.float64, requires_grad=True)
+        with gate.scoped(torch.tensor([0, 0, 1, 1])):
+            out = m(h)
+            assert out.shape == (4, 7, 6)
+            out.sum().backward()
+        assert torch.count_nonzero(h.grad[0, :, 3:8]) == 0
+
+    def test_rejects_routing_of_the_wrong_length(self):
+        m, gate = self._out()
+        h = self._h(batch=4)
+        with gate.scoped(torch.tensor([0, 1])):
+            try:
+                m(h)
+            except AssertionError:
+                return
+        raise AssertionError("expected an assertion on mismatched routing length")
+
+    def test_strict_gate_raises_when_routing_was_never_installed(self):
+        m, _ = self._out(strict=True)
+        try:
+            m(self._h())
+        except RuntimeError:
+            return
+        raise AssertionError("expected a strict-gate RuntimeError")
+
+    def test_survives_checkpoint_recomputation(self):
+        # Gradient checkpointing re-runs this forward during backward, on the autograd
+        # engine's worker thread. The gate must still be visible there, or gating is
+        # silently off and every slot gets gradient from every sample.
+        from torch.utils.checkpoint import checkpoint
+
+        m, gate = self._out()
+        h = self._h()
+        with gate.scoped(torch.tensor([0, 0, 0, 0])):
+            out = checkpoint(m, h, use_reentrant=False)
+            out.sum().backward()
+        assert torch.count_nonzero(m.weight.grad[:, 3:8]) == 0
+
+
+class TestSlotOutRankValidation:
+    """Same reasoning as SlotProj's: a bad rank list is a config error, so it has to
+    cost a construction rather than a full 7B model build plus an FSDP wrap."""
+
+    def test_rejects_an_empty_rank_list(self):
+        with pytest.raises(ValueError, match="at least one slot"):
+            SlotOut(6, (), SlotGate(strict=False))
+
+    def test_rejects_a_non_positive_rank(self):
+        for bad in ((3, 0), (0,), (3, -1)):
+            with pytest.raises(ValueError, match="strictly positive"):
+                SlotOut(6, bad, SlotGate(strict=False))
+
+
+class TestSlotOutDiag:
+    """The B-side halves of ⟨ΔW_s, ΔW_t⟩_F = tr(B_sᵀB_t · Ā_tĀ_sᵀ).
+
+    Only the small (R_t, R_s) blocks are ever materialized -- ΔW itself is d_out x d_in
+    and forming it to measure it would defeat the point of measuring it.
+    """
+
+    RANKS = (3, 5)
+
+    def _out(self, out_features=6, dtype=torch.float64):
+        torch.manual_seed(2)
+        m = SlotOut(out_features, self.RANKS, SlotGate(strict=False), dtype=dtype)
+        with torch.no_grad():
+            m.weight.copy_(torch.randn_like(m.weight))
+        return m
+
+    def _h(self, dtype=torch.float64):
+        return torch.randn(4, sum(self.RANKS), dtype=dtype)
+
+    def test_diag_is_off_by_default(self):
+        m = self._out()
+        with m.gate.ungated():
+            m(self._h())
+        assert m._diag is None
+
+    def test_diag_is_collected_once_when_armed(self):
+        m = self._out()
+        m._collect_diag = True
+        with m.gate.ungated():
+            m(self._h())
+        assert m._diag is not None
+        assert m._collect_diag is False
+        assert m._diag["b_norms"].shape == (2,)
+        assert set(m._diag["cross"]) == {(0, 1)}
+        # B_tᵀ B_s pairs elementwise with Ā_t Ā_sᵀ, so it is (R_t, R_s).
+        assert m._diag["cross"][(0, 1)].shape == (5, 3)
+
+    def test_diag_values_match_the_b_blocks(self):
+        m = self._out()
+        m._collect_diag = True
+        with m.gate.ungated():
+            m(self._h())
+        b = m.weight.detach().float()
+        b0, b1 = b[:, 0:3], b[:, 3:8]
+        assert torch.allclose(
+            m._diag["b_norms"], torch.stack([b0.norm(), b1.norm()]), atol=1e-6
+        )
+        assert torch.allclose(m._diag["cross"][(0, 1)], b1.T @ b0, atol=1e-6)
+
+    def test_diag_stays_fp32_inside_an_ambient_autocast(self):
+        # Same trap as SlotProj's Gram: autocast intercepts per op, so a bare matmul
+        # forming BᵀB is demoted right back down under an ambient bf16 autocast.
+        m = self._out(dtype=torch.bfloat16)
+        m._collect_diag = True
+        with torch.autocast("cpu", dtype=torch.bfloat16), m.gate.ungated():
+            m(self._h(dtype=torch.bfloat16))
+        assert m._diag["cross"][(0, 1)].dtype == torch.float32
+        assert m._diag["b_norms"].dtype == torch.float32
+
+    def test_diag_does_not_build_a_graph(self):
+        m = self._out()
+        m._collect_diag = True
+        with m.gate.ungated():
+            m(self._h())
+        assert m._diag["b_norms"].requires_grad is False
+        assert m._diag["cross"][(0, 1)].requires_grad is False

@@ -410,3 +410,197 @@ class SlotProj(nn.Module):
                 "config to match the checkpoint (or vice versa); this is not "
                 "reconciled here."
             )
+
+
+class SlotOut(nn.Module):
+    """Holds B; sums every slot's contribution, but routes gradient to one slot per sample.
+
+    ``ΔW = Σ_k B_k Ā_k``. This module owns the B side as ONE ``(d_out, R)`` parameter
+    whose k-th COLUMN block is ``B_k``, so the stacking already performs the sum: with
+    ``h = s·Āx`` from :class:`SlotProj`, ``B h = Σ_k B_k (s·Ā_k x)``. Like
+    :class:`SlotProj` it is deliberately a LEAF module -- no child modules, exactly one
+    ``.weight`` -- because that is the test at ``rlinf/hybrid_engines/fsdp/utils.py:306``
+    which gives it its own flat parameter. ``gate`` is stored as a plain attribute for
+    the same reason: it is not a Parameter, Module or buffer, so it adds nothing FSDP
+    would see.
+
+    WHY THE GATE IS APPLIED TO THE CONTRIBUTION AND NOT TO ``h``. The obvious
+    implementation -- zero out the row blocks of ``h`` that a sample's slot does not own
+    -- does not isolate anything. ``B`` is a single parameter block, and for the j-th
+    column block ``∂L/∂B_j = Σ_i outer(grad_out_i, h_{i,j})``: EVERY slot's B takes a
+    gradient contribution from every sample, and multiplying ``h`` by a mask only
+    changes the VALUE that lands in ``∂L/∂B_j``, never the fact that it lands there.
+    Worse, the masked entries are exactly the ones set to zero, so the leak is
+    ``outer(grad_out_i, 0) = 0`` for the masked blocks and full-strength for the owned
+    one -- which looks correct for ``B`` and is still wrong for anything downstream, and
+    it destroys the forward value, because a masked ``h`` no longer sums over all slots.
+
+    So the gate is applied one level up, to the whole per-slot CONTRIBUTION
+    ``c_k = B_k h_k``. ``torch.where(owns, c_k, c_k.detach())`` selects between two
+    tensors holding the SAME BITS, so the forward value is bit-identical to the ungated
+    sum ``Σ_k c_k``; only the graph differs, and a sample that does not own slot k
+    reaches ``c_k`` through the detached branch, which has no backward edge at all.
+    That is what makes the isolation exact rather than approximate: the owner's
+    gradient is untouched (not merely larger than the others'), and non-owners
+    contribute a structural zero (not a numerical one).
+
+    THE FORWARD VALUE IS ALWAYS THE FULL SUM OVER SLOTS. The acting policy is the fully
+    merged model: there is no inference-time routing, no per-slot forward, and so no
+    train/inference mismatch to reason about. The gate exists only to decide which
+    slot's B is allowed to LEARN from a given sample.
+
+    Zero-initialized, so ``ΔW = 0`` at init and the student starts numerically identical
+    to its base model.
+    """
+
+    def __init__(
+        self,
+        out_features: int,
+        slot_ranks: "tuple[int, ...]",
+        gate: SlotGate,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+    ):
+        """Build the B parameter and the column layout of its slots.
+
+        Args:
+            out_features: ``d_out`` of the linear this is the B side of.
+            slot_ranks: Per-slot rank, one entry per slot, in slot-index order. Slot
+                ``k`` owns columns ``offsets[k] : offsets[k] + slot_ranks[k]``.
+            gate: The model's single :class:`SlotGate`. Stored by reference and read
+                inside every forward, so a routing installed once reaches every
+                instance without walking the module tree.
+            dtype: Parameter dtype; ``None`` uses the torch default.
+            device: Parameter device; ``None`` uses the torch default.
+
+        Raises:
+            ValueError: if ``slot_ranks`` is empty or contains a non-positive rank.
+        """
+        super().__init__()
+        self.out_features = int(out_features)
+        ranks = tuple(int(r) for r in slot_ranks)
+        # Checked HERE rather than at the first forward, for the same reason
+        # SlotProj checks its rank at construction: a bad rank list is a config
+        # error, and left to blow up in a forward it costs a full 7B model build,
+        # an FSDP wrap and a device transfer before it says so.
+        if not ranks:
+            raise ValueError(
+                "SlotOut needs at least one slot; got an empty slot_ranks. With no "
+                "slots there are no columns in B, so ΔW is identically zero and the "
+                "adapter cannot learn anything."
+            )
+        if any(r <= 0 for r in ranks):
+            raise ValueError(
+                f"SlotOut needs every slot rank to be strictly positive; got "
+                f"{ranks}. A zero- or negative-rank slot owns no columns of B, so "
+                "the samples routed to it would train nothing while still looking "
+                "routed."
+            )
+        self.slot_ranks = ranks
+        offsets, acc = [], 0
+        for rank in ranks:
+            offsets.append(acc)
+            acc += rank
+        # Plain tuples/ints, not tensors: they are layout metadata read on every
+        # forward, and as buffers they would be sharded and synchronized by FSDP.
+        self.offsets = tuple(offsets)
+        self.total_rank = acc
+        # A plain attribute. nn.Module.__setattr__ only intercepts Parameters,
+        # Modules and buffers, and a SlotGate is none of those, so this adds no
+        # child and no parameter and the FSDP leaf predicate still fires.
+        self.gate = gate
+        # ZERO, not Gaussian: ΔW = B Ā must be exactly zero at init so the student
+        # starts identical to its base model. The randomness that keeps the two
+        # factors from being stuck at a saddle lives on the Z side (SlotProj).
+        self.weight = nn.Parameter(
+            torch.zeros(self.out_features, self.total_rank, dtype=dtype, device=device)
+        )
+        # Armed externally (by the training loop, on ONE module, once per step); the
+        # forward disarms it again, so a single arm costs a single extra measurement.
+        self._collect_diag = False
+        self._diag: Optional[dict] = None
+
+    def slot_block(self, k: int) -> torch.Tensor:
+        """The ``(d_out, R_k)`` column block of B belonging to slot ``k``.
+
+        Args:
+            k: Slot index.
+
+        Returns:
+            A VIEW into ``self.weight`` -- no copy, and writes through it are writes
+            to the parameter.
+        """
+        start = self.offsets[k]
+        return self.weight[:, start : start + self.slot_ranks[k]]
+
+    def _stash_diag(self) -> None:
+        """Record the B-side halves of the cross-slot interference measure.
+
+        ``⟨ΔW_s, ΔW_t⟩_F = tr(B_sᵀB_t · Ā_tĀ_sᵀ) = Σ (B_tᵀB_s) ⊙ (Ā_tĀ_sᵀ)``, so the
+        only thing needed from this side is the small ``(R_t, R_s)`` block ``B_tᵀB_s``,
+        laid out to pair elementwise with the ``Ā_tĀ_sᵀ`` block :class:`SlotProj`
+        contributes. ``ΔW`` itself is ``d_out x d_in`` and is NEVER materialized:
+        forming it to measure it would cost more memory than the adapter saves, per
+        module, per step.
+
+        Computed under ``no_grad`` and under the same ``_pinned_precision`` guard
+        :meth:`SlotProj.orth_weight` uses. The guard is not optional: autocast
+        intercepts per op, so an ambient bf16 autocast demotes the bare matmul that
+        forms ``B_tᵀB_s`` even when the operands were cast to fp32 by hand -- measured
+        on SlotProj's Gram at ~3000x worse resolution -- and TF32 leaks the same way
+        and is process-global.
+        """
+        with torch.no_grad(), _pinned_precision(self.weight.device.type):
+            blocks = [
+                self.weight.detach()[:, s : s + r].float()
+                for s, r in zip(self.offsets, self.slot_ranks)
+            ]
+            self._diag = {
+                "b_norms": torch.stack([b.norm() for b in blocks]),
+                "cross": {
+                    (s, t): blocks[t].transpose(-2, -1) @ blocks[s]
+                    for s in range(len(blocks))
+                    for t in range(s + 1, len(blocks))
+                },
+            }
+        self._collect_diag = False
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """Sum every slot's contribution, keeping only the owner's on the gradient path.
+
+        Args:
+            h: The projected coordinates ``s·Āx`` from :class:`SlotProj`, of shape
+                ``(B, ..., R)``. ``B`` is the micro-batch and must match the routing.
+
+        Returns:
+            ``Σ_k B_k h_k`` of shape ``(B, ..., d_out)`` -- the full sum over slots
+            whatever the routing says, since the acting policy is the merged model.
+        """
+        ids = self.gate.current()
+        if self._collect_diag:
+            self._stash_diag()
+        if ids is None:
+            # Ungated (eval, rollout, or a single-slot run): one matmul, no masks,
+            # no graph surgery -- and bit-identical to the merged adapter.
+            return F.linear(h, self.weight)
+        assert ids.shape[0] == h.shape[0], (
+            f"slot routing has {ids.shape[0]} entries but this forward was handed "
+            f"{h.shape[0]} samples. The gate must be built from THIS micro-batch and "
+            "installed before the student forward: with gradient accumulation the "
+            "global batch is split, and each micro-batch needs its own routing."
+        )
+        # (B,) -> (B, 1, ..., 1) so it broadcasts against (B, ..., d_out) for any
+        # number of intervening dims (a sequence axis, in practice).
+        owns_shape = (-1,) + (1,) * (h.dim() - 1)
+        out = None
+        for k, (start, rank) in enumerate(zip(self.offsets, self.slot_ranks)):
+            stop = start + rank
+            contribution = F.linear(h[..., start:stop], self.weight[:, start:stop])
+            owns = (ids == k).view(owns_shape)
+            # Both branches hold the same bits, so this is a no-op on the VALUE and
+            # a cut on the graph: non-owners reach the contribution through the
+            # detached branch and no gradient flows back to B_k or to h_k for them.
+            # See the class docstring for why masking h instead does not work.
+            contribution = torch.where(owns, contribution, contribution.detach())
+            out = contribution if out is None else out + contribution
+        return out
