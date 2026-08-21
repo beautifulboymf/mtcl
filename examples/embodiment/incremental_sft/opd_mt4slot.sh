@@ -206,10 +206,34 @@ fi
 # No hydra overrides: everything this run needs is in the config. run_iso.sh puts the job on its
 # OWN ray head so it cannot join (or be joined by) another job's cluster -- two concurrent RLinf
 # jobs on the default ports collide on ray's internal port range and both die.
+# MEMORY OVERRIDES. Both preserve the training math exactly -- global_batch_size stays 192, so
+# the optimizer sees the identical batch; only how it is split and whether activations are
+# recomputed change. They exist because the first attempt OOM'd on 4 GPUs inside the student
+# forward with 36 MiB free on an 80 GB card, and only 127 MiB of that was reserved-but-unallocated
+# (i.e. fragmentation was NOT the cause -- the card was genuinely full).
+#
+# Why fewer GPUs is HARDER, not easier: total_num_envs is pinned at mt4's 48, so envs-per-rank is
+# 48/W (mt4's 6 GPUs gave 8; 4 gives 12; 3 gives 16), and the student's FSDP shard and optimizer
+# state also grow as W shrinks. Meanwhile the fixed cost per card does not move: two full 7B
+# teacher bases (~28 GB) plus a collocated rollout worker holding its own copy.
+#
+#   GRAD_CKPT=True   recompute activations in backward. The big lever, ~30% slower. Numerically
+#                    identical here (lora_dropout=0, so recomputation is deterministic), and this
+#                    is the path the slot gate was specifically hardened for -- gradient
+#                    checkpointing re-runs the forward on the autograd worker thread, where a
+#                    ContextVar reads its default and the gate would have silently vanished.
+#   MICRO=<n>        micro_batch_size. Halving it halves the activation peak and doubles the
+#                    number of grad-accumulation steps.
+EXTRA=()
+[ -n "${GRAD_CKPT:-}" ] && EXTRA+=("++actor.fsdp_config.gradient_checkpointing=$GRAD_CKPT")
+[ -n "${MICRO:-}" ]     && EXTRA+=("actor.micro_batch_size=$MICRO")
+(( ${#EXTRA[@]} )) && echo "         memory overrides: ${EXTRA[*]}"
+
 MT4SLOT_GPUS="$GPUS" MT4SLOT_TAG="$TAG" MT4SLOT_STUDENT_PATH="$STUDENT" \
 MT4SLOT_MAX_STEPS="$STEPS" MT4SLOT_SAVE_INTERVAL="$SAVE_INTERVAL" \
 ISO_RAY_PORT="$PORT" bash "$SCRIPTS/run_iso.sh" \
-  "$PY" "$REPO/examples/embodiment/train_embodied_agent.py" --config-name "$CFG"
+  "$PY" "$REPO/examples/embodiment/train_embodied_agent.py" --config-name "$CFG" \
+    ${EXTRA[@]+"${EXTRA[@]}"}
 RC=$?
 # The reaper's only job was to hold the mid-run peak down; past this point every save is done
 # and the convert step below reads the newest checkpoint, so stop it before that walk starts.
