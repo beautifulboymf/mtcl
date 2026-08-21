@@ -23,6 +23,37 @@ cd /home/fanruochen/CL/RLinf
 
 ---
 
+## ⚠️ 接线契约（Task 7 落地后，Task 9/13 以此为准）
+
+**actor 取 gate**：
+
+```python
+from rlinf.models import find_slot_gate
+gate = find_slot_gate(self.model)     # 存在 model._slot_gate，getattr 能穿透 FSDP root
+with gate.scoped(ids):                 # ids 用 model._slot_order 作 suite_order 算出
+    loss = ...                         # 学生前向
+    loss.backward()                    # ★ 必须在同一作用域内
+```
+
+`model._slot_gate` 是普通属性（`SlotGate` 不是 `nn.Module`），不进 state dict / FSDP / optimizer。另存 `model._slot_order`（tuple），让路由顺序与 slot 索引顺序是同一个值。
+
+**rollout worker 也会被注入 slot**：`huggingface_worker.py:95` 对 `cfg.actor.model` 做 deepcopy 后走同一个 `get_model`，所以它拿到自己的 **strict gate**，而生成时没有路由 → `gate.current()` 会 raise。这是 strict 的正确行为，处理办法是把生成包进 `gate.ungated()`（rollout 本来就该跑全 slot 合并后的策略，不做路由）。
+
+**`actor.model.slot_lora` 的确切键**（Task 13 的 YAML 按此写）：
+
+| key | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `enabled` | — | `false` | 假值走原 PEFT 路径 |
+| `slot_ranks` | **是** | — | `{suite_name: rank}` 映射；给列表会被拒 |
+| `slot_order` | **是** | — | 固定 slot **索引**顺序的 suite 名列表；给字符串会被拒 |
+| `a_scale_mode` | 否 | `match_mt4` | 另可 `unit`，其余值 raise |
+| `a_scale_ref_rank` | 否 | `128` | |
+| `orth_eps` | 否 | `1e-6` | |
+
+rank 列表按 `[slot_ranks[s] for s in slot_order]` 取，**绝不依赖映射的迭代顺序**。以下情况会 loud `ValueError`：必填键缺失/为 null、`slot_order` 有重复、`slot_order` 里的名字没有对应 rank、`slot_ranks` 里有不在 `slot_order` 中的 suite、以及 `lora_path` 与 `enabled: true` 同时给（那个 adapter 会被静默忽略）。
+
+---
+
 ## ⚠️ API 变更（Task 2 返工后，Task 3/4/6/9 以此为准）
 
 原计划把 per-sample gate 用 `ContextVar` 传递，**这是错的**：autograd 引擎在 CUDA 上用每设备的 worker 线程跑反向节点，而本仓库会开 gradient checkpointing（`fsdp_model_manager.py:253`），重算发生在反向、在那个线程上。实测复现：作用域在主线程仍开着，重算里读到的是 `None` → 门控整个不生效、四个 slot 梯度互相串、**不报错也不 NaN**，曲线完全正常。
