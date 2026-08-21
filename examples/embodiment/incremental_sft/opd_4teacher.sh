@@ -19,7 +19,7 @@ set -uo pipefail
 TAG="${1:-mt4}"; STEPS="${2:-10}"
 
 O=/share/fanruochen-local/outputs
-STUDENT="$O/inc_sft_opd/lwf_long_e1000_merged"
+STUDENT="${OPD_STUDENT:-$O/inc_sft_opd/lwf_long_e1000_merged}"
 B130="$O/inc_sft_opd/base_stats130"
 T_SPATIAL="$B130::$O/seqcl_rlspat_opd/spatial_cat_r160"
 T_OBJECT="$B130::$O/inc_sft_opd/sft_object_base3_cont/openvla-7b-base+libero_object_no_noops+b32+lr-0.0003+lora-r32+dropout-0.0--image_aug/adapters/step_500"
@@ -46,7 +46,8 @@ echo "[preflight] disk=${free}G anon=${anon}G iowait=${iow}%  student=$(basename
 
 cd /home/fanruochen/CL/RLinf
 exec env OPD_GPUS="${OPD_GPUS:-0,1,2,4}" OPD_ENVS="${OPD_ENVS:-32}" OPD_STEPS="$STEPS" \
-     OPD_ROLLOUT_EPOCH=4 OPD_RAY_PORT="${OPD_RAY_PORT:-52000}" \
+     OPD_ROLLOUT_EPOCH="${OPD_ROLLOUT_EPOCH:-4}" OPD_RAY_PORT="${OPD_RAY_PORT:-52000}" \
+     OPD_MICRO="${OPD_MICRO:-8}" \
      ${OPD_WEIGHTS:+OPD_WEIGHTS="$OPD_WEIGHTS"} \
   bash examples/embodiment/incremental_sft/opd_multi.sh "$STUDENT" "$TAG" \
     libero_spatial="$T_SPATIAL" \

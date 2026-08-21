@@ -1770,7 +1770,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.cfg.algorithm.get("signal_stats", False):
             self._sig_armed = True
 
-        if self.cfg.algorithm.get("distill_on_failure", False):
+        if (
+            self.cfg.algorithm.get("distill_on_failure", False)
+            or float(self.cfg.algorithm.get("distill_fail_alpha", 0.0)) > 0.0
+        ):
             with torch.no_grad():
                 rw = rollout_batch["rewards"]  # [T, B, C]
                 T, B, C = rw.shape
@@ -1961,6 +1964,42 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"sft_loss_weight={self.sft_loss_weight:.6f}"
             )
 
+    def _dw_refresh_weights(self):
+        """Recompute per-teacher distillation weights ONCE per training step.
+
+        Every sync-forcing op (`.tolist()`, boolean-mask indexing) lives here and nowhere
+        else. Weights lag the KL they came from by one step, which is harmless -- an EMA
+        already smooths over steps -- and buys back the 5.6x that per-micro-batch syncs
+        cost (80.0 min vs a 14.3 min baseline, measured on an identical config).
+
+        Step 1 runs with uniform weights because no KL has been accumulated yet; the
+        weighting becomes active from step 2 on.
+        """
+        _dynw = float(self.cfg.algorithm.get("distill_dyn_weight", 0.0))
+        if _dynw <= 0.0 or getattr(self, "_dw_n", None) is None:
+            return
+        with torch.no_grad():
+            _seen = self._dw_d > 0
+            _cur = self._dw_n / self._dw_d.clamp_min(1.0)
+            _beta = float(self.cfg.algorithm.get("distill_w_ema", 0.9))
+            self._dw_ema = torch.where(
+                _seen, _beta * self._dw_ema + (1.0 - _beta) * _cur, self._dw_ema
+            )
+            # mean over suites that have been seen at least once, without boolean indexing
+            _posf = (self._dw_ema > 0).to(self._dw_ema.dtype)
+            _m = (self._dw_ema * _posf).sum() / _posf.sum().clamp_min(1.0)
+            _w = (self._dw_ema / _m.clamp_min(1e-8)).clamp_min(1e-8).pow(_dynw)
+            _w = (_w * _posf + (1.0 - _posf)).clamp(
+                float(self.cfg.algorithm.get("distill_w_min", 0.25)),
+                float(self.cfg.algorithm.get("distill_w_max", 4.0)),
+            )
+            self._dw_w = _w / _w.mean().clamp_min(1e-8)
+            # plain floats for the metric path, so IT never syncs either
+            self._dw_w_list = self._dw_w.tolist()
+            self._dw_kl_list = self._dw_ema.tolist()
+            self._dw_n.zero_()
+            self._dw_d.zero_()
+
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
@@ -2004,6 +2043,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         assert rollout_size % batch_size_per_rank == 0, (
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
+        # Refresh the per-teacher distillation weights ONCE per training step, from the KL
+        # this rank accumulated during the PREVIOUS step. This call MUST live in THIS method:
+        # the class defines run_training twice and the later definition shadows the earlier,
+        # so run_training_pipeline is dead code for the OpenVLA-OFT path -- putting the call
+        # there left the weights pinned at their all-ones init for a whole 8-step run while
+        # the metrics' `or` fallback made it look like a healthy uniform start (2026-08-20).
+        self._dw_refresh_weights()
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
         for _ in range(update_epoch):
@@ -2216,11 +2262,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             # The flag is "traj_fail", precomputed in _process_received_rollout_batch
                             # where the trajectory structure still exists (see the comment there for
                             # why computing it from this micro-batch's rewards is WRONG).
+                            # Two ways to emphasise what the student got WRONG:
+                            #   distill_on_failure=True  -> HARD filter, successful positions are
+                            #                               dropped entirely (mtok *= fail).
+                            #   distill_fail_alpha=a>0   -> SOFT weight, failed positions count
+                            #                               (1+a)x and successful ones still count 1.
+                            # Soft is the default choice: the hard filter throws away every state the
+                            # student already handles, which is also where "don't break what works"
+                            # has to be learned. Hard wins ties (both set = hard).
                             _fail_only = bool(
                                 self.cfg.algorithm.get("distill_on_failure", False)
                             )
+                            _fail_alpha = float(
+                                self.cfg.algorithm.get("distill_fail_alpha", 0.0)
+                            )
                             fail_m = None
-                            if _fail_only:
+                            if _fail_only or _fail_alpha > 0.0:
                                 fail_m = batch.get("traj_fail", None)
                                 if fail_m is None:
                                     raise RuntimeError(
@@ -2246,7 +2303,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                     .expand(-1, -1, sad)
                                     .reshape(kl_tok.shape[0], -1)
                                 )
-                                mtok = mtok * fm
+                                if _fail_only:
+                                    mtok = mtok * fm
+                                else:
+                                    mtok = mtok * (1.0 + _fail_alpha * fm)
                                 # fraction of the VALID (loss_mask'd) positions we actually distil on.
                                 # SELF-CHECK: this must land near (1 - success_rate), NOT ~0.98.
                                 with torch.no_grad():
@@ -2258,10 +2318,98 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                         if loss_mask is not None
                                         else torch.ones_like(kl_tok)
                                     )
+                                    # fraction of VALID positions that are failures -- identical in
+                                    # both modes, so the "must land near (1 - success_rate)" check
+                                    # still applies when soft weighting rescales mtok.
                                     self._last_fail_frac = (
-                                        mtok.sum() / _base.sum().clamp_min(1.0)
+                                        (_base * fm).sum() / _base.sum().clamp_min(1.0)
                                     ).item()
-                            opd_distill_loss = (kl_tok * mtok).sum() / mtok.sum().clamp_min(1.0)
+                            # ---- DYNAMIC PER-SUITE DISTILL STRENGTH ----------------------
+                            # "push harder where the student is further from its teacher." The
+                            # distance is measured by the KL itself, computed on this very forward
+                            # pass -- NOT by the per-suite success rate seen during training, which
+                            # was measured wrong by +0.32 (long) and -0.33 (goal) against a post-hoc
+                            # 50-env eval and would have weighted exactly backwards.
+                            #
+                            # w_s = clip((ema_kl_s / mean_ema_kl) ** alpha, w_min, w_max), then
+                            # renormalised to mean 1 so the loss scale (and the usable lr) does not
+                            # drift. w_min > 0 on purpose: a suite the student already matches still
+                            # needs a nonzero pull or the other suites' gradients walk it back.
+                            #
+                            # TWO THINGS THIS VERSION GETS RIGHT AND THE FIRST ONE DID NOT:
+                            #  1. NO GPU->CPU SYNC IN THE HOT PATH. The first cut called .item() per
+                            #     suite per micro-batch (plus a host->device copy per suite for the
+                            #     index list) -- ~12 syncs per micro-batch, which across 6 FSDP ranks
+                            #     stalls every rank at the next collective and took the update phase
+                            #     from ~15 min to ~39 min. Everything below stays on the GPU:
+                            #     index_add_ for the per-suite means, EMA as a device tensor.
+                            #  2. A FIXED SUITE KEY SET. The metrics emitted at the bottom must not
+                            #     depend on which suites this rank's micro-batch happened to contain:
+                            #     all_reduce_dict packs the metric dict into ONE tensor sized by key
+                            #     count, so a rank that saw 3 suites and a rank that saw 4 would
+                            #     all-reduce different-sized tensors and hang forever. Same failure
+                            #     that was fixed in libero_env.py earlier; do not reintroduce it.
+                            # Per-suite distillation strength. The WEIGHTS themselves are
+                            # recomputed once per training step in _dw_refresh_weights(); this
+                            # path only gathers them and accumulates the KL that feeds the next
+                            # refresh. NOTHING here may force a device sync -- `.any()`, `.item()`
+                            # and boolean-mask indexing all do, and 32 micro-batches x ~6 syncs
+                            # measured run_training at 80.0 min against a 14.3 min baseline on an
+                            # otherwise identical config (2026-08-20). Keep it gather-only.
+                            _dynw = float(self.cfg.algorithm.get("distill_dyn_weight", 0.0))
+                            _wrow = None
+                            if _dynw > 0.0 and getattr(self, "_last_groups", None):
+                                with torch.no_grad():
+                                    if not hasattr(self, "_dw_paths"):
+                                        _s2p = getattr(self, "teacher_suite_to_path", {}) or {}
+                                        self._dw_paths = sorted(set(_s2p.values()))
+                                        self._dw_w = None
+                                    _paths = self._dw_paths
+                                    _np = len(_paths)
+                                    if _np > 1:
+                                        _dev, _dt = kl_tok.device, kl_tok.dtype
+                                        if getattr(self, "_dw_w", None) is None:
+                                            self._dw_w = torch.ones(_np, device=_dev, dtype=_dt)
+                                            self._dw_ema = torch.zeros(_np, device=_dev, dtype=_dt)
+                                            self._dw_n = torch.zeros(_np, device=_dev, dtype=_dt)
+                                            self._dw_d = torch.zeros(_np, device=_dev, dtype=_dt)
+                                            self._dw_w_list = None
+                                            self._dw_kl_list = None
+                                        _pi = {p: i for i, p in enumerate(_paths)}
+                                        _B = kl_tok.shape[0]
+                                        _g = [-1] * _B
+                                        for _p, _idxs in self._last_groups.items():
+                                            _k = _pi.get(_p)
+                                            if _k is not None:
+                                                for _i in _idxs:
+                                                    if 0 <= _i < _B:
+                                                        _g[_i] = _k
+                                        # pinned staging buffer -> the H2D copy is async and does
+                                        # NOT drain the compute stream the way a pageable copy does
+                                        _hb = getattr(self, "_dw_hostbuf", None)
+                                        if _hb is None or _hb.numel() < _B:
+                                            self._dw_hostbuf = torch.empty(
+                                                _B, dtype=torch.long, pin_memory=True
+                                            )
+                                            _hb = self._dw_hostbuf
+                                        _hb = _hb[:_B]
+                                        _hb.copy_(torch.as_tensor(_g, dtype=torch.long))
+                                        _gidx = _hb.to(_dev, non_blocking=True)
+                                        _valid = (_gidx >= 0).to(_dt)
+                                        _safe = _gidx.clamp_min(0)
+                                        # feed the NEXT refresh (index_add_ never syncs); rows with
+                                        # no routed teacher contribute exactly 0 via _valid
+                                        self._dw_n.index_add_(
+                                            0, _safe, (kl_tok * mtok).sum(-1) * _valid
+                                        )
+                                        self._dw_d.index_add_(0, _safe, mtok.sum(-1) * _valid)
+                                        # weights from the last refresh; unrouted rows get 1.0
+                                        _wrow = self._dw_w[_safe] * _valid + (1.0 - _valid)
+                            if _wrow is not None:
+                                _wt = _wrow.unsqueeze(-1)
+                                opd_distill_loss = (kl_tok * mtok * _wt).sum() / (mtok * _wt).sum().clamp_min(1.0)
+                            else:
+                                opd_distill_loss = (kl_tok * mtok).sum() / mtok.sum().clamp_min(1.0)
 
                             # How many suites this micro-batch actually contains. Both probes are
                             # meaningless on a single-suite micro-batch (there is no other expert
@@ -2417,6 +2565,28 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         metrics_data = {
                             "actor/distill_loss": opd_distill_loss.detach().item()
                         }
+                        # Surface the dynamic weights and the per-suite KL they came from --
+                        # without them an adaptive run is indistinguishable from a uniform one and
+                        # the mechanism is unfalsifiable.
+                        # EMIT A FIXED KEY SET: one entry per ROUTED SUITE, always, defaulting to
+                        # 1.0/0.0 for suites this rank's micro-batch did not contain. all_reduce_dict
+                        # sizes its packed tensor by the key count, so rank-dependent keys deadlock
+                        # the collective (the bug already fixed once in libero_env.py). One .tolist()
+                        # here is the ONLY host sync in this path.
+                        _s2p = getattr(self, "teacher_suite_to_path", {}) or {}
+                        if _s2p and float(self.cfg.algorithm.get("distill_dyn_weight", 0.0)) > 0.0:
+                            _paths = getattr(self, "_dw_paths", None) or sorted(set(_s2p.values()))
+                            _wl = getattr(self, "_dw_w_list", None) or [1.0] * len(_paths)
+                            _kl_ = getattr(self, "_dw_kl_list", None) or [0.0] * len(_paths)
+                            _idx = {p: i for i, p in enumerate(_paths)}
+                            for _s in sorted(_s2p):
+                                _i = _idx.get(_s2p[_s])
+                                metrics_data[f"actor/dynw_{_s}"] = (
+                                    float(_wl[_i]) if _i is not None and _i < len(_wl) else 1.0
+                                )
+                                metrics_data[f"actor/suitekl_{_s}"] = (
+                                    float(_kl_[_i]) if _i is not None and _i < len(_kl_) else 0.0
+                                )
                         if getattr(self, "_last_fail_frac", None) is not None:
                             # share of rollout samples that never succeeded = what we distill on
                             metrics_data["actor/fail_frac"] = self._last_fail_frac

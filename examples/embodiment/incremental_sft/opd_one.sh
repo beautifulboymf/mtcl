@@ -37,6 +37,9 @@ ISO_RAY_PORT="${OPD_RAY_PORT:-28000}" bash "$SCRIPTS/run_iso.sh" \
     env.train.total_num_envs="${OPD_ENVS:-16}" \
     env.train.max_episode_steps="${OPD_EP_STEPS:-512}" \
     env.train.max_steps_per_rollout_epoch="${OPD_EP_STEPS:-512}" \
+    actor.micro_batch_size="${OPD_MICRO:-8}" \
+    ${OPD_GLOBAL_BATCH:+actor.global_batch_size=$OPD_GLOBAL_BATCH} \
+    ${OPD_EXTRA:+$OPD_EXTRA} \
     ${TEACHER_OVR}
 echo "OPD_TRAIN_DONE $(date '+%F %T')"
 
