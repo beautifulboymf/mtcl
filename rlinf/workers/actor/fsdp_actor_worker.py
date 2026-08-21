@@ -92,6 +92,390 @@ from rlinf.utils.utils import (
 )
 from rlinf.workers.rollout.utils import RankMapper
 
+# ==========================================================================================
+# Per-phase timing + in-step progress logging for run_training  (DIAGNOSTIC, OFF BY DEFAULT)
+# ==========================================================================================
+# THE PROBLEM. A routed multi-teacher OPD step at global_batch_size 192 / micro_batch_size 2
+# on two ranks runs 48 micro-batches per optimizer update, each one a student forward, a
+# frozen-teacher forward, a KL-distillation loss and a backward that (with gradient
+# checkpointing) re-runs the forward. That step took over three hours and `run_training`
+# printed NOTHING between step boundaries -- there was no way to tell slow from hung, and no
+# way to say which of those five things was the expensive one.
+#
+# THE MEASUREMENT. CUDA is asynchronous: a host-side `time.perf_counter()` around
+# `self.model(...)` measures how long it took to QUEUE the forward, not to run it, and all
+# the real time then lands on whichever later call happens to block. So the phases are timed
+# with `torch.cuda.Event` pairs -- recorded into the stream, read back with `elapsed_time`.
+#
+# ONE MOVING CURSOR, NOT START/STOP PAIRS. Each `mark(phase)` records one event and charges
+# the interval since the PREVIOUS event to `phase`. Consequence: no interval can be dropped.
+# With start/stop pairs, any statement outside a bracket silently vanishes from the
+# breakdown while the totals still look plausible; here the phases always sum to the wall
+# clock, and `unaccounted` on the summary line is the check that says so.
+#
+# WHAT IT COSTS, AND WHY THAT IS NOT THE 5.6x TRAP. Recording an event is a few microseconds
+# of host time and does not stall. Reading it needs the event to have completed, so the
+# flush calls `event.synchronize()` -- normally the expensive part. It is free HERE because
+# of exactly where the flush is placed: `micro_done()` is called immediately after
+# `metrics_data["actor/total_loss"] = loss.detach().item()`, which already drains the stream
+# on every micro-batch, profiling or not. The events being read are therefore already
+# complete and the synchronize returns at once. This distinction is load-bearing: this repo
+# measured run_training go from 14.3 min to 80.0 min (5.6x) from roughly six device syncs
+# per micro-batch placed MID-GRAPH, where they serialize the host against the GPU. A sync
+# after an existing sync costs nothing; a sync in the middle of loss construction costs
+# everything. Do not move the flush earlier.
+#
+# It is still gated OFF by default (`algorithm.profile_train_phases`) and documented as
+# diagnostic-only, because that argument depends on a `.item()` that is not this feature's
+# to guarantee.
+_PROFILE_PHASES = (
+    "prep",  # device copy + before_micro_batch + slot routing (_route_prepare)
+    "student_fwd",  # self.model(...)
+    "teacher_fwd",  # self._teacher_forward(...)  (absent on non-OPD runs -> folds into loss)
+    "loss",  # advantage + KL/anchor/loss construction, up to the backward
+    "backward",  # grad_scaler.scale(loss).backward()
+    "empty_cache",  # per-update torch_platform.empty_cache() + the slot lr alternation
+    "optim",  # self.optimizer_step()
+)
+
+
+def _fmt_dur(seconds: float) -> str:
+    """Seconds as ``41.2s`` / ``7m12s`` / ``3h04m05s``.
+
+    A 3-hour step is the thing being measured, so raw seconds are unreadable exactly
+    where it matters most.
+    """
+    s = float(seconds)
+    if s != s or s in (float("inf"), float("-inf")):
+        return "n/a"
+    s = max(0.0, s)
+    if s < 60.0:
+        return f"{s:.1f}s"
+    total = int(round(s))
+    h, rem = divmod(total, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m{sec:02d}s"
+    return f"{m}m{sec:02d}s"
+
+
+def _eta_seconds(elapsed_s: float, done: int, total: int) -> float:
+    """Remaining step time projected from the rate observed SO FAR IN THIS STEP.
+
+    Deliberately the crudest possible model -- ``elapsed / done`` extrapolated over what
+    is left. It is honest about the optimizer step (amortised across the update's
+    micro-batches rather than pretended away) and it needs no calibration. Returns 0.0
+    rather than a negative or infinite number for the degenerate inputs, so a progress
+    line can never be the thing that raises inside a training loop.
+    """
+    if done <= 0 or total <= done:
+        return 0.0
+    return float(elapsed_s) * float(total - done) / float(done)
+
+
+def _phase_breakdown(totals_ms: dict, wall_s: Optional[float] = None) -> str:
+    """The per-phase times, always in the same order and ALWAYS all of them.
+
+    A fixed key set means the line is greppable and two runs are diffable; a phase that
+    is genuinely zero (``teacher_fwd`` off the OPD path) says so instead of disappearing.
+    """
+    parts = []
+    for name in _PROFILE_PHASES:
+        secs = float(totals_ms.get(name, 0.0)) / 1000.0
+        if wall_s is not None and wall_s > 0:
+            parts.append(f"{name} {_fmt_dur(secs)} ({100.0 * secs / wall_s:.1f}%)")
+        else:
+            parts.append(f"{name} {_fmt_dur(secs)}")
+    return " ".join(parts)
+
+
+def _progress_line(
+    *,
+    rank,
+    step,
+    update_index,
+    updates_per_step,
+    mb_in_update,
+    mbs_per_update,
+    mb_done,
+    mb_total,
+    elapsed_s,
+    totals_ms,
+) -> str:
+    pct = (100.0 * mb_done / mb_total) if mb_total else 0.0
+    eta = _eta_seconds(elapsed_s, mb_done, mb_total)
+    return (
+        f"[prof][r{rank}] step {step} | update {update_index}/{updates_per_step} | "
+        f"micro {mb_in_update}/{mbs_per_update} (update) "
+        f"{mb_done}/{mb_total} (step, {pct:.1f}%) | "
+        f"elapsed {_fmt_dur(elapsed_s)} | eta {_fmt_dur(eta)} | "
+        f"{_phase_breakdown(totals_ms)}"
+    )
+
+
+def _summary_line(
+    *, rank, step, updates_per_step, mbs_per_update, mb_total, elapsed_s, totals_ms
+) -> str:
+    accounted = sum(float(totals_ms.get(p, 0.0)) for p in _PROFILE_PHASES) / 1000.0
+    other = max(0.0, float(elapsed_s) - accounted)
+    pct = (100.0 * other / elapsed_s) if elapsed_s else 0.0
+    return (
+        f"[prof][r{rank}] step {step} DONE | {updates_per_step} updates x "
+        f"{mbs_per_update} micro-batches = {mb_total} | wall {_fmt_dur(elapsed_s)} | "
+        f"{_phase_breakdown(totals_ms, elapsed_s)} | "
+        f"unaccounted {_fmt_dur(other)} ({pct:.1f}%)"
+    )
+
+
+class _CudaEventClock:
+    """Timing source backed by ``torch.cuda.Event`` -- the accurate one."""
+
+    __slots__ = ()
+
+    def event(self):
+        return torch.cuda.Event(enable_timing=True)
+
+    def record(self, ev):
+        ev.record()
+
+    def sync(self, ev):
+        ev.synchronize()
+
+    def elapsed_ms(self, a, b):
+        return a.elapsed_time(b)
+
+
+class _PerfCounterClock:
+    """Host-clock fallback for CPU-only runs.
+
+    On a GPU run this would be WRONG (it measures queueing, not execution), which is why
+    it is only ever selected when there is no CUDA device to be wrong about.
+    """
+
+    __slots__ = ()
+
+    def event(self):
+        return [0.0]
+
+    def record(self, ev):
+        ev[0] = time.perf_counter()
+
+    def sync(self, ev):
+        pass
+
+    def elapsed_ms(self, a, b):
+        return (b[0] - a[0]) * 1000.0
+
+
+class TrainPhaseProfiler:
+    """Per-phase timing and in-step progress logging for one training step.
+
+    Protocol, mirroring ``run_training``'s loop structure::
+
+        begin_step(updates_per_step)
+          begin_update(len(train_micro_batch))          # once per optimizer update
+            mark("prep"); mark("student_fwd"); ...      # once per micro-batch
+            micro_done()                                # flush + maybe a progress line
+          mark("empty_cache"); mark("optim")
+          update_done()                                 # per-update breakdown
+        step_done()                                     # per-step summary
+
+    Every method is a no-op when ``enabled`` is False: no clock is chosen, no event is
+    allocated, nothing is synchronized and nothing is logged.
+    """
+
+    PHASES = _PROFILE_PHASES
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = False,
+        log_every: int = 0,
+        log_fn=None,
+        warn_fn=None,
+        rank: int = 0,
+        step=None,
+        clock=None,
+        now_fn=time.perf_counter,
+    ):
+        self.enabled = bool(enabled)
+        self._cfg_log_every = max(0, int(log_every or 0))
+        self._log = log_fn if log_fn is not None else (lambda _msg: None)
+        self._warn = warn_fn if warn_fn is not None else self._log
+        self._rank = rank
+        self._step = step if step is not None else "?"
+        self._now = now_fn
+        self._clock = clock
+        self.totals = dict.fromkeys(_PROFILE_PHASES, 0.0)  # ms, this step
+        self.update_totals = dict.fromkeys(_PROFILE_PHASES, 0.0)  # ms, this update
+        self.updates_per_step = 0
+        self.mbs_per_update = 0
+        self.update_index = 0
+        self.mb_in_update = 0
+        self.mb_done = 0
+        self.log_every = 0
+        self._pending = []  # [(event, phase or None)] -- [0] is always the cursor
+        self._pool = []
+        self._t0 = None
+        self._t_update0 = None
+
+    # -- interval policy ----------------------------------------------------------------
+    @staticmethod
+    def auto_log_every(mbs_per_update: int) -> int:
+        """Roughly ten progress lines per optimizer update, from the REAL bound.
+
+        48 micro-batches -> every 5th; 12 -> every one. Never 0 (that would mean silence,
+        which is the bug this feature fixes).
+        """
+        if mbs_per_update <= 0:
+            return 1
+        # Half-up on purpose: Python's round() is banker's, so round(2.5) is 2 and a
+        # 25-micro-batch update would quietly get 12 lines where 24 gets 10.
+        return max(1, int(mbs_per_update / 10.0 + 0.5))
+
+    # -- lifecycle ----------------------------------------------------------------------
+    def begin_step(self, updates_per_step: int) -> None:
+        if not self.enabled:
+            return
+        if self._clock is None:
+            self._clock = (
+                _CudaEventClock() if torch.cuda.is_available() else _PerfCounterClock()
+            )
+        self.updates_per_step = int(updates_per_step)
+        self.mbs_per_update = 0
+        self.update_index = 0
+        self.mb_in_update = 0
+        self.mb_done = 0
+        self.log_every = 0
+        self.totals = dict.fromkeys(_PROFILE_PHASES, 0.0)
+        self.update_totals = dict.fromkeys(_PROFILE_PHASES, 0.0)
+        self._pool.extend(ev for ev, _ in self._pending)
+        self._pending = []
+        self._t0 = self._now()
+        self._t_update0 = self._t0
+        self._record(None)
+
+    def begin_update(self, micro_batches_per_update: int) -> None:
+        if not self.enabled or self._t0 is None:
+            return
+        self.update_index += 1
+        self.mbs_per_update = int(micro_batches_per_update)
+        self.mb_in_update = 0
+        self.update_totals = dict.fromkeys(_PROFILE_PHASES, 0.0)
+        self._t_update0 = self._now()
+        self.log_every = self._cfg_log_every or self.auto_log_every(self.mbs_per_update)
+
+    def mark(self, phase: str) -> None:
+        """Close the current interval and charge it to ``phase``."""
+        if not self.enabled or self._t0 is None:
+            return
+        self._record(phase)
+
+    def micro_done(self) -> None:
+        """End of one micro-batch: read the events back, maybe log a progress line."""
+        if not self.enabled or self._t0 is None:
+            return
+        self._flush()
+        if not self.enabled:
+            return
+        self.mb_in_update += 1
+        self.mb_done += 1
+        n = self.log_every
+        # The first micro-batch of the step ALWAYS logs: on a 3-hour step, waiting for
+        # the 5th one to learn that the step started is the same silence as before.
+        if n > 0 and (self.mb_done == 1 or self.mb_in_update % n == 0):
+            self._log(
+                _progress_line(
+                    rank=self._rank,
+                    step=self._step,
+                    update_index=self.update_index,
+                    updates_per_step=self.updates_per_step,
+                    mb_in_update=self.mb_in_update,
+                    mbs_per_update=self.mbs_per_update,
+                    mb_done=self.mb_done,
+                    mb_total=self.updates_per_step * self.mbs_per_update,
+                    elapsed_s=self._now() - self._t0,
+                    totals_ms=self.totals,
+                )
+            )
+
+    def update_done(self) -> None:
+        if not self.enabled or self._t0 is None:
+            return
+        self._flush()
+        if not self.enabled:
+            return
+        base = self._t_update0 if self._t_update0 is not None else self._t0
+        wall = self._now() - base
+        self._log(
+            f"[prof][r{self._rank}] step {self._step} | "
+            f"update {self.update_index}/{self.updates_per_step} DONE | "
+            f"{self.mb_in_update} micro-batches in {_fmt_dur(wall)} | "
+            f"{_phase_breakdown(self.update_totals, wall)}"
+        )
+
+    def step_done(self) -> dict:
+        """Log the step summary; return the per-phase totals in SECONDS."""
+        if not self.enabled or self._t0 is None:
+            return {}
+        self._flush()
+        if not self.enabled:
+            return {}
+        wall = self._now() - self._t0
+        self._log(
+            _summary_line(
+                rank=self._rank,
+                step=self._step,
+                updates_per_step=self.updates_per_step,
+                mbs_per_update=self.mbs_per_update,
+                mb_total=self.mb_done,
+                elapsed_s=wall,
+                totals_ms=self.totals,
+            )
+        )
+        self._t0 = None
+        return {p: self.totals[p] / 1000.0 for p in _PROFILE_PHASES}
+
+    # -- internals ----------------------------------------------------------------------
+    def _record(self, phase) -> None:
+        try:
+            ev = self._pool.pop() if self._pool else self._clock.event()
+            self._clock.record(ev)
+            self._pending.append((ev, phase))
+        except Exception as e:  # a diagnostic must never take the run down with it
+            self._disable(e)
+
+    def _flush(self) -> None:
+        if len(self._pending) < 2:
+            return
+        try:
+            self._clock.sync(self._pending[-1][0])
+            prev = self._pending[0][0]
+            for ev, phase in self._pending[1:]:
+                dt = self._clock.elapsed_ms(prev, ev)
+                if phase in self.totals:
+                    self.totals[phase] += dt
+                    self.update_totals[phase] += dt
+                prev = ev
+        except Exception as e:
+            self._disable(e)
+            return
+        # The last event becomes the next cursor, so the timeline stays continuous across
+        # flushes and no interval can fall between two micro-batches. Everything else goes
+        # back to the pool: the pool therefore stays at ~8 events for the whole run instead
+        # of allocating 7 per micro-batch.
+        self._pool.extend(ev for ev, _ in self._pending[:-1])
+        self._pending = [(self._pending[-1][0], None)]
+
+    def _disable(self, exc) -> None:
+        self.enabled = False
+        self._pending = []
+        self._pool = []
+        self._warn(
+            f"[prof] phase profiling disabled after an internal error: {exc!r} -- "
+            "training continues, only the timing is lost"
+        )
+
 
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     """
@@ -2646,6 +3030,43 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self._dw_n.zero_()
             self._dw_d.zero_()
 
+    def make_phase_profiler(self) -> TrainPhaseProfiler:
+        """Build this step's phase profiler from config. OFF unless asked for.
+
+        Both knobs are read the way every other diagnostic in this method is read --
+        ``self.cfg.algorithm.get(...)`` with a default, next to ``distill_dyn_weight``,
+        ``cross_score``, ``signal_stats`` and ``grad_conflict`` -- so a config that names
+        neither key (which is every config in the repo, including the one the production
+        run is using) gets a profiler that does nothing at all.
+
+        ONE boolean, not two. Splitting "time the phases" from "print progress" would
+        create two useless combinations: progress lines without the breakdown answer
+        "is it alive" but not "where is the time going", and the breakdown without the
+        progress lines only prints once the step is over -- three hours late, which is
+        the exact silence this exists to remove. The interval is a separate NUMBER
+        because it is a volume knob, not a feature:
+
+          algorithm.profile_train_phases  bool, default False -- the gate.
+          algorithm.profile_log_every     int, default 0 -- micro-batches between
+                                          progress lines. 0 means derive it from the
+                                          real loop bound, ~10 lines per optimizer
+                                          update. Set it huge to keep only the
+                                          per-update and per-step summaries.
+
+        DIAGNOSTIC ONLY. The flush synchronizes on CUDA events; it is free only because
+        it sits right after a ``.item()`` that already drained the stream (see the
+        TrainPhaseProfiler header). Leave it off for production runs.
+        """
+        enabled = bool(self.cfg.algorithm.get("profile_train_phases", False))
+        return TrainPhaseProfiler(
+            enabled=enabled,
+            log_every=int(self.cfg.algorithm.get("profile_log_every", 0)),
+            log_fn=self.log_info,
+            warn_fn=self.log_warning,
+            rank=getattr(self, "_rank", 0),
+            step=getattr(self, "version", None),
+        )
+
     @Worker.timer("run_training")
     def run_training(self) -> None:
         """
@@ -2706,6 +3127,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # at the FIRST one.
         updates_per_step = update_epoch * (rollout_size // batch_size_per_rank)
         self._slot_step_begin(updates_per_step)
+        # Per-phase timing + in-step progress logging. Inert unless
+        # algorithm.profile_train_phases is set; see make_phase_profiler.
+        prof = self.make_phase_profiler()
+        prof.begin_step(updates_per_step)
         update_index = 0
         for _ in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
@@ -2729,6 +3154,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
                 )
 
+                prof.begin_update(len(train_micro_batch))
                 self.optimizer.zero_grad()
                 for idx, batch in enumerate(train_micro_batch):
                     batch = put_tensor_device(
@@ -2811,6 +3237,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     # its batch, loudly, which is the right outcome -- that combination
                     # has no defined per-sample routing.
                     with self._slot_scope():
+                        prof.mark("prep")
                         with self.amp_context:
                             output_dict = self.model(
                                 forward_inputs=forward_inputs,
@@ -2820,6 +3247,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                 use_cache=False,
                                 **kwargs,
                             )
+                        prof.mark("student_fwd")
 
                         if (
                             SupportedModel(self.cfg.actor.model.model_type)
@@ -2839,6 +3267,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                 teacher_out = self._teacher_forward(
                                     forward_inputs, kwargs
                                 )
+                            prof.mark("teacher_fwd")
                             t_lp = teacher_out["logprobs"].detach()
                             # per-token reverse-KL -> aggregate to per-chunk (num_action_chunks) so it
                             # matches RLinf's action-granularity advantages. logprobs are
@@ -3332,11 +3761,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             self._train_sft_epoch(metrics_data, loss)
 
                         loss /= self.gradient_accumulation
+                        prof.mark("loss")
                         with backward_ctx:
                             self.grad_scaler.scale(loss).backward()
+                        prof.mark("backward")
 
                     metrics_data["actor/total_loss"] = loss.detach().item()
                     append_to_dict(metrics, metrics_data)
+                    # Read the events back HERE and nowhere earlier: the .item() above has
+                    # already drained the stream, so the synchronize this does is free.
+                    prof.micro_done()
 
                 self.torch_platform.empty_cache()
 
@@ -3352,7 +3786,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self._slot_alt_before_update(
                     is_last_update=(update_index == updates_per_step)
                 )
+                prof.mark("empty_cache")
                 grad_norm, lr_list = self.optimizer_step()
+                prof.mark("optim")
                 self._slot_alt_after_update()
                 data = {
                     "actor/grad_norm": grad_norm,
@@ -3361,10 +3797,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 if len(lr_list) > 1:
                     data["critic/lr"] = lr_list[1]
                 append_to_dict(metrics, data)
+                prof.update_done()
         # put LR scheduler step here
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
+        prof.step_done()
         # slot-LoRI: close the step. Reads what the armed forward stashed (orthogonality
         # error, per-slot ΔW norms, cross-slot cosines) plus the phase counter, as a
         # key set fixed by config so the metric all-reduce cannot deadlock.
