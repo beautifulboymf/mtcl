@@ -35,14 +35,94 @@ from rlinf.models.slot_lora.orth import (
     orthogonalize,
 )
 
+# Stamp `make_slot_ids` leaves on the tensor it validated, naming the slot count it
+# validated AGAINST. It is a plain Python attribute on that one tensor object, so
+# nothing derived from it (a slice, a `.to(device)`, a clone) carries it -- which is
+# the point: the only way to be trusted is to be the exact tensor whose values were
+# read on the host. Forgetting the stamp costs a device sync; it can never cost the
+# check itself.
+_RANGE_CHECKED_ATTR = "_slot_ids_range_checked"
+
+
+def _range_error(offenders: list[int], positions: list[int], num_slots: int) -> str:
+    """The one message both range checks raise, so the two cannot drift apart."""
+    more = "" if len(positions) <= 8 else f" (+{len(positions) - 8} more)"
+    return (
+        f"slot gate ids must be -1 (unrouted) or in [0, {num_slots}); got "
+        f"{offenders[:8]} at positions {positions[:8]}{more}. An out-of-range id "
+        "is NOT a no-op: it matches no slot, so the sample trains nothing at all "
+        "-- byte for byte what -1 means -- and a router off-by-one or a "
+        "task-id-to-slot map missing an entry would silently train nothing for a "
+        "whole suite. Fix the router, or widen num_slots if the model really has "
+        "that many slots."
+    )
+
+
+def make_slot_ids(ids, num_slots: int, device=None) -> torch.Tensor:
+    """Range-check a routing on the HOST, then copy it to ``device``. THE way to build one.
+
+    ``match_suite_ids`` produces a plain ``list[int]``, and this is the only moment at
+    which its values are readable for free: once the list is a CUDA tensor, the same
+    check costs a device-to-host sync, and it would pay it once per micro-batch
+    forever. This repo has measured ``run_training`` going 14.3 -> 80.0 min from
+    roughly six syncs per micro-batch, so the check moves to the list and the tensor
+    carries a stamp saying it was already done (see ``_RANGE_CHECKED_ATTR``).
+
+    The GUARANTEE is unchanged, and deliberately so: an id that matches no slot is
+    indistinguishable from ``-1`` ("no slot owns this sample") once it reaches
+    :meth:`SlotOut.forward`, so a router off-by-one would silently train nothing for a
+    whole suite. It is rejected here instead, one step earlier and one sync cheaper.
+
+    Args:
+        ids: The routing as plain Python ints, one per sample of THIS micro-batch;
+            ``-1`` for a sample no slot owns. A ``torch.Tensor`` is refused -- reading
+            one element-wise here is exactly the sync this exists to avoid, and a
+            caller that already has a tensor should hand it straight to
+            :meth:`SlotGate.scoped`, which checks it (with the sync) on the spot.
+        num_slots: How many slots the model has. Every id must be in ``[-1, num_slots)``.
+        device: Where the activations live; passed straight to ``torch.as_tensor``.
+            ``None`` leaves it on the host.
+
+    Returns:
+        A 1-D ``torch.long`` tensor on ``device``, stamped as range-checked against
+        ``num_slots``.
+
+    Raises:
+        ValueError: if ``num_slots`` is not a positive int, if ``ids`` is a tensor, or
+            if any id is outside ``[-1, num_slots)``.
+    """
+    if isinstance(ids, torch.Tensor):
+        raise ValueError(
+            "make_slot_ids takes the plain list of ints the router produced, not a "
+            "tensor: checking a tensor element-wise here is the device-to-host sync "
+            "this function exists to remove. Pass a tensor to SlotGate.scoped "
+            "directly -- it range-checks it there, sync and all."
+        )
+    if isinstance(num_slots, bool) or not isinstance(num_slots, int) or num_slots <= 0:
+        raise ValueError(
+            f"make_slot_ids needs a positive int num_slots; got {num_slots!r}. It is "
+            "the bound every id is checked against, so there is no meaningful "
+            "'unknown' here."
+        )
+    values = [int(v) for v in ids]
+    bad = [i for i, v in enumerate(values) if v < -1 or v >= num_slots]
+    if bad:
+        offenders = sorted({values[i] for i in bad})
+        raise ValueError(_range_error(offenders, bad, num_slots))
+    tensor = torch.as_tensor(values, dtype=torch.long, device=device)
+    setattr(tensor, _RANGE_CHECKED_ATTR, int(num_slots))
+    return tensor
+
 
 def _check_gate_ids(ids: Optional[torch.Tensor], num_slots: Optional[int]) -> None:
     """Validate a routing tensor against the contract in :class:`SlotGate`.
 
     Checked once per installation (i.e. once per micro-batch), never in the read
     path, which runs 200-400 times per forward. The RANGE check reads ``ids`` on the
-    host, so on CUDA it costs one device-to-host sync -- once per micro-batch, against
-    the 200-400 syncs an equivalent check in :meth:`SlotOut.forward` would cost.
+    host, so on CUDA it costs one device-to-host sync -- unless the routing came from
+    :func:`make_slot_ids`, which did that check on the plain Python list BEFORE the
+    host-to-device copy and stamped the tensor to say so. The stamped path is the hot
+    one (the actor's router); the sync below is what any other caller pays.
 
     Args:
         ids: The candidate routing, or ``None`` for ungated.
@@ -85,22 +165,23 @@ def _check_gate_ids(ids: Optional[torch.Tensor], num_slots: Optional[int]) -> No
             "(`SlotGate(num_slots=len(slot_ranks))`). A run that genuinely has no "
             "routing does not need one -- it installs None or uses `gate.ungated()`."
         )
+    # Already checked on the host, against THIS slot count, by make_slot_ids. Compared
+    # to num_slots and not merely present: a routing validated against a 4-slot model
+    # says nothing about a 2-slot one, and trusting it there would reopen exactly the
+    # hole (id 3 in a 2-slot model trains nothing, silently) that this check closes.
+    # Checked AFTER the num_slots-is-None raise above, so a gate that cannot verify a
+    # routing still refuses one rather than deferring to the stamp.
+    checked = getattr(ids, _RANGE_CHECKED_ATTR, None)
+    if isinstance(checked, int) and checked == num_slots:
+        return
+
     # One host sync per micro-batch. `.any()` first so the happy path pays exactly one,
     # and the (rare) failure path pays a second to name the offenders.
     out_of_range = (ids < -1) | (ids >= num_slots)
     if bool(out_of_range.any()):
         positions = out_of_range.nonzero().flatten().tolist()
         offenders = sorted({int(v) for v in ids[out_of_range].tolist()})
-        more = "" if len(positions) <= 8 else f" (+{len(positions) - 8} more)"
-        raise ValueError(
-            f"slot gate ids must be -1 (unrouted) or in [0, {num_slots}); got "
-            f"{offenders[:8]} at positions {positions[:8]}{more}. An out-of-range id "
-            "is NOT a no-op: it matches no slot, so the sample trains nothing at all "
-            "-- byte for byte what -1 means -- and a router off-by-one or a "
-            "task-id-to-slot map missing an entry would silently train nothing for a "
-            "whole suite. Fix the router, or widen num_slots if the model really has "
-            "that many slots."
-        )
+        raise ValueError(_range_error(offenders, positions, num_slots))
 
 
 class SlotGate:
@@ -265,7 +346,11 @@ class SlotGate:
                 micro-batch, with ``-1`` for unrouted samples; or ``None``. Note that
                 ``None`` does not mean "ungated" on a strict gate: reads still raise,
                 because a router that produced nothing is a bug, not a decision. Use
-                :meth:`ungated` to actually run ungated.
+                :meth:`ungated` to actually run ungated. Build it with
+                :func:`make_slot_ids`, which range-checks the router's plain list
+                before the host-to-device copy: the checks below then cost no device
+                sync at all. A tensor from anywhere else is checked here instead, at
+                one sync per micro-batch.
 
         Yields:
             This gate, for convenience.

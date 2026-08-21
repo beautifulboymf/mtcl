@@ -36,6 +36,8 @@ from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import (
+    PARAM_GROUP_SLOT_A,
+    PARAM_GROUP_SLOT_B,
     FSDPModelManager,
 )
 from rlinf.hybrid_engines.fsdp.utils import (
@@ -126,6 +128,98 @@ def process_nested_dict_for_train(nested_dict, shuffle_id):
         elif isinstance(value, dict):
             ret_dict[key] = process_nested_dict_for_train(value, shuffle_id)
     return ret_dict
+
+
+# slot-LoRI alternating schedule: the only two factors there are to train. "A" is Z
+# (the free matrix behind Ā), "B" is the readout.
+SLOT_ALT_FACTORS = ("A", "B")
+
+
+def parse_slot_alt_schedule(value) -> Optional[str]:
+    """Normalize ``actor.model.slot_lora.alt_schedule`` into a cycle string, or ``None``.
+
+    Args:
+        value: The config value. ``None`` means "train both factors jointly" -- the
+            ablation the alternation is measured against. A string is a cycle over the
+            factors, one character per OPTIMIZER UPDATE, case-insensitive: ``"BBA"``
+            (the default) trains B, B, then A, then repeats.
+
+    Returns:
+        The upper-cased schedule, or ``None`` for the joint ablation.
+
+    Raises:
+        ValueError: for anything else. Loudly, at construction: a schedule string with
+            a typo in it has no safe reading -- silently dropping the bad character
+            would run a different experiment than the config describes, and silently
+            falling back to joint training would run the ABLATION under the
+            alternation's name, which is the same result with the wrong label on it.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"actor.model.slot_lora.alt_schedule must be a string over "
+            f"{SLOT_ALT_FACTORS} (e.g. 'BBA') or null; got "
+            f"{type(value).__name__} ({value!r})."
+        )
+    schedule = value.strip().upper()
+    if not schedule:
+        raise ValueError(
+            "actor.model.slot_lora.alt_schedule is empty. Write null to train both "
+            "factors jointly (the ablation); an empty string is a typo, and the two "
+            "must not look alike in a config that decides which experiment ran."
+        )
+    unknown = sorted({c for c in schedule if c not in SLOT_ALT_FACTORS})
+    if unknown:
+        raise ValueError(
+            f"actor.model.slot_lora.alt_schedule {value!r} contains {unknown}; only "
+            f"{SLOT_ALT_FACTORS} are factors of a slot ('A' = Z, 'B' = the readout). "
+            "One character per optimizer update, cycled, e.g. 'BBA'."
+        )
+    return schedule
+
+
+def slot_alt_phase(
+    schedule: Optional[str], cycle_pos: int, is_last_update: bool
+) -> tuple[Optional[str], int]:
+    """Which factor this optimizer update trains, and where the cycle stands afterwards.
+
+    ALTERNATION IS PER OPTIMIZER UPDATE, NOT PER TRAINING STEP. One rollout yields
+    several updates (global_batch_size 192 at micro_batch_size 8 over 6 ranks is 4
+    micro-batches per update; three global batches per step is three updates), and it
+    is the update that is the atom here: with B fixed, ΔW = B Ā is linear in A and vice
+    versa, so each subproblem is better conditioned than chasing both at once.
+    Orthogonality does NOT depend on any of this -- it comes from the Z
+    parameterization and holds whatever the schedule says.
+
+    THE LAST UPDATE OF EVERY STEP IS FORCED TO B. B is the readout computed on the
+    current Ā, so ending each step on B means every checkpoint that step could save
+    carries a B that matches its Ā. Doing it per step rather than once at the end of
+    the run is strictly stronger and needs no knowledge of when the run ends.
+
+    THE FORCED B DOES NOT CONSUME THE CYCLE POSITION, and that is not a detail: with
+    three updates per step and a three-character schedule, advancing the cycle on the
+    override would lock it in phase with the step boundary, the ``A`` would land on the
+    forced update every single time, and A would never train -- for the whole run, with
+    ``slot/phase_is_A`` reading a perfectly plausible 0.0 and nothing else to say so.
+    Deferring the position instead retries that A on the next step's first update.
+
+    Args:
+        schedule: The cycle from :func:`parse_slot_alt_schedule`; ``None`` (or empty)
+            means train both factors jointly.
+        cycle_pos: Where the cycle stands, carried across training steps by the caller.
+        is_last_update: Whether this is the final optimizer update of the training step.
+
+    Returns:
+        ``(phase, next_cycle_pos)``. ``phase`` is ``"A"``, ``"B"``, or ``None`` for
+        "train both" -- the joint ablation, and the only case in which nothing is
+        frozen.
+    """
+    if not schedule:
+        return None, cycle_pos
+    if is_last_update:
+        return "B", cycle_pos
+    return schedule[cycle_pos % len(schedule)], (cycle_pos + 1) % len(schedule)
 
 
 class FSDPActor(FSDPModelManager, Worker):
@@ -1017,6 +1111,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._slot_gate_ids = None  # THIS micro-batch's routing (set by _route_prepare)
         self._slot_fallback = 0.0  # fraction of samples that matched no suite
         self._route_ready = False  # was the routing prepared for THIS micro-batch?
+        self._slot_alt_init()
 
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """
@@ -1397,6 +1492,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 message for why a single unmatched sample is worth stopping for.
         """
         from rlinf.models.slot_lora import match_suite_ids
+        from rlinf.models.slot_lora.modules import make_slot_ids
 
         self._last_groups = None
         self._slot_gate_ids = None
@@ -1450,9 +1546,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if not self._slot_enabled:
             return
         slot_of = self._slot_index_of()
-        self._slot_gate_ids = torch.as_tensor(
+        # make_slot_ids, not torch.as_tensor: it range-checks the plain Python list
+        # HERE, before the host-to-device copy, and stamps the tensor so the gate does
+        # not repeat the check on the device. The guarantee is identical (an id that
+        # matches no slot still raises, loudly -- it is indistinguishable from "no slot
+        # owns this sample" downstream, so it would train nothing for a whole suite in
+        # silence); what disappears is one device-to-host sync per micro-batch.
+        self._slot_gate_ids = make_slot_ids(
             [slot_of.get(s, -1) if s is not None else -1 for s in suites],
-            dtype=torch.long,
+            len(self._slot_order),
             device=ids.device,
         )
         if self._slot_fallback > 0.0:
@@ -1525,6 +1627,270 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "micro-batch, silently."
             )
         return gate.scoped(ids)
+
+    # ---- slot-LoRI: the B,B,A alternating schedule and the per-step diagnostics ------
+
+    def _slot_alt_init(self) -> None:
+        """Read the alternation config and reset the per-step counters.
+
+        A method called from ``__init__`` rather than inline code there, because it is
+        also the only way anything can reach this configuration without ray, LIBERO and
+        a 7B checkpoint -- which is to say, the only way it can be tested at all.
+
+        Raises:
+            ValueError: on a malformed ``alt_schedule`` (see
+                :func:`parse_slot_alt_schedule`) -- at construction, not at the first
+                optimizer update ~25 minutes into the run.
+        """
+        # Only a slot run has factors to alternate. Reading the key only when slots are
+        # on also keeps a stale alt_schedule in some inherited config from raising on
+        # runs where the whole slot_lora block is ignored anyway.
+        self._slot_alt_schedule = (
+            parse_slot_alt_schedule(
+                OmegaConf.select(
+                    self.cfg, "actor.model.slot_lora.alt_schedule", default="BBA"
+                )
+            )
+            if self._slot_enabled
+            else None
+        )
+        self._slot_alt_pos = 0  # cycle position, carried ACROSS training steps
+        self._slot_alt_lr: dict[str, float] = {}  # THIS step's scheduler lr per group
+        self._slot_alt_frozen = None  # group frozen for the update in flight
+        self._slot_alt_updates = 0  # optimizer updates so far this step
+        self._slot_alt_a_updates = 0  # ... of which A was free to move
+        self._slot_alt_expected = 0  # updates this step was told to expect
+        self._slot_alt_warned: set[str] = set()  # one-shot warning keys
+
+    def _slot_warn_once(self, key: str, message: str) -> None:
+        """Warn the first time only: these fire per training step, and would be noise."""
+        if key in self._slot_alt_warned:
+            return
+        self._slot_alt_warned.add(key)
+        self.log_warning(message)
+
+    def _slot_step_begin(self, updates_per_step: int) -> None:
+        """Open a training step: snapshot the lr, reset the counters, arm the diagnostics.
+
+        THE LR SNAPSHOT IS TAKEN HERE, EVERY STEP, and that is the whole point. The
+        alternation freezes a factor by writing ``0.0`` over its group's ``lr``, so it
+        needs the value to put back -- and the value to put back is whatever the LR
+        SCHEDULER set for THIS step (it rewrites every group once per step, at the end
+        of ``run_training``). A snapshot taken once at build time would restore the
+        warm-up lr for the rest of the run.
+
+        THE DIAGNOSTICS ARE ARMED HERE, BEFORE THE FIRST FORWARD, for the same reason
+        they are collected after the last update: ``enable_slot_diag`` arms ONE layer
+        and the numbers are computed inside that layer's forward, where its parameters
+        are already all-gathered by FSDP and cost no extra collective.
+
+        Args:
+            updates_per_step: How many optimizer updates this step will run. The "is
+                this the last one" decision is the caller's; this copy is what
+                :meth:`_slot_step_metrics` checks the realized count against, because
+                the two are computed from the same loop bounds in two places and a
+                drift between them would break the forced B silently -- either firing
+                it early (the step then ends on whatever the cycle says, possibly A,
+                and a checkpoint saved there carries a B that does not match its Ā) or
+                never firing it at all.
+
+        Raises:
+            RuntimeError: if the schedule is on but the optimizer has no slot groups to
+                alternate between -- i.e. the mechanism is configured and dead.
+        """
+        if not self._slot_enabled:
+            return
+        self._slot_alt_updates = 0
+        self._slot_alt_a_updates = 0
+        self._slot_alt_expected = int(updates_per_step)
+        self._slot_alt_frozen = None
+        self._slot_alt_lr = {
+            group["name"]: float(group["lr"])
+            for group in self.optimizer.param_groups
+            if group.get("name") in (PARAM_GROUP_SLOT_A, PARAM_GROUP_SLOT_B)
+        }
+        if self._slot_alt_schedule and len(self._slot_alt_lr) < 2:
+            if getattr(self, "critic_warmup_steps", 0) > 0:
+                # Critic warmup rebuilds the optimizer with ONLY the value head, so
+                # there is nothing to alternate and nothing to restore. Tolerated,
+                # because the slot factors are not training at all during it.
+                self._slot_warn_once(
+                    "alt_critic_warmup",
+                    "[slot-lora] critic warmup is active, so the optimizer has no "
+                    "slot_A/slot_B groups; the alternating schedule is inert until "
+                    "warmup ends and the optimizer is rebuilt.",
+                )
+                self._slot_alt_lr = {}
+            else:
+                raise RuntimeError(
+                    "actor.model.slot_lora.alt_schedule is set, but the optimizer has "
+                    f"no {PARAM_GROUP_SLOT_A}/{PARAM_GROUP_SLOT_B} groups to alternate "
+                    f"between (found {sorted(self._slot_alt_lr)}). The factors are "
+                    "grouped by parameter NAME in build_slot_aware_param_groups, so "
+                    "this means the slot parameters are not in this optimizer at all "
+                    "-- the schedule would silently do nothing for the whole run while "
+                    "slot/phase_is_A still reported a plausible number."
+                )
+        if self._slot_alt_schedule and updates_per_step < 2:
+            self._slot_warn_once(
+                "alt_one_update",
+                f"[slot-lora] this step has {updates_per_step} optimizer update(s) and "
+                "the last update of every step is forced to B, so A never trains. "
+                "Give the step more than one update (a smaller global_batch_size or a "
+                "larger update_epoch), or set alt_schedule: null to train both factors "
+                "jointly.",
+            )
+
+        from rlinf.models.slot_lora import enable_slot_diag
+
+        if not enable_slot_diag(self.model):
+            self._slot_warn_once(
+                "diag_no_slots",
+                "[slot-lora] slot metrics are on but the model has no SlotLoRALinear "
+                "to arm; every slot/* metric will read NaN.",
+            )
+
+    def _slot_alt_before_update(self, is_last_update: bool) -> Optional[str]:
+        """Freeze the factor this optimizer update is not training. Call BEFORE the step.
+
+        TWO THINGS, AND BOTH ARE NECESSARY.
+
+        ``lr = 0.0`` on the frozen group, rather than ``requires_grad_(False)`` on its
+        parameters: FSDP with ``use_orig_params=False`` (this repo's default) requires
+        uniform ``requires_grad`` within a flat parameter, and flipping it mid-run
+        breaks the flattening. The lr is the only knob that stops the update without
+        touching the graph.
+
+        ``p.grad = None`` on the frozen group, because a zeroed lr does NOT stop AdamW
+        from folding that parameter's gradient into ``exp_avg``/``exp_avg_sq``: it
+        would keep accumulating momentum through every update it was supposed to sit
+        out, and the first step after it thawed would move it by all of it. AdamW skips
+        a parameter whose ``grad`` is ``None`` entirely -- no moments, no step count.
+        Dropping the grads before the step also keeps them out of ``clip_grad_norm_``,
+        which is right: a gradient that will not be applied should not spend clip
+        budget belonging to the factor that is training.
+
+        Args:
+            is_last_update: Whether this is the final optimizer update of this training
+                step (which is forced to B; see :func:`slot_alt_phase`).
+
+        Returns:
+            The phase actually run: ``"A"``, ``"B"``, or ``None`` when both factors
+            train (slot-LoRI off, or the joint ablation).
+        """
+        if not self._slot_enabled:
+            return None
+        # An empty snapshot means there are no slot groups to alternate between (see
+        # _slot_step_begin); running joint is the only honest thing left to do.
+        schedule = self._slot_alt_schedule if len(self._slot_alt_lr) == 2 else None
+        phase, self._slot_alt_pos = slot_alt_phase(
+            schedule, self._slot_alt_pos, is_last_update
+        )
+        self._slot_alt_updates += 1
+        self._slot_alt_a_updates += int(phase != "B")
+        self._slot_alt_frozen = None
+        if phase is None:
+            return None
+        frozen = PARAM_GROUP_SLOT_A if phase == "B" else PARAM_GROUP_SLOT_B
+        for group in self.optimizer.param_groups:
+            if group.get("name") != frozen:
+                continue
+            group["lr"] = 0.0
+            for param in group["params"]:
+                param.grad = None
+        self._slot_alt_frozen = frozen
+        return phase
+
+    def _slot_alt_after_update(self) -> None:
+        """Put the scheduler's lr back on both slot groups. Call AFTER the step.
+
+        Both groups, not just the frozen one: restoring what this step's scheduler set
+        is idempotent, and a zero that somehow survived into the next step would be
+        restored to zero forever -- the group's lr is the only record of it.
+        """
+        if not self._slot_alt_frozen:
+            return
+        for group in self.optimizer.param_groups:
+            name = group.get("name")
+            if name in self._slot_alt_lr:
+                group["lr"] = self._slot_alt_lr[name]
+        self._slot_alt_frozen = None
+
+    def _slot_step_metrics(self) -> dict:
+        """Close a training step: read the armed diagnostics. Call AFTER the last update.
+
+        THE METRICS AND WHAT THEY MEAN:
+
+        * ``slot/orth_err`` -- ``‖Ā Āᵀ − I‖_F``, read off the fp32 recomputation inside
+          :class:`~rlinf.models.slot_lora.modules.SlotProj`, NEVER off the bf16 ``Ā``
+          the model consumes. Below 1e-3 is healthy; 1e-3 to 5e-2 means Z is degrading;
+          above 5e-2 orthogonality has collapsed and the run's results are invalid.
+          (Measured: as cond(Z) goes 10 -> 20 the fp32 error degrades 16x, 6.8e-5 ->
+          1.07e-3, while a bf16 reading moves 0.01887 -> 0.01894 -- the rounding floor
+          hides the entire slide, and by the time bf16 moves the result is garbage.)
+        * ``slot/cos_{s}_{t}`` -- cosine between two slots' ΔW, for every s < t. Below
+          1e-3 healthy, above 5e-2 collapsed.
+        * ``slot/dw_norm_{k}`` -- ``‖ΔW_k‖_F``. Expected to grow, largest for the suite
+          furthest from its teacher; a slot pinned at 0 was never routed to.
+        * ``slot/phase_is_A`` -- the share of THIS step's optimizer updates on which the
+          A factor was free to move. Under the default "BBA" at three updates per step
+          each step reads 0.0 or 1/3 and the RUN averages 2/9 (a third of the updates
+          that are not the forced step end); a flat 0.0 across steps means the
+          alternation is dead, and 1.0 is the joint ablation (nothing is ever frozen).
+
+        THE KEY SET IS FIXED BY CONFIG, always, including the NaNs. ``all_reduce_dict``
+        packs the metric dict into one tensor sized by the key count, so a rank that
+        emits a key another rank does not deadlocks the collective -- a bug this repo
+        has already hit once. Every key here is derived from ``len(self._slot_order)``,
+        which comes from config and is identical on every rank; a reading that is
+        missing is emitted as NaN rather than dropped (and NaN rather than 0.0, because
+        a plausible-looking constant is exactly the failure these plots must not
+        produce). ``slot/route_fallback_frac`` is deliberately NOT here: it is emitted
+        per micro-batch elsewhere, and a per-step copy would average two different
+        sample counts into one number.
+
+        Returns:
+            ``{metric: float}``, empty when slot-LoRI is off.
+        """
+        if not self._slot_enabled:
+            return {}
+
+        from rlinf.models.slot_lora import collect_slot_diag
+
+        n_slots = len(self._slot_order)
+        keys = ["slot/orth_err"]
+        keys += [f"slot/dw_norm_{k}" for k in range(n_slots)]
+        keys += [
+            f"slot/cos_{s}_{t}" for s in range(n_slots) for t in range(s + 1, n_slots)
+        ]
+        collected = collect_slot_diag(self.model)
+        unexpected = sorted(set(collected) - set(keys))
+        if unexpected:
+            # Dropped, not emitted: an extra key on one rank is a hang, not a metric.
+            self._slot_warn_once(
+                "diag_extra_keys",
+                f"[slot-lora] collect_slot_diag returned {unexpected}, which "
+                f"actor.model.slot_lora.slot_order ({n_slots} slots) does not predict. "
+                "Those readings are DROPPED -- a metric key that depends on the model "
+                "rather than on config deadlocks the metric all-reduce.",
+            )
+        if self._slot_alt_updates and self._slot_alt_updates != self._slot_alt_expected:
+            self._slot_warn_once(
+                "alt_update_count",
+                f"[slot-lora] this step ran {self._slot_alt_updates} optimizer "
+                f"update(s) but was opened expecting {self._slot_alt_expected}, so the "
+                "'last update of the step is forced to B' override fired at the wrong "
+                "update. A step that ends on A saves a checkpoint whose B does not "
+                "match its Ā. The expected count and the loop bounds are computed in "
+                "two places in run_training and have drifted apart.",
+            )
+        metrics = {key: float(collected.get(key, float("nan"))) for key in keys}
+        metrics["slot/phase_is_A"] = (
+            self._slot_alt_a_updates / self._slot_alt_updates
+            if self._slot_alt_updates
+            else float("nan")
+        )
+        return metrics
 
     def _teacher_forward(self, forward_inputs, kwargs):
         """Score the student's rollout with the teacher(s).
@@ -2332,6 +2698,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._dw_refresh_weights()
         metrics = {}
         update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+        # slot-LoRI: open the step. Snapshots the lr the scheduler set for THIS step
+        # (the alternation zeroes and restores it), resets the phase counters and arms
+        # the once-per-step orthogonality diagnostics on one layer -- BEFORE the first
+        # forward, which is what fills them. The update count is computed here and not
+        # inside, because "the LAST update of this step is forced to B" has to be known
+        # at the FIRST one.
+        updates_per_step = update_epoch * (rollout_size // batch_size_per_rank)
+        self._slot_step_begin(updates_per_step)
+        update_index = 0
         for _ in range(update_epoch):
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
@@ -2965,7 +3340,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                 self.torch_platform.empty_cache()
 
+                # slot-LoRI B,B,A: freeze one factor for THIS update by zeroing its
+                # optimizer group's lr and dropping its grads, then put the lr back
+                # afterwards. Both calls must bracket optimizer_step: the freeze has to
+                # be in place before AdamW runs, and the restore has to happen before
+                # the next update reads the group. Note that on a slot run the
+                # `actor/lr` key below reads whichever group comes first, so it shows
+                # the momentary per-group lr the alternation writes; `slot/phase_is_A`
+                # is the metric that reports the schedule.
+                update_index += 1
+                self._slot_alt_before_update(
+                    is_last_update=(update_index == updates_per_step)
+                )
                 grad_norm, lr_list = self.optimizer_step()
+                self._slot_alt_after_update()
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -2977,6 +3365,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.lr_scheduler.step()
         self.optimizer.zero_grad()
         clear_memory()
+        # slot-LoRI: close the step. Reads what the armed forward stashed (orthogonality
+        # error, per-slot ΔW norms, cross-slot cosines) plus the phase counter, as a
+        # key set fixed by config so the metric all-reduce cannot deadlock.
+        append_to_dict(metrics, self._slot_step_metrics())
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
