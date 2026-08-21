@@ -107,9 +107,10 @@ class SlotProj(nn.Module):
         super().__init__()
         self.in_features = int(in_features)
         self.total_rank = int(total_rank)
-        # A plain float, so it stays OUT of the state dict: it is a configuration
-        # constant, not learned state. Checkpoint conversion that merges slots into
-        # the base weights must therefore reconstruct the SAME value from config.
+        # A plain float, not a buffer: it must stay assignable (``p.scale = 2.5``)
+        # and must not acquire tensor semantics or be sharded/synchronized by FSDP.
+        # It IS persisted, via get_extra_state/set_extra_state -- see there for why
+        # the checkpoint has to carry it.
         self.scale = float(scale)
         self.eps = float(eps)
         self.weight = nn.Parameter(
@@ -158,3 +159,80 @@ class SlotProj(nn.Module):
             side reads, sliced by row block downstream.
         """
         return F.linear(x, self.orth_weight() * self.scale)
+
+    def get_extra_state(self) -> dict:
+        """Record the scale the checkpoint was trained with.
+
+        ``scale`` multiplies every slot's contribution to ``ΔW``, so a converter
+        that merges the slots back into the base weights has to use the SAME
+        value training used. Nothing else in the checkpoint pins it: ``Ā`` is
+        invariant to the scale of ``Z`` (see :func:`orthogonalize`), so the only
+        surviving trace of ``s`` would be in the B side, which this module does
+        not own. A converter left to re-derive ``s`` from CLI flags that
+        disagree with the training config produces a ``ΔW`` off by a constant
+        factor: the merge succeeds, the model runs, and the adapter is simply the
+        wrong size, with no error anywhere. Writing it down is what turns that
+        into something the converter can VERIFY.
+
+        Carried as extra state rather than a buffer on purpose: a buffer would be
+        sharded and synchronized by FSDP, would drag tensor semantics into a
+        configuration constant, and would break direct assignment
+        (``p.scale = 2.5``). The repo's weight-sync paths already skip
+        ``_extra_state`` keys (``bucket_syncer._bucket_key``,
+        ``fsdp_model_manager.divide_model_to_bucket``), so this reaches
+        checkpoints without reaching the rollout weight transfer.
+
+        ``eps`` and ``total_rank`` are deliberately NOT recorded. ``total_rank``
+        is already ``weight.shape[0]``, which the state dict carries: a mismatch
+        raises a shape error on load, and duplicating it would create a second
+        source of truth that can disagree with the tensor. ``eps`` only floors
+        ``‖Z Zᵀ‖_F`` (production sits ~7 orders of magnitude above it), so it
+        cannot silently rescale a merged ``ΔW`` -- the one failure this exists to
+        close -- and checking it would manufacture load failures for a knob that
+        carries no risk.
+
+        Returns:
+            ``{"scale": float}``. A dict rather than a bare float so more fields
+            can be added later without breaking readers.
+        """
+        return {"scale": self.scale}
+
+    def set_extra_state(self, state: dict) -> None:
+        """Verify the checkpoint's scale against this module's, never reconcile.
+
+        A disagreement here is a disagreement between the config that trained the
+        checkpoint and the config loading it, and only a human knows which one is
+        right. Overwriting from the checkpoint would silently make the run stop
+        matching its own config; ignoring the checkpoint would make the recorded
+        value decorative and reinstate the failure above. So this raises, naming
+        both values, and leaves the choice where it belongs.
+
+        Absence is a different case and is NOT an error here: a state dict with
+        no ``_extra_state`` predates scale persistence and therefore makes no
+        claim about ``s``, so there is nothing to contradict and the module keeps
+        its configured value. That case never reaches this method --
+        ``nn.Module._load_from_state_dict`` reports the missing key instead, and
+        only when ``strict=True``, which is the right place for it.
+
+        Args:
+            state: The object returned by :meth:`get_extra_state` at save time.
+
+        Raises:
+            ValueError: if ``state`` is not a mapping carrying ``"scale"``, or if
+                the scale it carries differs from this module's.
+        """
+        if not isinstance(state, dict) or "scale" not in state:
+            raise ValueError(
+                f"SlotProj extra state must be a dict carrying 'scale'; got "
+                f"{state!r}. The checkpoint was not written by this class."
+            )
+        ckpt_scale = float(state["scale"])
+        if ckpt_scale != self.scale:
+            raise ValueError(
+                f"SlotProj scale mismatch: the checkpoint was trained with "
+                f"scale={ckpt_scale!r} but this module is configured with "
+                f"scale={self.scale!r}. Every merged delta-W would come out off "
+                "by that ratio and nothing downstream would report it. Fix the "
+                "config to match the checkpoint (or vice versa); this is not "
+                "reconciled here."
+            )

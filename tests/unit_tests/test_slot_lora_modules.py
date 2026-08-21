@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
+
+import pytest
 import torch
 
 from rlinf.models.slot_lora.modules import SlotProj, get_slot_gate, slot_gate
@@ -131,3 +134,86 @@ class TestSlotProj:
         p._collect_diag = True
         p(torch.randn(4, 32, dtype=torch.float64))
         assert p._diag["gram"].requires_grad is False
+
+
+class TestSlotProjExtraState:
+    """scale is config, not a tensor -- but the checkpoint still has to record it.
+
+    Nothing else in the checkpoint pins ``s``: Ā is invariant to the scale of Z, so
+    a converter that re-derives ``s`` from CLI flags disagreeing with the training
+    config emits a delta-W off by a constant factor, with no error anywhere.
+    """
+
+    def _proj(self, scale):
+        torch.manual_seed(0)
+        return SlotProj(32, 8, scale, dtype=torch.float64)
+
+    def test_state_dict_carries_the_scale(self):
+        sd = self._proj(2.5).state_dict()
+        assert sd["_extra_state"] == {"scale": 2.5}
+
+    def test_state_dict_reads_the_live_attribute(self):
+        # scale stays a plain assignable float (that is why it is extra state and
+        # not a buffer), so the recorded value must follow a direct assignment.
+        p = self._proj(1.0)
+        p.scale = 3.0
+        assert p.state_dict()["_extra_state"] == {"scale": 3.0}
+
+    def test_round_trips_through_load_state_dict(self):
+        src = self._proj(2.5)
+        src.weight.data.add_(0.1)
+        dst = SlotProj(32, 8, 2.5, dtype=torch.float64)
+        dst.load_state_dict(src.state_dict())
+        assert dst.scale == 2.5
+        assert torch.equal(dst.weight, src.weight)
+
+    def test_round_trips_through_a_torch_save_file(self):
+        # extra state has to survive real serialization, not just an in-memory dict.
+        buf = io.BytesIO()
+        torch.save(self._proj(2.5).state_dict(), buf)
+        buf.seek(0)
+        dst = SlotProj(32, 8, 2.5, dtype=torch.float64)
+        dst.load_state_dict(torch.load(buf, weights_only=False))
+        assert dst.scale == 2.5
+
+    def test_mismatched_scale_raises_naming_both_values(self):
+        sd = self._proj(2.5).state_dict()
+        dst = SlotProj(32, 8, 1.0, dtype=torch.float64)
+        with pytest.raises(ValueError, match=r"scale=2\.5.*scale=1\.0"):
+            dst.load_state_dict(sd)
+        # and it must NOT have been reconciled in either direction
+        assert dst.scale == 1.0
+        assert sd["_extra_state"] == {"scale": 2.5}
+
+    def test_malformed_extra_state_raises(self):
+        p = self._proj(1.0)
+        for bad in (2.5, {}, {"eps": 1e-6}, None):
+            with pytest.raises(ValueError, match="must be a dict carrying 'scale'"):
+                p.set_extra_state(bad)
+
+    def test_pre_change_checkpoint_loads_and_keeps_the_configured_scale(self):
+        # A state dict written before scale was persisted makes NO claim about the
+        # scale, so there is nothing to contradict: the weight loads and the module
+        # keeps the scale it was constructed with (the pre-fix status quo).
+        legacy = {"weight": torch.zeros(8, 32, dtype=torch.float64)}
+        p = self._proj(2.5)
+        missing, unexpected = p.load_state_dict(legacy, strict=False)
+        assert p.scale == 2.5
+        assert torch.equal(p.weight, legacy["weight"])
+        assert missing == ["_extra_state"] and unexpected == []
+
+    def test_pre_change_checkpoint_is_a_missing_key_under_strict(self):
+        # Deliberately left as PyTorch's default rather than silently tolerated:
+        # "this state dict does not record its scale" is exactly what a converter
+        # that must VERIFY needs to hear, and strict= is the caller's knob for it.
+        legacy = {"weight": torch.zeros(8, 32, dtype=torch.float64)}
+        with pytest.raises(RuntimeError, match="_extra_state"):
+            self._proj(2.5).load_state_dict(legacy, strict=True)
+
+    def test_extra_state_does_not_break_the_fsdp_leaf_predicate(self):
+        # get/set_extra_state must not add children or parameters: the leaf-wrap
+        # test at rlinf/hybrid_engines/fsdp/utils.py:306 still has to fire.
+        p = self._proj(1.0)
+        assert list(p.named_children()) == []
+        assert len(list(p.parameters())) == 1
+        assert p.weight.requires_grad
