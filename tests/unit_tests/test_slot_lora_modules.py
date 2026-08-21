@@ -78,20 +78,20 @@ class TestSlotGate:
         assert SlotGate(strict=False).current() is None
 
     def test_scoped_sets_and_restores(self):
-        gate, ids = SlotGate(), _ids()
+        gate, ids = SlotGate(num_slots=2), _ids()
         with gate.scoped(ids):
             assert gate.current() is ids
         assert gate.current_unchecked() is None
 
     def test_restores_on_exception(self):
-        gate = SlotGate()
+        gate = SlotGate(num_slots=2)
         with pytest.raises(RuntimeError, match="boom"):
             with gate.scoped(_ids()):
                 raise RuntimeError("boom")
         assert gate.current_unchecked() is None
 
     def test_nested_scopes_restore_in_order(self):
-        gate, outer, inner = SlotGate(), _ids(0), _ids(1)
+        gate, outer, inner = SlotGate(num_slots=2), _ids(0), _ids(1)
         with gate.scoped(outer):
             with gate.scoped(inner):
                 assert gate.current() is inner
@@ -101,7 +101,7 @@ class TestSlotGate:
     def test_one_holder_is_shared_by_every_gated_module(self):
         # Installing a routing must be O(1), not a walk over the 200-400 gated linears
         # of a 7B model: ONE holder, many references to it.
-        gate = SlotGate()
+        gate = SlotGate(num_slots=2)
         probes = [_GateProbe(gate) for _ in range(4)]
         ids = _ids()
         with gate.scoped(ids):
@@ -119,7 +119,7 @@ class TestSlotGateStrictMode:
     """
 
     def test_strict_raises_after_the_scope_exits(self):
-        gate = SlotGate()
+        gate = SlotGate(num_slots=2)
         with gate.scoped(_ids()):
             pass
         with pytest.raises(RuntimeError, match="no slot routing"):
@@ -128,7 +128,7 @@ class TestSlotGateStrictMode:
     def test_strict_raises_when_the_scope_carried_none(self):
         # The routing helper has several early-return paths that yield None. Under
         # strict, "the router produced nothing" is a BUG, not "quietly run ungated".
-        gate = SlotGate()
+        gate = SlotGate(num_slots=2)
         with gate.scoped(None):
             with pytest.raises(RuntimeError, match="no slot routing"):
                 gate.current()
@@ -141,7 +141,7 @@ class TestSlotGateStrictMode:
         assert SlotGate().current_unchecked() is None
 
     def test_ungated_window_opts_out_and_restores_both_fields(self):
-        gate, ids = SlotGate(), _ids()
+        gate, ids = SlotGate(num_slots=2), _ids()
         with gate.scoped(ids):
             with gate.ungated():
                 assert gate.current() is None
@@ -150,7 +150,7 @@ class TestSlotGateStrictMode:
             assert gate.strict is True
 
     def test_ungated_window_restores_on_exception(self):
-        gate = SlotGate()
+        gate = SlotGate(num_slots=2)
         with pytest.raises(RuntimeError, match="boom"):
             with gate.ungated():
                 raise RuntimeError("boom")
@@ -193,12 +193,12 @@ class TestSlotGateIdsContract:
             assert gate.current() is None
 
     def test_accepts_minus_one_for_unrouted_samples(self):
-        gate, ids = SlotGate(), _ids(-1, -1)
+        gate, ids = SlotGate(num_slots=2), _ids(-1, -1)
         with gate.scoped(ids):
             assert torch.equal(gate.current(), ids)
 
     def test_a_bad_gate_does_not_clobber_the_live_one(self):
-        gate, good = SlotGate(), _ids()
+        gate, good = SlotGate(num_slots=2), _ids()
         with gate.scoped(good):
             with pytest.raises(ValueError):
                 with gate.scoped(torch.tensor([0.0])):
@@ -219,12 +219,12 @@ class TestSlotGateSurvivesThreadsAndCheckpointing:
     """
 
     def test_the_gate_is_visible_from_a_fresh_thread(self):
-        gate, ids = SlotGate(), _ids()
+        gate, ids = SlotGate(num_slots=2), _ids()
         with gate.scoped(ids):
             assert _in_a_fresh_thread(gate.current) is ids
 
     def test_a_fresh_thread_can_install_a_routing_the_main_thread_sees(self):
-        gate, ids = SlotGate(), _ids()
+        gate, ids = SlotGate(num_slots=2), _ids()
 
         def install_and_read():
             with gate.scoped(ids):
@@ -234,7 +234,7 @@ class TestSlotGateSurvivesThreadsAndCheckpointing:
         assert gate.current_unchecked() is None
 
     def test_checkpoint_recomputation_sees_the_gate(self):
-        gate, ids = SlotGate(), _ids(0, 1)
+        gate, ids = SlotGate(num_slots=2), _ids(0, 1)
         probe = _GateProbe(gate)
         x = torch.randn(2, 3, dtype=torch.float64, requires_grad=True)
         with gate.scoped(ids):
@@ -248,7 +248,7 @@ class TestSlotGateSurvivesThreadsAndCheckpointing:
     def test_checkpoint_recomputation_on_another_thread_sees_the_gate(self):
         # The production shape, reproduced on CPU: the forward is recomputed by a
         # thread that never entered the scope. The ContextVar version returns None here.
-        gate, ids = SlotGate(), _ids(0, 1)
+        gate, ids = SlotGate(num_slots=2), _ids(0, 1)
         probe = _GateProbe(gate)
         x = torch.randn(2, 3, dtype=torch.float64, requires_grad=True)
         with gate.scoped(ids):
@@ -261,7 +261,7 @@ class TestSlotGateSurvivesThreadsAndCheckpointing:
     def test_a_strict_gate_raises_when_recomputation_escapes_the_scope(self):
         # Backward AFTER the scope closed: the recomputed forward genuinely has no
         # routing. Strict mode makes that loud instead of silently ungated.
-        gate, ids = SlotGate(), _ids(0, 1)
+        gate, ids = SlotGate(num_slots=2), _ids(0, 1)
         probe = _GateProbe(gate)
         x = torch.randn(2, 3, dtype=torch.float64, requires_grad=True)
         with gate.scoped(ids):
@@ -340,7 +340,7 @@ class TestSlotProj:
 
     def test_diag_is_collected_once_when_armed(self):
         p = self._proj()
-        p._collect_diag = True
+        p.arm_diag()
         p(torch.randn(4, 32, dtype=torch.float64))
         assert p._diag is not None
         assert p._collect_diag is False
@@ -354,7 +354,7 @@ class TestSlotProj:
         # rounding floor hides the entire slide; failure is a cliff, not a slope.
         torch.manual_seed(0)
         p = SlotProj(64, 16, 1.0, dtype=torch.bfloat16)
-        p._collect_diag = True
+        p.arm_diag()
         p(torch.randn(4, 64, dtype=torch.bfloat16))
         gram = p._diag["gram"]
         assert gram.dtype == torch.float32
@@ -373,7 +373,7 @@ class TestSlotProj:
         # because it runs with no ambient autocast.
         torch.manual_seed(0)
         p = SlotProj(64, 16, 1.0, dtype=torch.bfloat16)
-        p._collect_diag = True
+        p.arm_diag()
         with torch.autocast("cpu", dtype=torch.bfloat16):
             p(torch.randn(4, 64, dtype=torch.bfloat16))
         gram = p._diag["gram"]
@@ -383,7 +383,7 @@ class TestSlotProj:
 
     def test_diag_does_not_build_a_graph(self):
         p = self._proj()
-        p._collect_diag = True
+        p.arm_diag()
         p(torch.randn(4, 32, dtype=torch.float64))
         assert p._diag["gram"].requires_grad is False
 
@@ -505,7 +505,7 @@ class TestSlotOut:
 
     def _out(self, out_features=6, strict=True):
         torch.manual_seed(1)
-        gate = SlotGate(strict=strict)
+        gate = SlotGate(num_slots=len(self.RANKS), strict=strict)
         m = SlotOut(out_features, self.RANKS, gate, dtype=torch.float64)
         with torch.no_grad():
             m.weight.copy_(
@@ -611,37 +611,49 @@ class TestSlotOut:
             assert out.shape == (4, 7, 6)
             out.sum().backward()
         assert torch.count_nonzero(h.grad[0, :, 3:8]) == 0
+        # the owner half too: a mutant that keeps the forward value and HALVES the
+        # owner's gradient passes every "some block is zero" assertion in this file.
+        assert h.grad[0, :, 0:3].abs().sum() > 0
+        assert m.weight.grad[:, 0:3].abs().sum() > 0
+        assert m.weight.grad[:, 3:8].abs().sum() > 0
 
     def test_rejects_routing_of_the_wrong_length(self):
+        # A ValueError, not an assert: under PYTHONOPTIMIZE=1 asserts are STRIPPED, and
+        # measured with them stripped, a length-1 routing against a batch of 4 assigns
+        # all four samples to slot 0 (slot0 grad abs-sum 63.27, slot1 exactly 0) while a
+        # length-4 routing against a batch of 1 silently changes the output shape from
+        # (1, 6) to (4, 6). Both are host-side shape comparisons, so raising costs the
+        # same as asserting.
         m, gate = self._out()
         h = self._h(batch=4)
         with gate.scoped(torch.tensor([0, 1])):
-            try:
+            with pytest.raises(ValueError, match=r"routing has 2 entries.*4 samples"):
                 m(h)
-            except AssertionError:
-                return
-        raise AssertionError("expected an assertion on mismatched routing length")
+
+    def test_rejects_a_routing_longer_than_the_micro_batch(self):
+        m, gate = self._out()
+        with gate.scoped(torch.tensor([0, 1, 0, 1])):
+            with pytest.raises(ValueError, match=r"routing has 4 entries.*1 samples"):
+                m(self._h(batch=1))
 
     def test_strict_gate_raises_when_routing_was_never_installed(self):
         m, _ = self._out(strict=True)
-        try:
+        with pytest.raises(RuntimeError, match="no slot routing"):
             m(self._h())
-        except RuntimeError:
-            return
-        raise AssertionError("expected a strict-gate RuntimeError")
 
     def test_survives_checkpoint_recomputation(self):
         # Gradient checkpointing re-runs this forward during backward, on the autograd
         # engine's worker thread. The gate must still be visible there, or gating is
         # silently off and every slot gets gradient from every sample.
-        from torch.utils.checkpoint import checkpoint
-
         m, gate = self._out()
         h = self._h()
         with gate.scoped(torch.tensor([0, 0, 0, 0])):
             out = checkpoint(m, h, use_reentrant=False)
             out.sum().backward()
         assert torch.count_nonzero(m.weight.grad[:, 3:8]) == 0
+        # and the owner still learned: "everything is zero" would pass the line above.
+        assert m.weight.grad[:, 0:3].abs().sum() > 0
+        assert h.grad[:, 0:3].abs().sum() > 0
 
 
 class TestSlotOutRankValidation:
@@ -657,6 +669,21 @@ class TestSlotOutRankValidation:
             with pytest.raises(ValueError, match="strictly positive"):
                 SlotOut(6, bad, SlotGate(strict=False))
 
+    def test_rejects_a_gate_whose_slot_count_disagrees(self):
+        # The gate's range check is only as good as its count: a gate saying 4 against
+        # a 3-slot B accepts an id of 3, which matches no slot here and trains that
+        # sample nothing -- the very failure num_slots exists to close.
+        with pytest.raises(ValueError, match=r"2 slots \(3, 5\).*num_slots=4"):
+            SlotOut(6, (3, 5), SlotGate(num_slots=4))
+
+    def test_accepts_a_gate_whose_slot_count_agrees(self):
+        assert SlotOut(6, (3, 5), SlotGate(num_slots=2)).total_rank == 8
+
+    def test_accepts_a_countless_gate(self):
+        # A gate with no count cannot install a routing at all, so there is nothing to
+        # disagree with; single-suite runs must stay buildable.
+        assert SlotOut(6, (3, 5), SlotGate(strict=False)).total_rank == 8
+
 
 class TestSlotOutDiag:
     """The B-side halves of ⟨ΔW_s, ΔW_t⟩_F = tr(B_sᵀB_t · Ā_tĀ_sᵀ).
@@ -669,7 +696,12 @@ class TestSlotOutDiag:
 
     def _out(self, out_features=6, dtype=torch.float64):
         torch.manual_seed(2)
-        m = SlotOut(out_features, self.RANKS, SlotGate(strict=False), dtype=dtype)
+        m = SlotOut(
+            out_features,
+            self.RANKS,
+            SlotGate(num_slots=len(self.RANKS), strict=False),
+            dtype=dtype,
+        )
         with torch.no_grad():
             m.weight.copy_(torch.randn_like(m.weight))
         return m
@@ -685,7 +717,7 @@ class TestSlotOutDiag:
 
     def test_diag_is_collected_once_when_armed(self):
         m = self._out()
-        m._collect_diag = True
+        m.arm_diag()
         with m.gate.ungated():
             m(self._h())
         assert m._diag is not None
@@ -697,7 +729,7 @@ class TestSlotOutDiag:
 
     def test_diag_values_match_the_b_blocks(self):
         m = self._out()
-        m._collect_diag = True
+        m.arm_diag()
         with m.gate.ungated():
             m(self._h())
         b = m.weight.detach().float()
@@ -707,11 +739,24 @@ class TestSlotOutDiag:
         )
         assert torch.allclose(m._diag["cross"][(0, 1)], b1.T @ b0, atol=1e-6)
 
+    def test_diag_is_collected_on_the_gated_path_too(self):
+        # Every other case here goes through gate.ungated(), so moving the _collect_diag
+        # branch inside the `ids is None` fast path would break none of them -- and would
+        # silently stop collecting for every real training step, which is gated.
+        m = self._out()
+        m.arm_diag()
+        with m.gate.scoped(torch.tensor([0, 1, 0, -1])):
+            m(self._h())
+        assert m._diag is not None
+        assert m._collect_diag is False
+        assert set(m._diag["cross"]) == {(0, 1)}
+        assert m._diag["b_norms"].shape == (2,)
+
     def test_diag_stays_fp32_inside_an_ambient_autocast(self):
         # Same trap as SlotProj's Gram: autocast intercepts per op, so a bare matmul
         # forming BᵀB is demoted right back down under an ambient bf16 autocast.
         m = self._out(dtype=torch.bfloat16)
-        m._collect_diag = True
+        m.arm_diag()
         with torch.autocast("cpu", dtype=torch.bfloat16), m.gate.ungated():
             m(self._h(dtype=torch.bfloat16))
         assert m._diag["cross"][(0, 1)].dtype == torch.float32
@@ -719,8 +764,487 @@ class TestSlotOutDiag:
 
     def test_diag_does_not_build_a_graph(self):
         m = self._out()
-        m._collect_diag = True
+        m.arm_diag()
         with m.gate.ungated():
             m(self._h())
         assert m._diag["b_norms"].requires_grad is False
         assert m._diag["cross"][(0, 1)].requires_grad is False
+
+
+class TestSlotGateSlotCount:
+    """Out-of-range slot ids: the failure mode strict mode does NOT catch.
+
+    Measured before the fix: a 2-slot model handed ``ids = [0, 1, 7, 99]`` raised
+    nothing, and samples 2 and 3 received zero gradient everywhere -- byte for byte the
+    behaviour of the deliberate ``-1`` "no slot owns this sample". A router off-by-one,
+    or a task-id-to-slot map missing an entry, therefore trains NOTHING for a whole
+    suite with no error, no NaN and a normal-looking loss curve. Strict mode catches
+    "no routing installed"; only the slot count catches "wrong routing installed".
+    """
+
+    def test_out_of_range_ids_are_rejected_at_install_time(self):
+        with pytest.raises(ValueError, match=r"must be -1 .*or in \[0, 2\)"):
+            with SlotGate(num_slots=2).scoped(_ids(0, 1, 7, 99)):
+                pass
+
+    def test_the_message_names_the_offending_values_and_positions(self):
+        with pytest.raises(ValueError, match=r"\[7, 99\].*positions \[2, 3\]"):
+            with SlotGate(num_slots=2).scoped(_ids(0, 1, 7, 99)):
+                pass
+
+    def test_the_off_by_one_id_equal_to_the_slot_count_is_rejected(self):
+        # The likeliest bug of all: a 0-based map read as 1-based, or one slot too few.
+        with pytest.raises(ValueError, match=r"\[0, 2\)"):
+            with SlotGate(num_slots=2).scoped(_ids(0, 2)):
+                pass
+
+    def test_ids_below_minus_one_are_rejected(self):
+        with pytest.raises(ValueError, match=r"\[-2\]"):
+            with SlotGate(num_slots=2).scoped(_ids(0, -2)):
+                pass
+
+    def test_minus_one_remains_valid(self):
+        gate, ids = SlotGate(num_slots=2), _ids(-1, -1)
+        with gate.scoped(ids):
+            assert torch.equal(gate.current(), ids)
+
+    def test_every_in_range_id_is_accepted(self):
+        gate, ids = SlotGate(num_slots=4), _ids(0, 3, -1, 2)
+        with gate.scoped(ids):
+            assert torch.equal(gate.current(), ids)
+
+    def test_a_rejected_routing_does_not_clobber_the_live_one(self):
+        gate, good = SlotGate(num_slots=2), _ids()
+        with gate.scoped(good):
+            with pytest.raises(ValueError):
+                with gate.scoped(_ids(0, 5)):
+                    pass
+            assert gate.current() is good
+
+    def test_the_contract_checks_run_before_the_range_check(self):
+        # A float tensor has no meaningful range; it must be reported as a dtype error.
+        with pytest.raises(ValueError, match="torch.long"):
+            with SlotGate(num_slots=2).scoped(torch.tensor([0.0, 7.0])):
+                pass
+
+    def test_a_gate_with_no_slot_count_refuses_to_install_a_routing(self):
+        # An unverifiable routing on a gate that cannot check it is exactly the hole
+        # this closes, so installing one is an error rather than a reduced check.
+        with pytest.raises(ValueError, match="num_slots"):
+            with SlotGate().scoped(_ids(0, 1)):
+                pass
+
+    def test_a_gate_with_no_slot_count_is_still_a_first_class_ungated_gate(self):
+        # Single-suite runs never install a routing; they must not be forced to invent
+        # a slot count.
+        gate = SlotGate(strict=False)
+        with gate.scoped(None):
+            assert gate.current() is None
+        with gate.ungated():
+            assert gate.current() is None
+
+    def test_the_slot_count_is_validated_at_construction(self):
+        for bad in (0, -1, 2.5, "2"):
+            with pytest.raises(ValueError, match="num_slots"):
+                SlotGate(num_slots=bad)
+
+    def test_a_bool_slot_count_is_rejected_as_a_misplaced_strict_flag(self):
+        # SlotGate(True) reads as the strict flag but binds to num_slots, where True
+        # would quietly become a ONE-slot gate that rejects every id except 0 and -1.
+        with pytest.raises(ValueError, match="strict"):
+            SlotGate(True)
+
+    def test_the_slot_count_is_readable(self):
+        assert SlotGate(num_slots=4).num_slots == 4
+        assert SlotGate().num_slots is None
+
+    def test_end_to_end_a_two_slot_model_rejects_slot_seven(self):
+        # The measured bug, whole: before the fix this ran to completion and trained
+        # nothing for samples 2 and 3.
+        gate = SlotGate(num_slots=2)
+        m = SlotOut(6, (3, 5), gate, dtype=torch.float64)
+        with pytest.raises(ValueError, match=r"\[0, 2\)"):
+            with gate.scoped(_ids(0, 1, 7, 99)):
+                m(torch.randn(4, 8, dtype=torch.float64)).sum().backward()
+
+
+class TestSlotOutInputWidth:
+    """``h`` must span exactly the columns the slots do.
+
+    The gated path slices ``h[..., start:stop]`` per slot, so it always reads the FIRST
+    ``total_rank`` columns: an ``h`` of width 12 against ``total_rank=8`` used to run
+    fine and silently drop 4 columns, while the ungated fast path raised
+    ``RuntimeError: mat1 and mat2 shapes cannot be multiplied``. A SlotProj.total_rank
+    that disagrees with sum(SlotOut.slot_ranks) would therefore train to completion and
+    only blow up at eval, by which time the checkpoint's delta-W is already wrong.
+    """
+
+    RANKS = (3, 5)
+
+    def _out(self):
+        torch.manual_seed(1)
+        gate = SlotGate(num_slots=len(self.RANKS))
+        return SlotOut(6, self.RANKS, gate, dtype=torch.float64), gate
+
+    def test_too_wide_h_is_rejected_on_the_gated_path(self):
+        m, gate = self._out()
+        with gate.scoped(_ids(0, 1)):
+            with pytest.raises(ValueError, match=r"width 12.*8 columns"):
+                m(torch.randn(2, 12, dtype=torch.float64))
+
+    def test_too_wide_h_is_rejected_on_the_ungated_path(self):
+        m, gate = self._out()
+        with gate.ungated():
+            with pytest.raises(ValueError, match=r"width 12.*8 columns"):
+                m(torch.randn(2, 12, dtype=torch.float64))
+
+    def test_too_narrow_h_is_rejected_on_the_gated_path(self):
+        m, gate = self._out()
+        with gate.scoped(_ids(0, 1)):
+            with pytest.raises(ValueError, match=r"width 5.*8 columns"):
+                m(torch.randn(2, 5, dtype=torch.float64))
+
+    def test_too_narrow_h_is_rejected_on_the_ungated_path(self):
+        m, gate = self._out()
+        with gate.ungated():
+            with pytest.raises(ValueError, match=r"width 5.*8 columns"):
+                m(torch.randn(2, 5, dtype=torch.float64))
+
+    def test_a_sequence_dimension_does_not_confuse_the_width_check(self):
+        m, gate = self._out()
+        with gate.scoped(_ids(0, 1)):
+            assert m(torch.randn(2, 7, 8, dtype=torch.float64)).shape == (2, 7, 6)
+
+
+class TestSlotOutSlotLayouts:
+    """Equal per-slot ranks, K = 1 and K >= 3.
+
+    Every other SlotOut test uses (3, 5). Unequal ranks make a transposed block a shape
+    error, which accidentally protects the diagnostic pairing from a silent slicing bug,
+    and a two-slot layout cannot catch an offset bug that only shows up from slot 2 on.
+    """
+
+    def _out(self, ranks, out_features=6, strict=True):
+        torch.manual_seed(7)
+        gate = SlotGate(num_slots=len(ranks), strict=strict)
+        m = SlotOut(out_features, ranks, gate, dtype=torch.float64)
+        with torch.no_grad():
+            m.weight.copy_(torch.randn_like(m.weight))
+        return m, gate
+
+    def test_equal_ranks_lay_out_contiguous_blocks(self):
+        m, _ = self._out((4, 4, 4))
+        assert m.total_rank == 12
+        assert m.offsets == (0, 4, 8)
+
+    def test_equal_ranks_isolate_every_slot(self):
+        m, gate = self._out((4, 4, 4))
+        h = torch.randn(3, 12, dtype=torch.float64, requires_grad=True)
+        with gate.scoped(torch.tensor([0, 1, 2])):
+            m(h).sum().backward()
+        blocks = [slice(0, 4), slice(4, 8), slice(8, 12)]
+        for sample, owned in enumerate(blocks):
+            assert h.grad[sample, owned].abs().sum() > 0
+            for other in blocks:
+                if other != owned:
+                    assert torch.count_nonzero(h.grad[sample, other]) == 0
+        for owned in blocks:
+            assert m.weight.grad[:, owned].abs().sum() > 0
+
+    def test_equal_ranks_leave_the_owner_gradient_numerically_untouched(self):
+        m, gate = self._out((4, 4, 4))
+        h = torch.randn(3, 12, dtype=torch.float64, requires_grad=True)
+        with gate.scoped(torch.tensor([1, 1, 2])):
+            m(h).sum().backward()
+        gated = m.weight.grad.clone()
+
+        reference, ref_gate = self._out((4, 4, 4))
+        with ref_gate.ungated():
+            reference(h.detach()[:2]).sum().backward()
+        assert torch.allclose(gated[:, 4:8], reference.weight.grad[:, 4:8], atol=1e-12)
+
+    def test_three_slots_cross_the_expected_pairs(self):
+        m, _ = self._out((4, 4, 4), strict=False)
+        m.arm_diag()
+        with m.gate.ungated():
+            m(torch.randn(2, 12, dtype=torch.float64))
+        assert set(m._diag["cross"]) == {(0, 1), (0, 2), (1, 2)}
+        assert m._diag["cross"][(0, 2)].shape == (4, 4)
+        assert m._diag["b_norms"].shape == (3,)
+
+    def test_a_single_slot_takes_gradient_from_every_routed_sample(self):
+        m, gate = self._out((4,))
+        h = torch.randn(3, 4, dtype=torch.float64, requires_grad=True)
+        with gate.scoped(torch.tensor([0, 0, 0])):
+            m(h).sum().backward()
+        assert m.offsets == (0,)
+        assert m.weight.grad.abs().sum() > 0
+        assert h.grad.abs().sum() > 0
+
+    def test_a_single_slot_still_honours_minus_one(self):
+        m, gate = self._out((4,))
+        h = torch.randn(3, 4, dtype=torch.float64, requires_grad=True)
+        with gate.scoped(torch.tensor([0, -1, -1])):
+            m(h).sum().backward()
+        assert h.grad[0].abs().sum() > 0
+        assert torch.count_nonzero(h.grad[1:]) == 0
+
+    def test_a_single_slot_has_no_cross_terms(self):
+        m, _ = self._out((4,), strict=False)
+        m.arm_diag()
+        with m.gate.ungated():
+            m(torch.randn(2, 4, dtype=torch.float64))
+        assert m._diag["cross"] == {}
+        assert m._diag["b_norms"].shape == (1,)
+
+
+class TestSlotOutBf16:
+    """bf16 is the production dtype; every other functional test here is fp64."""
+
+    RANKS = (3, 5)
+
+    def _out(self):
+        torch.manual_seed(11)
+        gate = SlotGate(num_slots=len(self.RANKS))
+        m = SlotOut(6, self.RANKS, gate, dtype=torch.bfloat16)
+        with torch.no_grad():
+            m.weight.copy_(torch.randn_like(m.weight))
+        return m, gate
+
+    def test_bf16_forward_keeps_its_dtype(self):
+        m, gate = self._out()
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            out = m(torch.randn(4, 8, dtype=torch.bfloat16))
+        assert out.dtype == torch.bfloat16
+        assert out.shape == (4, 6)
+
+    def test_bf16_backward_routes_gradient_to_the_owner_only(self):
+        m, gate = self._out()
+        h = torch.randn(4, 8, dtype=torch.bfloat16, requires_grad=True)
+        with gate.scoped(torch.tensor([0, 0, 0, 0])):
+            m(h).sum().backward()
+        assert m.weight.grad.dtype == torch.bfloat16
+        assert torch.isfinite(m.weight.grad).all()
+        assert m.weight.grad[:, 0:3].abs().sum() > 0
+        assert torch.count_nonzero(m.weight.grad[:, 3:8]) == 0
+        assert h.grad[:, 0:3].abs().sum() > 0
+        assert torch.count_nonzero(h.grad[:, 3:8]) == 0
+
+    def test_the_two_paths_agree_only_to_the_bf16_rounding_floor(self):
+        # The routing has no train/inference mismatch, but the ARITHMETIC does: the
+        # gated path accumulates K per-slot terms where the fast path does one matmul.
+        # Measured max|delta| 8.882e-16 in fp64 and 9.375e-2 in bf16 against max|out|
+        # 2.05e1 (relative ~4.6e-3). Never compare the two for bitwise equality.
+        m, gate = self._out()
+        h = torch.randn(4, 8, dtype=torch.bfloat16)
+        with gate.ungated():
+            fast = m(h).float()
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            gated = m(h).float()
+        assert (gated - fast).abs().max() <= 2e-2 * fast.abs().max()
+
+
+class TestSlotOutGradientAccumulation:
+    """Each micro-batch installs its own routing; the accumulated grad must respect all
+    of them. With gradient accumulation the global batch is split, so this is the shape
+    every real training step takes."""
+
+    RANKS = (3, 5)
+
+    def _out(self):
+        torch.manual_seed(13)
+        gate = SlotGate(num_slots=len(self.RANKS))
+        m = SlotOut(6, self.RANKS, gate, dtype=torch.float64)
+        with torch.no_grad():
+            m.weight.copy_(torch.randn_like(m.weight))
+        return m, gate
+
+    def test_two_micro_batches_land_in_their_own_column_blocks(self):
+        m, gate = self._out()
+        h1 = torch.randn(4, 8, dtype=torch.float64, requires_grad=True)
+        h2 = torch.randn(2, 8, dtype=torch.float64, requires_grad=True)
+
+        with gate.scoped(torch.tensor([0, 0, 0, 0])):
+            m(h1).sum().backward()
+        after_first = m.weight.grad.clone()
+        assert after_first[:, 0:3].abs().sum() > 0
+        assert torch.count_nonzero(after_first[:, 3:8]) == 0
+
+        with gate.scoped(torch.tensor([1, 1])):
+            m(h2).sum().backward()
+        # slot 0's accumulated gradient must be exactly what micro-batch 1 left there
+        assert torch.equal(m.weight.grad[:, 0:3], after_first[:, 0:3])
+        assert m.weight.grad[:, 3:8].abs().sum() > 0
+
+    def test_accumulation_adds_rather_than_replaces_within_one_slot(self):
+        m, gate = self._out()
+        h1 = torch.randn(2, 8, dtype=torch.float64)
+        h2 = torch.randn(2, 8, dtype=torch.float64)
+        with gate.scoped(torch.tensor([0, 0])):
+            m(h1).sum().backward()
+            first = m.weight.grad.clone()
+            m(h2).sum().backward()
+        both = m.weight.grad.clone()
+
+        m2, gate2 = self._out()
+        with gate2.scoped(torch.tensor([0, 0])):
+            m2(h2).sum().backward()
+        assert torch.allclose(both - first, m2.weight.grad, atol=1e-12)
+
+
+class TestDiagStaleness:
+    """``_diag`` must never read as fresh when no forward refreshed it.
+
+    Measured before the fix: arm, forward, record; then mutate the weight and re-arm
+    WITHOUT running a forward -- ``_diag`` still held the previous values and no reader
+    could tell. A module that is armed but never REACHED by a forward (a frozen layer,
+    a rollout-only step, a branch this batch did not take) would have last step's
+    numbers plotted as this step's, in plots whose entire job is to answer "is this slot
+    dead?".
+    """
+
+    def _proj(self):
+        torch.manual_seed(17)
+        return SlotProj(32, 8, 1.0, dtype=torch.float64)
+
+    def _out(self):
+        torch.manual_seed(19)
+        m = SlotOut(6, (3, 5), SlotGate(num_slots=2, strict=False), dtype=torch.float64)
+        with torch.no_grad():
+            m.weight.copy_(torch.randn_like(m.weight))
+        return m
+
+    def test_slot_proj_arm_diag_sets_the_flag(self):
+        p = self._proj()
+        p.arm_diag()
+        assert p._collect_diag is True
+
+    def test_slot_out_arm_diag_sets_the_flag(self):
+        m = self._out()
+        m.arm_diag()
+        assert m._collect_diag is True
+
+    def test_slot_proj_re_arming_without_a_forward_reads_absent_not_stale(self):
+        p = self._proj()
+        p.arm_diag()
+        p(torch.randn(4, 32, dtype=torch.float64))
+        assert p._diag is not None
+        with torch.no_grad():
+            p.weight.mul_(3.0)
+        p.arm_diag()
+        assert p._diag is None
+
+    def test_slot_out_re_arming_without_a_forward_reads_absent_not_stale(self):
+        m = self._out()
+        m.arm_diag()
+        with m.gate.ungated():
+            m(torch.randn(4, 8, dtype=torch.float64))
+        stale = m._diag["b_norms"].clone()
+        with torch.no_grad():
+            m.weight.mul_(3.0)
+        m.arm_diag()
+        assert m._diag is None
+        # and the next forward reports the CURRENT weight, not the recorded one
+        with m.gate.ungated():
+            m(torch.randn(4, 8, dtype=torch.float64))
+        assert torch.allclose(m._diag["b_norms"], 3.0 * stale, atol=1e-5)
+
+    def test_arm_diag_is_idempotent_before_a_forward(self):
+        m = self._out()
+        m.arm_diag()
+        m.arm_diag()
+        assert m._collect_diag is True and m._diag is None
+
+
+class TestCrossGramPairingContract:
+    """How a consumer turns the two recorded halves into a cross-slot interference.
+
+    ``<dW_s, dW_t>_F = scale**2 * sum( (B_t^T B_s) elementwise (A_t A_s^T) )``. The B
+    half comes from ``SlotOut._diag["cross"][(s, t)]`` and is (R_t, R_s); the A half is
+    ``SlotProj._diag["gram"][t_slice, s_slice]``, in THAT order. With EQUAL per-slot
+    ranks the transposed slicing has the same shape, so the wrong one produces a wrong
+    number instead of a shape error -- which is why these use (4, 4).
+    """
+
+    RANKS = (4, 4)
+    IN_FEATURES = 16
+    SCALE = 2.5
+
+    def _out_with_diag(self):
+        torch.manual_seed(23)
+        m = SlotOut(
+            6,
+            self.RANKS,
+            SlotGate(num_slots=len(self.RANKS), strict=False),
+            dtype=torch.float64,
+        )
+        with torch.no_grad():
+            m.weight.copy_(torch.randn_like(m.weight))
+        m.arm_diag()
+        with m.gate.ungated():
+            m(torch.randn(2, sum(self.RANKS), dtype=torch.float64))
+        return m
+
+    def test_the_documented_pairing_reproduces_the_frobenius_inner_product(self):
+        # A deliberately NON-orthogonal A: with a real orthonormal A-bar every slicing
+        # of the Gram is ~0, so an orthonormal basis cannot tell the right pairing from
+        # the wrong one.
+        m = self._out_with_diag()
+        torch.manual_seed(29)
+        a = torch.randn(sum(self.RANKS), self.IN_FEATURES, dtype=torch.float64)
+        gram = a @ a.transpose(-2, -1)
+        b = m.weight.detach()
+        s_slice, t_slice = slice(0, 4), slice(4, 8)
+
+        dw_s = self.SCALE * b[:, s_slice] @ a[s_slice]
+        dw_t = self.SCALE * b[:, t_slice] @ a[t_slice]
+        truth = (dw_s * dw_t).sum()
+
+        cross = m._diag["cross"][(0, 1)].double()
+        predicted = (cross * gram[t_slice, s_slice]).sum() * self.SCALE**2
+        assert torch.allclose(predicted, truth, rtol=1e-5)
+
+    def test_the_transposed_slicing_is_a_silent_wrong_answer(self):
+        # Same shape, different number: nothing but this test says which one is right.
+        m = self._out_with_diag()
+        torch.manual_seed(29)
+        a = torch.randn(sum(self.RANKS), self.IN_FEATURES, dtype=torch.float64)
+        gram = a @ a.transpose(-2, -1)
+        b = m.weight.detach()
+        s_slice, t_slice = slice(0, 4), slice(4, 8)
+        truth = (
+            (self.SCALE * b[:, s_slice] @ a[s_slice])
+            * (self.SCALE * b[:, t_slice] @ a[t_slice])
+        ).sum()
+
+        cross = m._diag["cross"][(0, 1)].double()
+        wrong = (cross * gram[s_slice, t_slice]).sum() * self.SCALE**2
+        assert wrong.shape == ()  # no shape error to save you
+        assert (wrong - truth).abs() > 1e-3 * truth.abs()
+
+    def test_end_to_end_the_orthonormal_basis_makes_the_cross_term_vanish(self):
+        # The real pipeline: gram from SlotProj, scale from SlotProj's own record, cross
+        # from SlotOut. A-bar is row-orthonormal, so the interference must be ~0 -- and
+        # the B half is far from zero, so the vanishing comes from the Gram.
+        m = self._out_with_diag()
+        torch.manual_seed(31)
+        p = SlotProj(self.IN_FEATURES, sum(self.RANKS), self.SCALE, dtype=torch.float64)
+        p.arm_diag()
+        p(torch.randn(2, self.IN_FEATURES, dtype=torch.float64))
+        gram, scale = p._diag["gram"].double(), p._diag["scale"]
+        assert scale == self.SCALE
+
+        a = p.orth_weight().detach()
+        b = m.weight.detach()
+        s_slice, t_slice = slice(0, 4), slice(4, 8)
+        dw_s = scale * b[:, s_slice] @ a[s_slice]
+        dw_t = scale * b[:, t_slice] @ a[t_slice]
+        truth = (dw_s * dw_t).sum()
+
+        cross = m._diag["cross"][(0, 1)].double()
+        predicted = (cross * gram[t_slice, s_slice]).sum() * scale**2
+
+        floor = 1e-4 * dw_s.norm() * dw_t.norm()
+        assert cross.abs().max() > 0.1  # the B half is NOT trivially zero
+        assert truth.abs() < floor
+        assert (predicted - truth).abs() < floor

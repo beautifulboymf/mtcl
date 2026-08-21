@@ -30,17 +30,24 @@ import torch.nn.functional as F
 from rlinf.models.slot_lora.orth import _pinned_precision, orthogonalize
 
 
-def _check_gate_ids(ids: Optional[torch.Tensor]) -> None:
+def _check_gate_ids(ids: Optional[torch.Tensor], num_slots: Optional[int]) -> None:
     """Validate a routing tensor against the contract in :class:`SlotGate`.
 
     Checked once per installation (i.e. once per micro-batch), never in the read
-    path, which runs 200-400 times per forward.
+    path, which runs 200-400 times per forward. The RANGE check reads ``ids`` on the
+    host, so on CUDA it costs one device-to-host sync -- once per micro-batch, against
+    the 200-400 syncs an equivalent check in :meth:`SlotOut.forward` would cost.
 
     Args:
         ids: The candidate routing, or ``None`` for ungated.
+        num_slots: How many slots the model has, or ``None`` when the gate was built
+            without one -- in which case a routing cannot be installed at all (see
+            :class:`SlotGate`).
 
     Raises:
-        ValueError: if ``ids`` is neither ``None`` nor a 1-D ``torch.long`` tensor.
+        ValueError: if ``ids`` is neither ``None`` nor a 1-D ``torch.long`` tensor, if
+            a routing is offered to a gate with no slot count, or if any id is outside
+            ``[-1, num_slots)``.
     """
     if ids is None:
         return
@@ -61,6 +68,32 @@ def _check_gate_ids(ids: Optional[torch.Tensor]) -> None:
         raise ValueError(
             f"slot gate ids must be 1-D, one entry per sample in the micro-batch; "
             f"got shape {tuple(ids.shape)}."
+        )
+    if num_slots is None:
+        raise ValueError(
+            "cannot install a slot routing on a gate built without num_slots. A gate "
+            "with no slot count cannot tell a valid slot id from a typo, and an "
+            "out-of-range id behaves EXACTLY like the deliberate -1: the sample "
+            "trains nothing, with no error, no NaN and a normal-looking loss curve. "
+            "Pass the model's slot count when you create the gate "
+            "(`SlotGate(num_slots=len(slot_ranks))`). A run that genuinely has no "
+            "routing does not need one -- it installs None or uses `gate.ungated()`."
+        )
+    # One host sync per micro-batch. `.any()` first so the happy path pays exactly one,
+    # and the (rare) failure path pays a second to name the offenders.
+    out_of_range = (ids < -1) | (ids >= num_slots)
+    if bool(out_of_range.any()):
+        positions = out_of_range.nonzero().flatten().tolist()
+        offenders = sorted({int(v) for v in ids[out_of_range].tolist()})
+        more = "" if len(positions) <= 8 else f" (+{len(positions) - 8} more)"
+        raise ValueError(
+            f"slot gate ids must be -1 (unrouted) or in [0, {num_slots}); got "
+            f"{offenders[:8]} at positions {positions[:8]}{more}. An out-of-range id "
+            "is NOT a no-op: it matches no slot, so the sample trains nothing at all "
+            "-- byte for byte what -1 means -- and a router off-by-one or a "
+            "task-id-to-slot map missing an entry would silently train nothing for a "
+            "whole suite. Fix the router, or widen num_slots if the model really has "
+            "that many slots."
         )
 
 
@@ -97,6 +130,23 @@ class SlotGate:
     SAME object to every gated module, so installing a routing is one attribute write
     rather than a walk over 200-400 modules.
 
+    THE SLOT COUNT. ``num_slots`` is how many slots the model has; it is what makes an
+    out-of-range id an ERROR instead of a silent no-op. Nothing downstream can catch
+    one: :meth:`SlotOut.forward` compares ``ids == k`` for each existing slot, so an id
+    of 7 in a 2-slot model matches nothing and the sample trains nothing -- byte for
+    byte the behaviour of the deliberate ``-1``. Measured before this check existed, a
+    2-slot model handed ``[0, 1, 7, 99]`` raised nothing and quietly trained on half its
+    batch. Strict mode catches "no routing installed"; only the count catches "WRONG
+    routing installed". It is validated in :meth:`scoped`, once per micro-batch, and
+    never in the read path: the check reads ``ids`` on the host, and doing that inside
+    the forward would force a device-to-host sync 200-400 times per step.
+
+    A gate built WITHOUT a count (``num_slots=None``) refuses to install a routing at
+    all. Skipping the check instead would be a silently reduced guarantee, which is the
+    failure this class exists to prevent; and the case that legitimately has no count --
+    a single-suite run with no routing -- never installs one, so it pays nothing. In
+    other words: if you route, you must say how many slots you route among.
+
     STRICT MODE. ``strict=True`` (the default) makes :meth:`current` RAISE when no
     routing is installed, instead of quietly returning ``None`` and running ungated.
     That is the whole point: an ungated forward in a run that meant to be gated is a
@@ -117,17 +167,46 @@ class SlotGate:
     routing. Under ``strict`` that raises; it is not silently ungated.
     """
 
-    __slots__ = ("_ids", "strict")
+    __slots__ = ("_ids", "num_slots", "strict")
 
-    def __init__(self, strict: bool = True) -> None:
+    def __init__(self, num_slots: Optional[int] = None, strict: bool = True) -> None:
         """Create the holder for one model.
 
         Args:
+            num_slots: How many slots the model has. Every installed routing is checked
+                against it, so passing it is what turns an out-of-range slot id into an
+                error rather than a sample that silently trains nothing. ``None`` means
+                "unknown", and a gate that does not know cannot install a routing at
+                all -- use it only for runs that never route.
             strict: When true, reading through :meth:`current` with no routing
                 installed raises instead of returning ``None``. Turn it off only for
                 runs that genuinely have no routing.
+
+        Raises:
+            ValueError: if ``num_slots`` is neither ``None`` nor a positive int.
         """
+        # bool is an int subclass, so `SlotGate(True)` -- which READS as the strict
+        # flag -- would otherwise bind to num_slots and quietly build a ONE-slot gate.
+        if isinstance(num_slots, bool):
+            raise ValueError(
+                "SlotGate num_slots must be an int or None; got a bool. "
+                "`SlotGate(True)` reads as the strict flag but binds to num_slots, "
+                "where True would become a one-slot gate. Pass `strict=` by keyword."
+            )
+        if num_slots is not None:
+            if not isinstance(num_slots, int):
+                raise ValueError(
+                    f"SlotGate num_slots must be an int or None; got "
+                    f"{type(num_slots).__name__} ({num_slots!r})."
+                )
+            if num_slots <= 0:
+                raise ValueError(
+                    f"SlotGate num_slots must be positive; got {num_slots}. A gate "
+                    "with no slots can own no sample, so every routing it accepted "
+                    "would be entirely unrouted."
+                )
         self._ids: Optional[torch.Tensor] = None
+        self.num_slots = num_slots
         self.strict = bool(strict)
 
     def current(self) -> Optional[torch.Tensor]:
@@ -186,10 +265,12 @@ class SlotGate:
             This gate, for convenience.
 
         Raises:
-            ValueError: if ``ids`` violates the contract (see :class:`SlotGate`). The
-                previously installed routing is left untouched in that case.
+            ValueError: if ``ids`` violates the contract (see :class:`SlotGate`) --
+                wrong type, dtype or rank, an id outside ``[-1, num_slots)``, or any
+                routing at all on a gate built without ``num_slots``. The previously
+                installed routing is left untouched in every one of those cases.
         """
-        _check_gate_ids(ids)
+        _check_gate_ids(ids, self.num_slots)
         previous = self._ids
         self._ids = ids
         try:
@@ -291,12 +372,34 @@ class SlotProj(nn.Module):
         self._collect_diag = False
         self._diag: Optional[dict] = None
 
+    def arm_diag(self) -> None:
+        """Ask the next :meth:`orth_weight` to record diagnostics; clear the old ones.
+
+        Clearing is the point, and it is why arming has a method instead of being a
+        bare ``_collect_diag = True``. ``_diag`` is only ever refreshed by a forward,
+        so a module that is armed but never REACHED by one -- a frozen layer, a
+        rollout-only step, a branch this batch did not take -- would keep LAST step's
+        numbers, and a reader has no way to tell a stale reading from a fresh one.
+        Measured before this existed: arm, forward, record, mutate the weight, re-arm
+        without a forward, and ``_diag`` still held the old values. These numbers are
+        plotted to answer "is this slot dead?", so a stale constant is the exact
+        failure they must not produce. After this call, ``_diag is None`` means "not
+        collected", full stop.
+        """
+        self._collect_diag = True
+        self._diag = None
+
     def orth_weight(self) -> torch.Tensor:
         """Ā = (Z Zᵀ)^(-1/2) Z, differentiable w.r.t. Z, in the parameter's dtype.
 
+        When armed (see :meth:`arm_diag`) this also refreshes ``self._diag`` with
+        ``{"gram": Ā Āᵀ as (R, R) fp32, "scale": float}`` and disarms itself. ``gram``
+        is the WHOLE ``(R, R)`` matrix -- this module does not know ``slot_ranks``, so
+        the consumer carves out the block it wants; see :meth:`SlotOut._stash_diag`
+        for the exact slicing and the ``scale**2`` factor that pair it with the B side.
+
         Returns:
-            The row-orthonormal ``(R, d_in)`` matrix. Also refreshes ``self._diag``
-            and disarms ``self._collect_diag`` when armed.
+            The row-orthonormal ``(R, d_in)`` matrix.
         """
         a = orthogonalize(self.weight, eps=self.eps)
         if self._collect_diag:
@@ -437,17 +540,35 @@ class SlotOut(nn.Module):
 
     So the gate is applied one level up, to the whole per-slot CONTRIBUTION
     ``c_k = B_k h_k``. ``torch.where(owns, c_k, c_k.detach())`` selects between two
-    tensors holding the SAME BITS, so the forward value is bit-identical to the ungated
-    sum ``Σ_k c_k``; only the graph differs, and a sample that does not own slot k
-    reaches ``c_k`` through the detached branch, which has no backward edge at all.
-    That is what makes the isolation exact rather than approximate: the owner's
-    gradient is untouched (not merely larger than the others'), and non-owners
-    contribute a structural zero (not a numerical one).
+    tensors holding the SAME BITS, so it is a no-op on the value and a cut on the
+    graph: the owner's gradient is untouched -- not merely larger than the others' --
+    and a sample that does not own slot k sends it nothing.
+
+    WHAT THE ``where`` DOES NOT DO is remove the backward edge. It saves only its
+    CONDITION, the edge to ``c_k`` survives, and every slot's backward matmul still runs
+    over the whole micro-batch; what happens is that grad_output is SELECTED to zero at
+    non-owner positions. So a non-owner's contribution is an exact NUMERICAL zero, not a
+    structural one, and the gating saves no compute (measured: after an all-``-1``
+    backward, ``weight.grad`` is an allocated all-zero tensor, not ``None``).
+
+    BOTH CONSEQUENCES OF THAT SURVIVING EDGE ARE LOAD-BEARING. (a) ``weight.grad`` is
+    ALWAYS allocated, so FSDP's post-backward hook always fires: a micro-batch that
+    happens to contain no samples for some slot cannot desync the ranks. Measured with
+    rank0 routed entirely to ``-1`` and rank1 routed normally, the backward completed
+    with no desync and no hang; a structurally cut edge would have fired the hook on one
+    rank and not the other. (b) Because the backward is a select rather than a multiply,
+    a NaN sitting in grad_output at a non-owner position cannot leak into that slot
+    (measured: injected NaN, slot 1's gradient stayed exactly zero and NaN-free).
 
     THE FORWARD VALUE IS ALWAYS THE FULL SUM OVER SLOTS. The acting policy is the fully
     merged model: there is no inference-time routing, no per-slot forward, and so no
-    train/inference mismatch to reason about. The gate exists only to decide which
-    slot's B is allowed to LEARN from a given sample.
+    train/inference mismatch in the ROUTING to reason about. The gate exists only to
+    decide which slot's B is allowed to LEARN from a given sample. The two code paths
+    are not bit-identical, though: the gated path accumulates K per-slot terms where the
+    ungated one does a single matmul, so they differ by floating-point summation order.
+    Measured max|Δ| 8.882e-16 in fp64 and 9.375e-2 in bf16 against max|out| 2.05e1
+    (relative ~4.6e-3, the bf16 rounding floor). Do not compare the two outputs for
+    bitwise equality.
 
     Zero-initialized, so ``ΔW = 0`` at init and the student starts numerically identical
     to its base model.
@@ -474,7 +595,8 @@ class SlotOut(nn.Module):
             device: Parameter device; ``None`` uses the torch default.
 
         Raises:
-            ValueError: if ``slot_ranks`` is empty or contains a non-positive rank.
+            ValueError: if ``slot_ranks`` is empty, contains a non-positive rank, or
+                has a different number of slots than ``gate.num_slots``.
         """
         super().__init__()
         self.out_features = int(out_features)
@@ -495,6 +617,20 @@ class SlotOut(nn.Module):
                 f"{ranks}. A zero- or negative-rank slot owns no columns of B, so "
                 "the samples routed to it would train nothing while still looking "
                 "routed."
+            )
+        # The gate's range check is only as good as its slot count, so the count has to
+        # AGREE with the module that consumes it. A gate saying 4 against a 3-slot B
+        # would happily install an id of 3, which then matches no slot and trains the
+        # sample nothing -- the exact silent failure num_slots exists to close, walking
+        # back in through a different door. Build time, host side, once per module.
+        if gate.num_slots is not None and gate.num_slots != len(ranks):
+            raise ValueError(
+                f"SlotOut was built with {len(ranks)} slots {ranks} but its gate was "
+                f"built with num_slots={gate.num_slots}. The gate validates every "
+                "routing against ITS count, so a disagreement means ids the gate "
+                "accepts can match no slot here (training that sample nothing, "
+                "silently) or slots here can never be routed to at all. One of the "
+                "two is a config error; this is not reconciled here."
             )
         self.slot_ranks = ranks
         offsets, acc = [], 0
@@ -520,18 +656,17 @@ class SlotOut(nn.Module):
         self._collect_diag = False
         self._diag: Optional[dict] = None
 
-    def slot_block(self, k: int) -> torch.Tensor:
-        """The ``(d_out, R_k)`` column block of B belonging to slot ``k``.
+    def arm_diag(self) -> None:
+        """Ask the next :meth:`forward` to record diagnostics; clear the old ones.
 
-        Args:
-            k: Slot index.
-
-        Returns:
-            A VIEW into ``self.weight`` -- no copy, and writes through it are writes
-            to the parameter.
+        Same contract, and the same reason, as :meth:`SlotProj.arm_diag`: ``_diag`` is
+        only refreshed by a forward, so an armed module the forward never reaches would
+        otherwise keep last step's numbers with nothing to mark them stale -- in plots
+        whose entire job is to answer "is this slot dead?". After this call,
+        ``_diag is None`` means "not collected", full stop.
         """
-        start = self.offsets[k]
-        return self.weight[:, start : start + self.slot_ranks[k]]
+        self._collect_diag = True
+        self._diag = None
 
     def _stash_diag(self) -> None:
         """Record the B-side halves of the cross-slot interference measure.
@@ -542,6 +677,23 @@ class SlotOut(nn.Module):
         contributes. ``ΔW`` itself is ``d_out x d_in`` and is NEVER materialized:
         forming it to measure it would cost more memory than the adapter saves, per
         module, per step.
+
+        HOW A CONSUMER COMBINES THE TWO HALVES -- with the ``scale``, which neither half
+        carries, since :meth:`SlotProj.forward` folds it into Ā::
+
+            g = proj._diag["gram"]  # (R, R), the WHOLE matrix
+            t_slice = slice(out.offsets[t], out.offsets[t] + out.slot_ranks[t])
+            s_slice = slice(out.offsets[s], out.offsets[s] + out.slot_ranks[s])
+            interference = (out._diag["cross"][(s, t)] * g[t_slice, s_slice]).sum()
+            interference *= proj._diag["scale"] ** 2  # == ⟨ΔW_s, ΔW_t⟩_F
+
+        Two things there are easy to get wrong and neither fails loudly. The Gram must
+        be sliced ``[t_slice, s_slice]``, NOT ``[s_slice, t_slice]``: with equal
+        per-slot ranks both slicings have the SAME SHAPE, so the wrong one yields a
+        wrong number instead of a shape error. And the ``scale**2`` is not optional --
+        it is the only place the LoRA scaling enters, and dropping it rescales every
+        reported interference by a constant. :class:`SlotProj` does not know
+        ``slot_ranks``, which is why the consumer does the slicing.
 
         Computed under ``no_grad`` and under the same ``_pinned_precision`` guard
         :meth:`SlotProj.orth_weight` uses. The guard is not optional: autocast
@@ -570,12 +722,30 @@ class SlotOut(nn.Module):
 
         Args:
             h: The projected coordinates ``s·Āx`` from :class:`SlotProj`, of shape
-                ``(B, ..., R)``. ``B`` is the micro-batch and must match the routing.
+                ``(B, ..., R)``. The last dim must be exactly ``total_rank`` and ``B``
+                is the micro-batch, which must match the routing.
 
         Returns:
             ``Σ_k B_k h_k`` of shape ``(B, ..., d_out)`` -- the full sum over slots
             whatever the routing says, since the acting policy is the merged model.
+
+        Raises:
+            ValueError: if ``h`` is not ``total_rank`` wide, or if the installed
+                routing does not have one entry per sample of ``h``. Both are host-side
+                shape comparisons: no device sync, no measurable cost.
         """
+        # Shared by BOTH paths on purpose. The gated path slices h[..., start:stop] per
+        # slot, so it always reads the FIRST total_rank columns: an over-wide h ran fine
+        # and silently DROPPED the surplus, while the ungated matmul raised. A SlotProj
+        # whose total_rank disagrees with sum(slot_ranks) would then train to completion
+        # and only blow up at eval, with the checkpoint's ΔW already wrong.
+        if h.shape[-1] != self.total_rank:
+            raise ValueError(
+                f"SlotOut was handed h of width {h.shape[-1]} but its slots span "
+                f"{self.total_rank} columns {self.slot_ranks}. h comes from SlotProj, "
+                "so this means SlotProj.total_rank and sum(SlotOut.slot_ranks) "
+                "disagree -- a build-time config error."
+            )
         ids = self.gate.current()
         if self._collect_diag:
             self._stash_diag()
@@ -583,12 +753,18 @@ class SlotOut(nn.Module):
             # Ungated (eval, rollout, or a single-slot run): one matmul, no masks,
             # no graph surgery -- and bit-identical to the merged adapter.
             return F.linear(h, self.weight)
-        assert ids.shape[0] == h.shape[0], (
-            f"slot routing has {ids.shape[0]} entries but this forward was handed "
-            f"{h.shape[0]} samples. The gate must be built from THIS micro-batch and "
-            "installed before the student forward: with gradient accumulation the "
-            "global batch is split, and each micro-batch needs its own routing."
-        )
+        # A raise, not an assert: `python -O` / PYTHONOPTIMIZE=1 STRIPS asserts, and
+        # measured with them stripped, a length-1 routing against a batch of 4 assigned
+        # all four samples to slot 0 while a length-4 routing against a batch of 1
+        # broadcast the output from (1, d_out) to (4, d_out). A host-side shape compare
+        # costs the same either way.
+        if ids.shape[0] != h.shape[0]:
+            raise ValueError(
+                f"slot routing has {ids.shape[0]} entries but this forward was handed "
+                f"{h.shape[0]} samples. The gate must be built from THIS micro-batch "
+                "and installed before the student forward: with gradient accumulation "
+                "the global batch is split, and each micro-batch needs its own routing."
+            )
         # (B,) -> (B, 1, ..., 1) so it broadcasts against (B, ..., d_out) for any
         # number of intervening dims (a sequence axis, in practice).
         owns_shape = (-1,) + (1,) * (h.dim() - 1)
@@ -597,10 +773,12 @@ class SlotOut(nn.Module):
             stop = start + rank
             contribution = F.linear(h[..., start:stop], self.weight[:, start:stop])
             owns = (ids == k).view(owns_shape)
-            # Both branches hold the same bits, so this is a no-op on the VALUE and
-            # a cut on the graph: non-owners reach the contribution through the
-            # detached branch and no gradient flows back to B_k or to h_k for them.
-            # See the class docstring for why masking h instead does not work.
+            # Both branches hold the same bits, so this is a no-op on the VALUE. It
+            # does not CUT the edge -- torch.where saves only its condition -- it
+            # selects grad_output to zero at non-owner positions, so B_k and h_k
+            # receive an exact numerical zero from those samples. See the class
+            # docstring for why masking h instead does not work, and for why the
+            # surviving edge is what keeps FSDP's post-backward hook firing.
             contribution = torch.where(owns, contribution, contribution.detach())
             out = contribution if out is None else out + contribution
         return out
