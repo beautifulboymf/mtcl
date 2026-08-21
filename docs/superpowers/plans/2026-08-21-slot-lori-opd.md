@@ -23,6 +23,30 @@ cd /home/fanruochen/CL/RLinf
 
 ---
 
+## ✅ 实施完成状态（2026-08-21 夜）
+
+Task 1-13 全部完成，**485 个 CPU 测试全绿**，`0902b2d2..HEAD` 共 36 个 commit，工作树干净，未 push。
+**R1 尚未启动** —— 当晚 8 张卡全被其他租户占用，预检会正确拒绝。
+
+最终端到端审查（跨任务接缝）抓到 3 个阻塞项，均已修复：
+
+1. **路由前缀吞并（最重要）**：`libero_goal` 的 `"turn on the stove"` 是 `libero_10` 任务 122
+   `"turn on the stove and put the moka pot on it"` 的真前缀，子串首次匹配即停 → long suite 10 个任务
+   里有 1 个被 goal 专家打分、梯度写进 goal slot（约每 micro-batch 的 2.5%）。**所有守卫都读得干净**：
+   `route_fallback_frac` 只数 `suite is None`，而它是匹配上了、只是匹配错了。修法：最长键优先 +
+   同长度冲突时 raise。**这条同样污染 mt4/mt4w2**，它们的 `long` 数字是在 9/10 个任务上量的。
+2. **注入模块数 437 vs PEFT 的 439**：vision backbone 两个 `Conv2d` patch-embed 名字匹配但类型被拒，
+   在 R1 里是冻结的、在 mt4 里是可训的。改为大声记录（不 raise —— raise 会让这条路径在 OpenVLA-OFT
+   上完全不可用），两处声称"完全一致"的 docstring 已更正。
+3. **磁盘下限 120G → 175G**：runner 从不删周期性 checkpoint，15 步 / save_interval 5 会同时留
+   3 个 `global_step_*` + `best`；mt4 实测每个 32G，R=256 约 36G → 峰值 144G，加转换后 15G = 159G。
+   另加一个尽力而为的后台清理（`KEEP_CKPTS`，默认 2），但下限**不**假设它跑过。
+
+另补 `actor.model.slot_lora.orth_iters`（默认 12），让设计文档里"orth_err 进入 1e-3~5e-2 就把 iters
+提到 16"这条处置真正可达 —— 此前它只是文档，没有配置路径。
+
+---
+
 ## ⚠️ 实施中发现的硬阻塞与决定（Task 9/12/13）
 
 **teacher 会继承 slot 配置，必须显式清掉。** teacher 的 config 是 `deepcopy(cfg.actor.model)`，于是每个 teacher 都带着 `slot_lora.enabled=true`；teacher 是 `base::adapter` 形式（`is_lora=True` + `lora_path`），而 slot 路径明确拒绝 `lora_path` —— 四个 teacher 会全部在加载时死掉，R1 根本起不来。修法：`_load_teacher_model._load_one` 里设 `tcfg.slot_lora = None`（teacher 永远不是 slot 学生）。dual-KL anchor 走 `is_lora=False`，不受影响。
