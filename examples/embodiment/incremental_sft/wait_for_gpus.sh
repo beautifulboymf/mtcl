@@ -26,8 +26,15 @@
 # Note GPU 4-7 are frequently one four-GPU job, so when it ends GPU4 usually becomes the least
 # loaded card in PICK_FROM and gets chosen without anyone having to intervene.
 #
-# The command is exec'd with GPUS=<csv> exported. Everything else about it is the command's own
-# business -- this script does not know or care whether it is a smoke test or the real run.
+# The command is run with GPUS=<csv> in its environment. Everything else about it is the
+# command's own business -- this script does not know or care whether it is a smoke test or
+# the real run.
+#
+# TESTING. Every input to a decision comes from a command or a path named by a variable:
+# NVIDIA_SMI (the sampler), DISK_PATH and CGROUP_MEM_STAT (the launch gates). All three
+# default to the real thing, so production behaviour is unchanged and a human still runs
+# this with no arguments; tests/unit_tests/test_wait_for_gpus.py points them at fakes so the
+# idle test and the card selection can be exercised on a box where every card is busy.
 set -uo pipefail
 
 NEED_ALL="${NEED_ALL-5,6,7}"   # no colon: an explicit empty string means "nothing is mandatory"
@@ -37,16 +44,26 @@ MEM_MAX_MIB="${MEM_MAX_MIB:-5000}"
 UTIL_MAX_PCT="${UTIL_MAX_PCT:-20}"
 UTIL_N="${UTIL_N:-5}"
 UTIL_OK_N="${UTIL_OK_N:-4}"
+UTIL_SLEEP_S="${UTIL_SLEEP_S:-1}"          # gap between utilization samples
 MEM_BUCKET_MIB="${MEM_BUCKET_MIB:-4096}"   # candidates within one bucket are ranked by utilization
 POLL_S="${POLL_S:-120}"
 MAX_WAIT_H="${MAX_WAIT_H:-12}"
 NEED_GB="${NEED_GB:-175}"
 ANON_MAX_G="${ANON_MAX_G:-200}"
 RETRY_IF_FAST_S="${RETRY_IF_FAST_S:-180}"  # a target that dies faster than this never started real work
+DISK_PATH="${DISK_PATH:-/share/fanruochen-local}"
+CGROUP_MEM_STAT="${CGROUP_MEM_STAT:-/sys/fs/cgroup/memory.stat}"
 LOG="${WAIT_LOG:-/share/fanruochen-local/outputs/wait_for_gpus.log}"
 LOCK="${WAIT_LOCK:-/tmp/wait_for_gpus.lock}"
 
+# The ONLY thing in here that touches the cards, so it is the only seam a test needs. Must
+# be a single executable that answers `-i <n> --query-gpu=<field> --format=csv,noheader,nounits`.
+NVIDIA_SMI="${NVIDIA_SMI:-nvidia-smi}"
+
 (( $# >= 1 )) || { echo "usage: wait_for_gpus.sh <command> [args...]"; exit 2; }
+if [ -z "${NEED_ALL//,/}" ] && (( PICK_N <= 0 )); then
+  echo "nothing to select: NEED_ALL is empty and PICK_N=$PICK_N -- there is no such thing as a window"; exit 2
+fi
 
 # Single instance. Two waiters would both fire into the same window and fight over the same cards.
 exec 9>"$LOCK" || { echo "cannot open lock $LOCK"; exit 1; }
@@ -57,13 +74,16 @@ say() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG"; }
 # Returns 0 if the card is idle by both measures. Echoes "mem util_mean n_busy" on stdout.
 probe_gpu() {
   local g="$1" mem util busy=0 sum=0 i
-  mem=$(nvidia-smi -i "$g" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null) || return 2
+  mem=$("$NVIDIA_SMI" -i "$g" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null) || return 2
+  # A card that answers "[N/A]" (MIG, vGPU, a driver hiccup) is not a card we understand,
+  # and an unparsable reading must never be arithmetic-error its way into looking free.
+  [[ "$mem" =~ ^[0-9]+$ ]] || return 2
   for (( i = 0; i < UTIL_N; i++ )); do
-    util=$(nvidia-smi -i "$g" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null)
-    util=${util:-100}
+    util=$("$NVIDIA_SMI" -i "$g" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null)
+    [[ "$util" =~ ^[0-9]+$ ]] || util=100   # unreadable == busy, never == free
     sum=$(( sum + util ))
     (( util < UTIL_MAX_PCT )) || busy=$(( busy + 1 ))
-    sleep 1
+    sleep "$UTIL_SLEEP_S"
   done
   echo "$mem $(( sum / UTIL_N )) $busy"
   (( mem < MEM_MAX_MIB )) || return 1
@@ -94,7 +114,7 @@ while :; do
     (( rc == 0 )) || all_ok=0
   done
 
-  chosen=""
+  chosen=""; ready=0
   if (( all_ok == 1 )); then
     # Rank the candidates by memory, then by mean utilization, and keep only the idle ones.
     cands=""
@@ -111,22 +131,28 @@ while :; do
     done
     n_ok=$(printf '%s' "$cands" | grep -c . || true)
     if (( n_ok >= PICK_N )); then
-      chosen=$(printf '%s' "$cands" | sort -k1,1n -k2,2n | head -n "$PICK_N" | awk '{print $4}' | paste -sd, -)
+      # The window is open because the CARDS say so. Do not infer it from `chosen` being
+      # non-empty: PICK_N=0 is the legitimate way to ask for exactly the NEED_ALL cards
+      # (the 2-GPU smoke test is NEED_ALL=0,1 PICK_N=0), and that selects nothing to pick.
+      ready=1
+      if (( PICK_N > 0 )); then
+        chosen=$(printf '%s' "$cands" | sort -k1,1n -k2,2n | head -n "$PICK_N" | awk '{print $4}' | paste -sd, -)
+      fi
     fi
   fi
 
-  if [ -n "$chosen" ]; then
+  if (( ready == 1 )); then
     GPUS_SEL=$(printf '%s\n%s\n' "${NEED_ALL//,/$'\n'}" "${chosen//,/$'\n'}" | grep -E '^[0-9]+$' | sort -n | uniq | paste -sd, -)
     say "WINDOW OPEN round=$ROUND -> GPUS=$GPUS_SEL   [$status]"
 
     # Re-check the red lines HERE, not at the top. The wait may have been hours; the volume and
     # the container's memory are shared and move underneath us.
-    free=$(df -BG --output=avail /share/fanruochen-local 2>/dev/null | tail -1 | tr -dc '0-9')
+    free=$(df -BG --output=avail "$DISK_PATH" 2>/dev/null | tail -1 | tr -dc '0-9')
     if (( ${free:-0} < NEED_GB )); then
-      say "HOLDING: only ${free}G free on /share/fanruochen-local, need >=${NEED_GB}G. Free space; still waiting."
+      say "HOLDING: only ${free}G free on $DISK_PATH, need >=${NEED_GB}G. Free space; still waiting."
       sleep "$POLL_S"; continue
     fi
-    anon=$(awk '/^anon /{a=$2} /^slab /{s=$2} /^kernel_stack /{k=$2} END{printf "%.0f",(a+s+k)/1073741824}' /sys/fs/cgroup/memory.stat 2>/dev/null)
+    anon=$(awk '/^anon /{a=$2} /^slab /{s=$2} /^kernel_stack /{k=$2} END{printf "%.0f",(a+s+k)/1073741824}' "$CGROUP_MEM_STAT" 2>/dev/null)
     if (( ${anon:-999} >= ANON_MAX_G )); then
       say "HOLDING: cgroup anon already ${anon}G (limit ${ANON_MAX_G}G). Still waiting."
       sleep "$POLL_S"; continue
