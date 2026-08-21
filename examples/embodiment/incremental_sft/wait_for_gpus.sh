@@ -45,6 +45,13 @@ PICK_N="${PICK_N:-1}"
 # only a human can make, so it must be typed on the command line, and every reading is logged.
 # Never put a card here to work around a failing idle test.
 FORCE_GPUS="${FORCE_GPUS-}"
+# EXTRA_N: after PICK_N genuinely idle cards are found, top the selection up with this many MORE
+# cards chosen as the least-occupied of whatever is left -- WITHOUT requiring them to be idle.
+# The case it serves: a job needs four cards but only three are ever free at once, and a fourth
+# carrying a small long-lived tenant is a better trade than not running. Ranked the same way as
+# the idle candidates (memory bucket first, then utilization), and every pick is logged with its
+# actual readings so a bad trade is visible rather than silent.
+EXTRA_N="${EXTRA_N:-0}"
 MEM_MAX_MIB="${MEM_MAX_MIB:-5000}"
 UTIL_MAX_PCT="${UTIL_MAX_PCT:-20}"
 UTIL_N="${UTIL_N:-5}"
@@ -146,8 +153,30 @@ while :; do
     fi
   fi
 
+  extra=""
+  if (( ready == 1 && EXTRA_N > 0 )); then
+    pool=""
+    for g in ${PICK_FROM//,/ }; do
+      case ",$NEED_ALL,${chosen:+$chosen,}" in *",$g,"*) continue ;; esac
+      out=$(probe_gpu "$g")
+      read -r mem umean busy <<< "$out"
+      pool+="$(( mem / MEM_BUCKET_MIB )) $umean $mem $g"$'\n'
+    done
+    n_pool=$(printf '%s' "$pool" | grep -c . || true)
+    if (( n_pool >= EXTRA_N )); then
+      extra=$(printf '%s' "$pool" | sort -k1,1n -k2,2n | head -n "$EXTRA_N" | awk '{print $4}' | paste -sd, -)
+      for g in ${extra//,/ }; do
+        read -r em eu _ <<< "$(probe_gpu "$g")"
+        say "TOP-UP GPU$g taken as least-occupied, NOT idle-tested: ${em}MiB / ${eu}%"
+      done
+    else
+      say "round=$ROUND idle cards found but only $n_pool card(s) left to top up with, need $EXTRA_N"
+      ready=0
+    fi
+  fi
+
   if (( ready == 1 )); then
-    GPUS_SEL=$(printf '%s\n%s\n%s\n' "${NEED_ALL//,/$'\n'}" "${chosen//,/$'\n'}" "${FORCE_GPUS//,/$'\n'}" | grep -E '^[0-9]+$' | sort -n | uniq | paste -sd, -)
+    GPUS_SEL=$(printf '%s\n%s\n%s\n%s\n' "${NEED_ALL//,/$'\n'}" "${chosen//,/$'\n'}" "${FORCE_GPUS//,/$'\n'}" "${extra//,/$'\n'}" | grep -E '^[0-9]+$' | sort -n | uniq | paste -sd, -)
     for g in ${FORCE_GPUS//,/ }; do
       read -r fm fu _ <<< "$(probe_gpu "$g")"
       say "FORCED GPU$g taken with no idle test: ${fm}MiB / ${fu}% -- operator's explicit choice"
