@@ -40,6 +40,11 @@ set -uo pipefail
 NEED_ALL="${NEED_ALL-5,6,7}"   # no colon: an explicit empty string means "nothing is mandatory"
 PICK_FROM="${PICK_FROM:-0,1,2,3,4}"
 PICK_N="${PICK_N:-1}"
+# FORCE_GPUS: cards taken UNCONDITIONALLY, with no idle test. For the case where a card carries a
+# known, small, long-lived tenant process the operator has decided to co-run with -- a judgement
+# only a human can make, so it must be typed on the command line, and every reading is logged.
+# Never put a card here to work around a failing idle test.
+FORCE_GPUS="${FORCE_GPUS-}"
 MEM_MAX_MIB="${MEM_MAX_MIB:-5000}"
 UTIL_MAX_PCT="${UTIL_MAX_PCT:-20}"
 UTIL_N="${UTIL_N:-5}"
@@ -142,7 +147,11 @@ while :; do
   fi
 
   if (( ready == 1 )); then
-    GPUS_SEL=$(printf '%s\n%s\n' "${NEED_ALL//,/$'\n'}" "${chosen//,/$'\n'}" | grep -E '^[0-9]+$' | sort -n | uniq | paste -sd, -)
+    GPUS_SEL=$(printf '%s\n%s\n%s\n' "${NEED_ALL//,/$'\n'}" "${chosen//,/$'\n'}" "${FORCE_GPUS//,/$'\n'}" | grep -E '^[0-9]+$' | sort -n | uniq | paste -sd, -)
+    for g in ${FORCE_GPUS//,/ }; do
+      read -r fm fu _ <<< "$(probe_gpu "$g")"
+      say "FORCED GPU$g taken with no idle test: ${fm}MiB / ${fu}% -- operator's explicit choice"
+    done
     say "WINDOW OPEN round=$ROUND -> GPUS=$GPUS_SEL   [$status]"
 
     # Re-check the red lines HERE, not at the top. The wait may have been hours; the volume and
