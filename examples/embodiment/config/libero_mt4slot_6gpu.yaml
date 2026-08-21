@@ -255,6 +255,17 @@ actor:
       a_scale_mode: match_mt4
       a_scale_ref_rank: 128
       orth_eps: 1.0e-6
+      # Alternate which factor trains, by OPTIMIZER UPDATE (3 per step here), cycling "BBA".
+      # With B fixed, dW is linear in A and vice versa, so each subproblem is better
+      # conditioned than chasing both at once. Orthogonality does NOT depend on this -- it
+      # comes from the Z parameterization and holds either way.
+      # The last update of every step is forced to B so each saved checkpoint's B matches
+      # its own A. That override deliberately does NOT consume the cycle position: with 3
+      # updates per step and a 3-character schedule, consuming it would lock A onto the
+      # forced update every step, so A would never train at all while slot/phase_is_A read
+      # a plausible-looking 0.0.
+      # null = train both factors jointly (the R2 ablation).
+      alt_schedule: "BBA"
     # -----------------------------------------------------------------------------------------
 
     unnorm_key: libero_130_no_noops_trajall   # student's native (130) norm
