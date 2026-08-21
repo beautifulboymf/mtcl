@@ -108,7 +108,7 @@ out = Σ_k [ c_k                if 该样本属于 suite k
 **为什么必须逐 slot 算贡献再 detach，而不是在 h 上乘门**（这条论证 2026-08-21 被变异测试纠正过一次，记下正确版本）：在 h 上乘 mask 的**梯度路由其实是对的** —— ∂L/∂B_j = Σ_i grad_out_i ⊗ (mask_i⊙h_i)_j，非归属块为 0。错的是**前向值**：out_i 只剩 owner slot 的贡献，模型不再是四个 slot 合并后的整体，训练和推理对不上，「全 slot 永远激活」这个前提直接没了。实测变异（把实现换成 mask h）只有「前向值等于全 slot 和」那一条测试失败，**所有梯度测试都通过** —— 所以那条测试是这一整类错误实现的唯一防线，不可删。
 `torch.where(owns, c, c.detach())` 同时满足两边：前向 `c` 与 `c.detach()` 数值相同所以输出仍是完整和，反向只走 owner。
 
-**门控的开销（已实测，暂不优化）**：逐 slot 循环比单次 `F.linear` 多约 390 ms/micro-batch（B=8/T=512/R=256/K=4/d_out=4096，按 300 个模块折算：480 ms vs 92 ms），一个 training step（72 个 micro-batch）约 28 s，开 gradient checkpointing 前向重跑后翻倍。相对 mt4 约 14 分钟/步是 3-6%，先不动。若 profiling 显示这块吃掉了步时间，有一个现成的等价替换：`out = full + (m - m.detach())`，其中 `full = F.linear(h, W)`（no_grad）、`m = F.linear(h * mask, W)`，前向 bit-exact、fp64 下梯度与循环版 max|diff| = 0.0，kernel 数从约 40 降到约 4（实测 210 ms vs 480 ms）。显存不构成理由：`torch.where` 版与零拷贝 autograd.Function 实测峰值完全相同（116.3 MiB），因为 `where` 的 backward 只 save condition，中间张量在重绑定时立即释放。
+**门控的开销（已实测，暂不优化）**：逐 slot 循环比单次 `F.linear` 多约 390 ms/micro-batch（B=8/T=512/R=256/K=4/d_out=4096，按 300 个模块折算：480 ms vs 92 ms），一个 training step（72 个 micro-batch）约 28 s，开 gradient checkpointing 前向重跑后翻倍。相对 mt4 约 14 分钟/步是 3-6%，先不动。若 profiling 显示这块吃掉了步时间，有一个现成的等价替换：`out = full.detach() + (m - m.detach())`，其中 `full = F.linear(h, W)`、`m = F.linear(h * mask, W)`。**`full` 必须 detach**——写成 `full + (m - m.detach())` 且 full 带图的话梯度完全错（实测对 B 差 98.34、对 h 差 72.35）。梯度与循环版 max|diff| = 0.0；前向**不是** bit-exact（fp64 下 8.88e-16，K 项累加 vs 单次 matmul 的浮点次序差），kernel 数从约 40 降到约 4（实测 210 ms vs 480 ms）。显存不构成理由：`torch.where` 版与零拷贝 autograd.Function 实测峰值完全相同（116.3 MiB），因为 `where` 的 backward 只 save condition，中间张量在重绑定时立即释放。
 
 ### 3.1 FSDP 约束
 

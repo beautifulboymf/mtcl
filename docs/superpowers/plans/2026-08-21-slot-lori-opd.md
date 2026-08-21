@@ -1057,10 +1057,20 @@ def collect_slot_diag(model: nn.Module) -> dict:
     for k, norm in enumerate(norms):
         metrics[f"slot/dw_norm_{k}"] = (proj._diag["scale"] * norm).item()
     for (s, t), p_ts in out._diag["cross"].items():
+        # SLICE ORDER MATTERS AND IS EASY TO GET WRONG. cross[(s,t)] = B_tᵀB_s has shape
+        # (r_t, r_s), so it pairs with gram[t_slice, s_slice] -- NOT [s_slice, t_slice].
+        # With unequal per-slot ranks the wrong order raises a shape error; with EQUAL
+        # ranks (a perfectly plausible future config) both slicings have the same shape
+        # and the wrong one silently computes tr(B_sᵀB_t Ā_sĀ_tᵀ), a different quantity.
+        # Verified numerically against a deliberately non-orthogonal A: a true orthonormal
+        # Ā makes both slicings ~0 and cannot tell them apart.
         q_st = gram[
-            offsets[s] : offsets[s] + ranks[s], offsets[t] : offsets[t] + ranks[t]
+            offsets[t] : offsets[t] + ranks[t], offsets[s] : offsets[s] + ranks[s]
         ]
         inner = torch.einsum("ij,ji->", p_ts.to(q_st.dtype), q_st)
+        # ⟨ΔW_s, ΔW_t⟩_F = scale² · Σ(B_tᵀB_s ⊙ Ā_tĀ_sᵀ) and ‖ΔW_k‖_F = scale · ‖B_k‖_F,
+        # so scale² cancels in the cosine and must NOT be applied here. It does NOT cancel
+        # in dw_norm_k above, which is why that one carries an explicit factor.
         denom = (norms[s] * norms[t]).clamp_min(1e-12)
         metrics[f"slot/cos_{s}_{t}"] = (inner / denom).item()
     proj._diag = None
