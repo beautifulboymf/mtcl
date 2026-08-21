@@ -255,6 +255,21 @@ actor:
       a_scale_mode: match_mt4
       a_scale_ref_rank: 128
       orth_eps: 1.0e-6
+      # Newton-Schulz iterations for Ā = (Z Zᵀ)^(-1/2) Z. THE ESCALATION KNOB, and the only
+      # one: if slot/orth_err leaves the healthy band (< 1e-3) and enters 1e-3 ~ 5e-2, raise
+      # this to 16 and change NOTHING else, then check Z's condition number. Measured here at
+      # cond(Z)=20, R=256, d_in=1024, fp32: iters 11 -> 6.8e-2, 12 -> 1.07e-3, 13 -> 1.62e-4,
+      # 16 -> 1.64e-4. Above 5e-2 orthogonality has already collapsed and the run is invalid;
+      # more iterations do not rescue it (failure is a cliff, not a slope).
+      # BOUNDED ABOVE TOO -- this is not "more is safer". The iteration converges only on the
+      # range of Z; on any direction where Z Zᵀ is singular the recurrence multiplies by 3/2
+      # every step, so on a rank-deficient Z the null-space component grows like 1.5^iters and
+      # the result is NaN by iters ~ 50 (at cond(Z)=1e4, already NaN by 30). 16 is safe; 40+
+      # is not. Do not raise this past 16 without re-measuring.
+      # The converter has no matching flag and merges at the default 12. That is harmless:
+      # measured at cond(Z)=20, ‖Ā(16) − Ā(12)‖/‖Ā(12)‖ = 3.3e-5, two orders of magnitude
+      # under the 1.66e-3 bf16 rounding floor the merge already accepts.
+      orth_iters: 12
       # Alternate which factor trains, by OPTIMIZER UPDATE (3 per step here), cycling "BBA".
       # With B fixed, dW is linear in A and vice versa, so each subproblem is better
       # conditioned than chasing both at once. Orthogonality does NOT depend on this -- it

@@ -30,6 +30,7 @@ import torch.nn.functional as F
 # for -- and promoting them would mean editing ``orth.py`` to widen an API that has
 # exactly two other callers.
 from rlinf.models.slot_lora.orth import (
+    _DEFAULT_NS_ITERS,
     _compute_dtype,
     _pinned_precision,
     orthogonalize,
@@ -410,6 +411,7 @@ class SlotProj(nn.Module):
         total_rank: int,
         scale: float,
         eps: float = 1e-6,
+        iters: int = _DEFAULT_NS_ITERS,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
     ):
@@ -425,12 +427,21 @@ class SlotProj(nn.Module):
                 attribute below.
             eps: Passed through to :func:`orthogonalize` as the floor on the
                 Frobenius norm of ``Z Zᵀ``.
+            iters: Newton-Schulz iteration count, passed through to
+                :func:`orthogonalize`. The default is converged at the production
+                shape; the ONE documented remediation for a ``slot/orth_err`` that
+                drifts into the 1e-3..5e-2 band is to raise it to 16 and change
+                nothing else (measured at cond(Z)=20: 11 -> 6.8e-2, 12 -> 1.07e-3,
+                13 -> 1.62e-4). It is bounded ABOVE as well: on a rank-deficient Z
+                the null-space component grows 1.5x per iteration and reaches NaN
+                around 50, so 16 is safe and 40+ is not.
             dtype: Parameter dtype; ``None`` uses the torch default.
             device: Parameter device; ``None`` uses the torch default.
 
         Raises:
-            ValueError: if ``0 < total_rank <= in_features`` does not hold, or if
-                ``scale`` is not finite and strictly positive.
+            ValueError: if ``0 < total_rank <= in_features`` does not hold, if
+                ``scale`` is not finite and strictly positive, or if ``iters`` is not
+                strictly positive.
         """
         super().__init__()
         self.in_features = int(in_features)
@@ -478,6 +489,27 @@ class SlotProj(nn.Module):
                 "means that arithmetic already produced nan/inf."
             )
         self.eps = float(eps)
+        # Checked HERE for the same reason scale is: a non-positive count is not a
+        # degenerate setting, it is a SILENT one. `_ns_loop` runs `range(iters)`, so at
+        # iters <= 0 it never executes and returns X = I unchanged, making Ā =
+        # Z / sqrt(‖Z Zᵀ‖_F) -- a scaled Z, with no orthogonality at all, no error and
+        # no NaN. Every slot would then share subspace with every other and the one
+        # mechanism this package exists to provide would be off while `slot/dw_norm_k`
+        # kept moving for all K slots. There is no upper guard, because the failure at
+        # the other end is LOUD either way -- a NaN, or an orth_err that blows past the
+        # 5e-2 collapse threshold the training loop already watches -- and because the
+        # safe ceiling depends on cond(Z) rather than on any constant this class could
+        # hard-code; see the docstring for the measured 1.5^iters growth.
+        self.iters = int(iters)
+        if self.iters <= 0:
+            raise ValueError(
+                f"SlotProj needs a strictly positive Newton-Schulz iters; got "
+                f"iters={self.iters}. The recurrence would not run at all, so Ā would "
+                "come back as a rescaled Z -- NOT row-orthonormal -- with nothing "
+                "raised and every slot silently overlapping every other. Set "
+                "actor.model.slot_lora.orth_iters to 12 (the default) or, if "
+                "slot/orth_err has entered the 1e-3..5e-2 band, to 16."
+            )
         self.weight = nn.Parameter(
             torch.empty(self.total_rank, self.in_features, dtype=dtype, device=device)
         )
@@ -538,7 +570,7 @@ class SlotProj(nn.Module):
         Returns:
             The row-orthonormal ``(R, d_in)`` matrix.
         """
-        a = orthogonalize(self.weight, eps=self.eps)
+        a = orthogonalize(self.weight, iters=self.iters, eps=self.eps)
         if collect and self._collect_diag:
             # The precision guard has to wrap the GRAM as well, not just the
             # orthogonalization. orthogonalize pins autocast and TF32 off internally,
@@ -557,7 +589,9 @@ class SlotProj(nn.Module):
                 # is already garbage. Failure is a cliff, not a slope, so the sentinel
                 # has to watch the slope. One extra NS call (~1.3 ms) on ONE module per
                 # training step.
-                a32 = orthogonalize(self.weight.detach().float(), eps=self.eps)
+                a32 = orthogonalize(
+                    self.weight.detach().float(), iters=self.iters, eps=self.eps
+                )
                 self._diag = {"gram": a32 @ a32.transpose(-2, -1), "scale": self.scale}
             self._collect_diag = False
         return a
@@ -968,6 +1002,7 @@ class SlotLoRALinear(nn.Module):
         scale: float,
         gate: SlotGate,
         eps: float = 1e-6,
+        iters: int = _DEFAULT_NS_ITERS,
     ):
         """Wrap one linear, freeze it, and give it its slots.
 
@@ -987,12 +1022,16 @@ class SlotLoRALinear(nn.Module):
             gate: The model's single :class:`SlotGate`, shared by every gated module.
                 Passed to :class:`SlotOut`, which reads it inside every forward.
             eps: Passed through to :func:`orthogonalize`.
+            iters: Newton-Schulz iteration count, passed through to
+                :func:`orthogonalize`. See :class:`SlotProj` for the escalation ladder
+                and why it is bounded on both sides.
 
         Raises:
             ValueError: if ``base`` is not a childless ``nn.Linear`` with a
                 materialized floating-point weight, if ``slot_ranks`` is empty or does
-                not fit the input width, if ``scale`` is not finite and positive, or if
-                ``gate``'s slot count disagrees with ``slot_ranks``.
+                not fit the input width, if ``scale`` is not finite and positive, if
+                ``iters`` is not strictly positive, or if ``gate``'s slot count
+                disagrees with ``slot_ranks``.
         """
         super().__init__()
         if not isinstance(base, nn.Linear):
@@ -1061,6 +1100,7 @@ class SlotLoRALinear(nn.Module):
             sum(ranks),
             scale,
             eps,
+            iters,
             dtype=ref.dtype,
             device=ref.device,
         )

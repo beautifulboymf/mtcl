@@ -26,6 +26,7 @@ from rlinf.models.slot_lora.modules import (
     SlotOut,
     SlotProj,
 )
+from rlinf.models.slot_lora.orth import _DEFAULT_NS_ITERS, orth_error
 
 
 def _ids(*values):
@@ -473,6 +474,53 @@ class TestSlotProjScaleValidation:
         # a scale check that jumped the queue would hide it.
         with pytest.raises(ValueError, match="total_rank"):
             SlotProj(8, 16, 0.0)
+
+
+class TestSlotProjItersValidation:
+    """``iters`` is the documented remediation knob, and 0 is a silent no-op.
+
+    The design doc's response to ``slot/orth_err`` entering the 1e-3..5e-2 band is
+    "raise iters from 12 to 16" (measured at cond(Z)=20: 11 -> 6.8e-2, 12 -> 1.07e-3,
+    13 -> 1.62e-4). A non-positive count runs the Newton-Schulz recurrence ZERO times,
+    so ``X`` stays the identity and ``Ā`` comes back as ``Z / sqrt(‖Z Zᵀ‖_F)`` -- not
+    orthonormal at all, no error, no NaN, and every slot silently sharing subspace with
+    every other. That is the failure this whole module exists to prevent, so it is a
+    construction-time refusal rather than a first-forward surprise.
+    """
+
+    def test_zero_iters_raises_naming_the_value(self):
+        with pytest.raises(ValueError, match="iters=0"):
+            SlotProj(32, 8, 1.0, iters=0)
+
+    def test_negative_iters_raises_naming_the_value(self):
+        with pytest.raises(ValueError, match="iters=-3"):
+            SlotProj(32, 8, 1.0, iters=-3)
+
+    def test_the_documented_escalation_value_is_allowed(self):
+        assert SlotProj(32, 8, 1.0, iters=16).iters == 16
+
+    def test_the_default_is_the_module_constant(self):
+        assert SlotProj(32, 8, 1.0).iters == _DEFAULT_NS_ITERS
+
+    def test_iters_reaches_orthogonalize(self):
+        # Stored is not enough: the count has to be the one the forward computes with.
+        torch.manual_seed(0)
+        starved = SlotProj(32, 8, 1.0, iters=1, dtype=torch.float64)
+        healthy = SlotProj(32, 8, 1.0, dtype=torch.float64)
+        with torch.no_grad():
+            healthy.weight.copy_(starved.weight)
+        assert orth_error(starved.orth_weight(collect=False)) > 100 * orth_error(
+            healthy.orth_weight(collect=False)
+        )
+
+    def test_it_raises_before_allocating_the_parameter(self):
+        with pytest.raises(ValueError):
+            SlotProj(32, 8, 1.0, iters=0)
+
+    def test_the_scale_check_still_runs_first(self):
+        # Both are wrong; scale=0 is the older and more specific message.
+        with pytest.raises(ValueError, match="scale=0.0"):
+            SlotProj(32, 8, 0.0, iters=0)
 
 
 class TestSlotProjOrthWeightCollect:
@@ -1377,12 +1425,16 @@ class TestSlotLoRALinear:
         eps=1e-6,
         ranks=None,
         num_slots=None,
+        iters=_DEFAULT_NS_ITERS,
     ):
         ranks = self.RANKS if ranks is None else ranks
         torch.manual_seed(2)
         base = nn.Linear(in_features, out_features, bias=bias, dtype=dtype)
         gate = SlotGate(num_slots=len(ranks) if num_slots is None else num_slots)
-        return SlotLoRALinear(base, ranks, scale, gate, eps=eps), gate
+        return (
+            SlotLoRALinear(base, ranks, scale, gate, eps=eps, iters=iters),
+            gate,
+        )
 
     def _trained(self, **kwargs):
         """A layer whose B is non-zero. At init ΔW == 0 and every merge test is vacuous."""
@@ -1442,6 +1494,14 @@ class TestSlotLoRALinear:
         layer, _ = self._layer(scale=0.7, eps=1e-4)
         assert layer.slot_A.scale == 0.7
         assert layer.slot_A.eps == 1e-4
+
+    def test_iters_is_stored_on_the_projection(self):
+        layer, _ = self._layer(iters=16)
+        assert layer.slot_A.iters == 16
+
+    def test_iters_defaults_to_the_module_constant(self):
+        layer, _ = self._layer()
+        assert layer.slot_A.iters == _DEFAULT_NS_ITERS
 
     def test_match_mt4_style_scale_is_stored_verbatim(self):
         # The scale POLICY (sqrt(d_in)/ref_rank, reproducing the row norm of PEFT's

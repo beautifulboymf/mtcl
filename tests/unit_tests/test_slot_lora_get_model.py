@@ -44,6 +44,7 @@ from rlinf.models import (
     register_model,
 )
 from rlinf.models.slot_lora import SlotGate, SlotLoRALinear, SlotOut, SlotProj
+from rlinf.models.slot_lora.orth import _DEFAULT_NS_ITERS
 
 DIM = 8
 MODEL_TYPE = "slot_lora_unit_test_toy"
@@ -364,6 +365,24 @@ class TestScaleAndOptionalKeys:
         model = get_model(make_cfg(slot_cfg(orth_eps=1e-4)))
 
         assert model.attn.q_proj.slot_A.eps == pytest.approx(1e-4)
+
+    def test_orth_iters_is_honoured(self, toy_type, peft_spy):
+        # The design doc's remediation for a degrading slot/orth_err is "raise iters
+        # from 12 to 16". Without a config path that instruction is unreachable.
+        model = get_model(make_cfg(slot_cfg(orth_iters=16)))
+
+        assert model.attn.q_proj.slot_A.iters == 16
+
+    def test_orth_iters_defaults_to_twelve(self, toy_type, peft_spy):
+        model = get_model(make_cfg(slot_cfg()))
+
+        assert model.attn.q_proj.slot_A.iters == _DEFAULT_NS_ITERS
+        assert _DEFAULT_NS_ITERS == 12
+
+    def test_a_non_positive_orth_iters_raises(self, toy_type, peft_spy):
+        # Zero iterations returns Z itself, unnormalized -- silently non-orthogonal.
+        with pytest.raises(ValueError, match="iters=0"):
+            get_model(make_cfg(slot_cfg(orth_iters=0)))
 
     def test_an_unknown_scale_mode_raises(self, toy_type, peft_spy):
         with pytest.raises(ValueError, match="scale_mode"):

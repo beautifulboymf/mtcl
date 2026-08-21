@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
 from rlinf.models.slot_lora.routing import match_suite_ids
 
 _SUITE_ORDER = ["libero_10", "libero_goal", "libero_spatial", "libero_object"]
@@ -85,26 +87,85 @@ def test_empty_prompt_to_suite_gives_all_negative_one():
     assert got == [-1, -1]
 
 
-def test_first_match_wins_when_two_instructions_appear_in_one_prompt():
-    # Dict insertion order controls which key is checked first: "pick up the
-    # black bowl" (-> spatial) is inserted before "put the bowl on the plate"
-    # (-> object) in _PROMPT_TO_SUITE, so a prompt containing both substrings
-    # must resolve to spatial, not object.
+def test_the_longest_matching_instruction_wins():
+    # Both keys are contained in this prompt. "put the bowl on the plate" (25
+    # chars, -> object) is longer than "pick up the black bowl" (22, -> spatial),
+    # so object wins -- even though spatial is inserted FIRST in _PROMPT_TO_SUITE.
     text = (
         "In: What action should the robot take to pick up the black bowl "
         "and put the bowl on the plate? Out:"
     )
     got = match_suite_ids([text], _PROMPT_TO_SUITE, _SUITE_ORDER)
-    assert got == [_SUITE_ORDER.index("libero_spatial")]
+    assert got == [_SUITE_ORDER.index("libero_object")]
 
-    # Reversing the dict's insertion order flips which suite wins, proving the
-    # result tracks iteration order rather than some fixed priority.
+
+def test_the_table_iteration_order_does_not_change_the_answer():
+    # The routing dict's order is an accident of how the actor builds the table
+    # (benchmark.libero_suites order); a routing that tracked it sent libero_10
+    # task 122 into the goal slot. Reversing the table must change nothing.
+    text = (
+        "In: What action should the robot take to pick up the black bowl "
+        "and put the bowl on the plate? Out:"
+    )
     reordered = {
         "put the bowl on the plate": "libero_object",
         "pick up the black bowl": "libero_spatial",
     }
-    got_reordered = match_suite_ids([text], reordered, _SUITE_ORDER)
-    assert got_reordered == [_SUITE_ORDER.index("libero_object")]
+    forward = {
+        "pick up the black bowl": "libero_spatial",
+        "put the bowl on the plate": "libero_object",
+    }
+    assert match_suite_ids([text], reordered, _SUITE_ORDER) == match_suite_ids(
+        [text], forward, _SUITE_ORDER
+    )
+
+
+def test_a_prefix_key_never_beats_the_longer_key_it_is_a_prefix_of():
+    # The real LIBERO collision, in miniature: libero_goal's "turn on the stove"
+    # is a proper prefix of libero_10 task 122's instruction, and the goal key
+    # comes first in the table the actor builds.
+    prompt_to_suite = {
+        "turn on the stove": "libero_goal",
+        "turn on the stove and put the moka pot on it": "libero_10",
+    }
+    long_prompt = (
+        "In: What action should the robot take to turn on the stove and put "
+        "the moka pot on it? Out:"
+    )
+    short_prompt = "In: What action should the robot take to turn on the stove? Out:"
+    assert match_suite_ids([long_prompt], prompt_to_suite, _SUITE_ORDER) == [
+        _SUITE_ORDER.index("libero_10")
+    ]
+    # ...and the shorter instruction still reaches its own suite.
+    assert match_suite_ids([short_prompt], prompt_to_suite, _SUITE_ORDER) == [
+        _SUITE_ORDER.index("libero_goal")
+    ]
+
+
+def test_an_equal_length_disagreement_raises_instead_of_flipping_a_coin():
+    # Longest-first settles a substring CHAIN (the longer key is strictly more
+    # specific). It cannot settle a TIE: two keys of the same length mapping to
+    # different suites, both present in one prompt. Dict order would decide it,
+    # invisibly, so this is refused rather than resolved.
+    prompt_to_suite = {
+        "open the drawer": "libero_goal",  # 15 characters
+        "shut the fridge": "libero_10",  # also 15
+    }
+    text = "In: ... open the drawer then shut the fridge ... Out:"
+    with pytest.raises(ValueError, match="equally specific"):
+        match_suite_ids([text], prompt_to_suite, _SUITE_ORDER)
+
+
+def test_an_equal_length_agreement_does_not_raise():
+    # Same length, SAME suite: there is nothing to choose between, so it routes.
+    prompt_to_suite = {
+        "open the drawer": "libero_goal",
+        "shut the fridge": "libero_goal",
+    }
+    text = "In: ... open the drawer then shut the fridge ... Out:"
+    assert match_suite_ids([text], prompt_to_suite, _SUITE_ORDER) == [
+        _SUITE_ORDER.index("libero_goal")
+    ]
 
 
 def test_every_returned_id_is_a_valid_slot_index_or_negative_one():
@@ -142,15 +203,21 @@ def test_empty_string_text_gives_negative_one():
     assert got == [-1]
 
 
-def test_empty_instruction_key_matches_everything_first():
-    # Mirrors the teacher router's literal semantics: "" is a substring of
-    # every string, so an empty key placed first wins for every sample. This
-    # looks like a footgun, but the routing table is built from real LIBERO
-    # instructions and never contains an empty key in practice; the test
-    # documents the behavior rather than prescribing it.
+def test_an_empty_instruction_key_is_the_last_resort_not_the_first():
+    # "" is a substring of every string, so it always matches -- but it is also
+    # the SHORTEST possible key, so longest-first reaches it only when nothing
+    # else matched. Under the old first-in-the-dict rule an empty key placed
+    # first swallowed every sample; now it behaves like a catch-all, which is
+    # the only sane reading of a zero-length instruction. The routing table is
+    # built from real LIBERO instructions and never contains one in practice;
+    # the test documents the behavior rather than prescribing it.
     prompt_to_suite = {"": "libero_10", "pick up the black bowl": "libero_spatial"}
-    got = match_suite_ids(["anything at all"], prompt_to_suite, _SUITE_ORDER)
-    assert got == [_SUITE_ORDER.index("libero_10")]
+    assert match_suite_ids(["anything at all"], prompt_to_suite, _SUITE_ORDER) == [
+        _SUITE_ORDER.index("libero_10")
+    ]
+    assert match_suite_ids(
+        ["In: ... pick up the black bowl ... Out:"], prompt_to_suite, _SUITE_ORDER
+    ) == [_SUITE_ORDER.index("libero_spatial")]
 
 
 def test_duplicate_suite_order_entries_use_first_occurrence_index():

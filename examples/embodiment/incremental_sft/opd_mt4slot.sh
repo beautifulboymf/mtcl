@@ -45,12 +45,31 @@ LOGP="$O/seqcl_${TAG}"
 # ---- disk ------------------------------------------------------------------------------------
 # THE one red line that has actually taken this machine down: a full /share/fanruochen-local
 # stopped every tenant's writes for days, and it happened by letting checkpoints pile up without
-# ever looking at df. This run writes ~29G per checkpoint (DCP shards + full_weights.pt) and the
-# runner keeps the latest plus `best`, so refuse to start on a tight disk rather than find out
-# at step 10.
+# ever looking at df.
+#
+# THE FLOOR IS THE UNCLEANED PEAK. The previous 120G was justified by "the runner keeps the
+# latest plus best". It does not: embodied_runner._save_checkpoint writes
+# checkpoints/global_step_<N>/ for every periodic save and only ever rmtree's the TAGGED path,
+# so the global_step_* directories ACCUMULATE. mt4's own driver log shows saves at steps 5, 10
+# and 15 plus `best` overwritten repeatedly, and mt4's surviving directories measure 32G each
+# (17G DCP shards + 15G full_weights.pt) -- 128G concurrent, already over the old floor.
+#
+#   R1 arithmetic: R = 256 is twice mt4's rank-128 LoRA, so ~36G per directory.
+#     STEPS/SAVE_INTERVAL = 15/5 = 3 periodic saves, + 1 for `best`   -> 4 x 36G = 144G peak
+#     + the merged HF model the convert step writes (~15G, measured)  -> 159G total after
+#   Floor 175G = 159G + ~16G of headroom for tensorboard/logs and a checkpoint that comes out
+#   bigger than the estimate. At today's ~800G free this never bites; it exists for the tight
+#   case, where the old 120G would have PASSED at 121G free and then filled a shared volume at
+#   about step 10.
+#
+# The reaper below usually keeps the real high-water mark near 108G, but the floor deliberately
+# does NOT assume it ran: a best-effort background loop must never be load-bearing for the guard
+# that stops this volume from filling.
+NEED_GB="${NEED_GB:-175}"
 free=$(df -BG --output=avail /share/fanruochen-local | tail -1 | tr -dc '0-9')
-(( free >= 120 )) || {
-  echo "ABORT: only ${free}G free on /share/fanruochen-local (need >=120G; each checkpoint ~29G)"
+(( free >= NEED_GB )) || {
+  echo "ABORT: only ${free}G free on /share/fanruochen-local (need >=${NEED_GB}G:"
+  echo "       4 checkpoint dirs x ~36G concurrent = 144G, + ~15G for the converted model)"
   echo "       Free space first -- filling this volume takes down every tenant, not just this job."
   exit 1; }
 
@@ -119,6 +138,54 @@ echo "======== SLOT-LORI R1 [$TAG] config=$CFG init=$(basename "$STUDENT") gpus=
 echo "         slots: libero_10:128 libero_goal:64 libero_spatial:48 libero_object:16  (R=256)"
 echo "         controls: mt4 0.745 (opd_mt4i_driver.log) / mt4w2 0.750 (opd_mt4w2_driver.log)"
 
+# ---- checkpoint reaper -------------------------------------------------------------------------
+# The runner never deletes a global_step_* directory, so a 15-step run at save_interval 5 ends
+# holding three of them plus `best` -- ~144G that nothing but this loop will free while the job is
+# still running. Best-effort ONLY: the disk floor above is sized for the uncleaned peak, so if this
+# loop never starts, dies, or is switched off, the run is still safe. Set KEEP_CKPTS=0 to disable.
+#
+# The safety rules it must not break, in the order they matter:
+#   * NEVER the newest. It keeps the newest KEEP_CKPTS (>=2) by STEP NUMBER, so the directory
+#     currently being written is kept AND so is the last complete one -- a crash mid-write can
+#     never leave the run with zero loadable checkpoints (the "half-written DCP, missing
+#     .metadata, unconvertible" failure).
+#   * NEVER `best`, and never anything outside this run's own checkpoints/ directory. The find
+#     regex matches only `global_step_<digits>`, and CKPT_DIR is asserted to live under $O first.
+#   * NEVER outlive its parent. If safe_run.sh SIGKILLs this script the EXIT trap does not fire,
+#     so the loop also checks that the launcher's PID is still alive and exits within one tick --
+#     an orphan reaper would otherwise eat the checkpoints of the NEXT run with the same TAG.
+KEEP_CKPTS="${KEEP_CKPTS:-2}"
+CKPT_DIR="$LOGP/seqcl_${TAG}/checkpoints"
+REAP_PID=""
+case "$CKPT_DIR" in
+  "$O"/*) ;;
+  *) echo "WARN: refusing to reap outside $O (CKPT_DIR=$CKPT_DIR)"; KEEP_CKPTS=0 ;;
+esac
+(( KEEP_CKPTS == 0 || KEEP_CKPTS >= 2 )) || KEEP_CKPTS=2
+if (( KEEP_CKPTS > 0 )); then
+  MAIN_PID=$$
+  (
+    while kill -0 "$MAIN_PID" 2>/dev/null; do
+      sleep 120
+      [ -d "$CKPT_DIR" ] || continue
+      mapfile -t steps < <(find "$CKPT_DIR" -mindepth 1 -maxdepth 1 -type d \
+        -regextype posix-extended -regex '.*/global_step_[0-9]+' -printf '%f\n' 2>/dev/null \
+        | sed 's/^global_step_//' | sort -n)
+      n=${#steps[@]}
+      (( n > KEEP_CKPTS )) || continue
+      for (( i = 0; i < n - KEEP_CKPTS; i++ )); do
+        victim="$CKPT_DIR/global_step_${steps[i]}"
+        [ -d "$victim" ] || continue
+        echo "[reap] removing superseded $victim ($(du -sh "$victim" 2>/dev/null | cut -f1))"
+        rm -rf -- "$victim"
+      done
+    done
+  ) &
+  REAP_PID=$!
+  trap 'kill "$REAP_PID" 2>/dev/null' EXIT
+  echo "[reap] keeping the newest $KEEP_CKPTS global_step_* under $CKPT_DIR (pid $REAP_PID)"
+fi
+
 # ---- train -----------------------------------------------------------------------------------
 # No hydra overrides: everything this run needs is in the config. run_iso.sh puts the job on its
 # OWN ray head so it cannot join (or be joined by) another job's cluster -- two concurrent RLinf
@@ -128,7 +195,11 @@ MT4SLOT_MAX_STEPS="$STEPS" MT4SLOT_SAVE_INTERVAL="$SAVE_INTERVAL" \
 ISO_RAY_PORT="$PORT" bash "$SCRIPTS/run_iso.sh" \
   "$PY" "$REPO/examples/embodiment/train_embodied_agent.py" --config-name "$CFG"
 RC=$?
+# The reaper's only job was to hold the mid-run peak down; past this point every save is done
+# and the convert step below reads the newest checkpoint, so stop it before that walk starts.
+[ -n "$REAP_PID" ] && { kill "$REAP_PID" 2>/dev/null; trap - EXIT; }
 echo "OPD_TRAIN_DONE rc=$RC $(date '+%F %T')"
+echo "== df =="; df -h /share/fanruochen-local | tail -1
 (( RC == 0 )) || exit "$RC"
 
 # ---- convert ---------------------------------------------------------------------------------

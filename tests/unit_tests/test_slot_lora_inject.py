@@ -29,7 +29,11 @@ from rlinf.models.slot_lora.modules import (
     SlotOut,
     SlotProj,
 )
-from rlinf.models.slot_lora.orth import orth_error, orthogonalize
+from rlinf.models.slot_lora.orth import (
+    _DEFAULT_NS_ITERS,
+    orth_error,
+    orthogonalize,
+)
 
 DIM = 16
 HIDDEN = 24
@@ -85,6 +89,28 @@ class Toy(nn.Module):
         for block in self.blocks:
             x = block(x)
         return x
+
+
+class PatchEmbed(nn.Module):
+    """A ``Conv2d`` whose ATTRIBUTE NAME is a target, next to one that is not.
+
+    Shaped after the real ``vision_backbone.featurizer.patch_embed.proj`` -- an
+    ``nn.Conv2d`` sitting under a name in the shared target list, which PEFT adapts and
+    the slot path cannot.
+    """
+
+    def __init__(self, dim=DIM):
+        super().__init__()
+        self.q_proj = nn.Conv2d(3, dim, kernel_size=2, dtype=torch.float64)
+        self.patch_conv_only = nn.Conv2d(3, dim, kernel_size=2, dtype=torch.float64)
+
+
+class ConvToy(Toy):
+    """A :class:`Toy` with the name-matched ``Conv2d`` bolted on."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.patch_embed = PatchEmbed()
 
 
 class FSDPLike(nn.Module):
@@ -301,6 +327,90 @@ class TestInjectSlotLora:
         model = Toy()
         inject_slot_lora(model, RANKS, TARGETS, scale_mode="unit", eps=1e-4)
         assert model.blocks[0].attn.q_proj.slot_A.eps == 1e-4
+
+    def test_iters_reaches_the_projection(self):
+        model = Toy()
+        inject_slot_lora(model, RANKS, TARGETS, scale_mode="unit", iters=16)
+        assert model.blocks[0].attn.q_proj.slot_A.iters == 16
+
+    def test_iters_defaults_to_the_module_constant(self):
+        model = Toy()
+        inject_slot_lora(model, RANKS, TARGETS, scale_mode="unit")
+        assert model.blocks[0].attn.q_proj.slot_A.iters == _DEFAULT_NS_ITERS
+
+    def test_iters_actually_changes_the_orthogonalization(self):
+        """Not just stored: a starved iteration count must show up in ``Ā``.
+
+        One Newton-Schulz step cannot converge, so ``orth_error`` at ``iters=1`` has to
+        be orders of magnitude worse than at the default. Without this the knob could
+        be threaded to the attribute and dropped on the way to ``orthogonalize``, and
+        the documented remediation ("raise iters from 12 to 16") would still do nothing.
+        """
+        starved, healthy = Toy(), Toy()
+        starved.load_state_dict(healthy.state_dict())
+        inject_slot_lora(starved, RANKS, TARGETS, scale_mode="unit", iters=1)
+        inject_slot_lora(healthy, RANKS, TARGETS, scale_mode="unit")
+        starved_proj = starved.blocks[0].attn.q_proj.slot_A
+        healthy_proj = healthy.blocks[0].attn.q_proj.slot_A
+        # Same Z in both, so the only difference is the iteration count.
+        with torch.no_grad():
+            starved_proj.weight.copy_(healthy_proj.weight)
+        assert orth_error(starved_proj.orth_weight(collect=False)) > 100 * orth_error(
+            healthy_proj.orth_weight(collect=False)
+        )
+
+
+class TestNameMatchedButWrongType:
+    """A child whose NAME is a target but whose TYPE is not an ``nn.Linear``.
+
+    This is not hypothetical. Two modules of the real student --
+    ``vision_backbone.featurizer.patch_embed.proj`` and
+    ``vision_backbone.fused_featurizer.patch_embed.proj``, both ``Conv2d(3, 128, 14)``
+    -- match ``"proj"`` in ``SLOT_LORA_TARGET_MODULES``, and PEFT adapts them (measured
+    off the mt4 baseline's own adapter: 439 ``lora_A`` tensors, 437 of them 2-D and 2 of
+    them 4-D). The slot path cannot, so it adapts 437 and leaves those two frozen. That
+    divergence from the baseline is legitimate but it must be COUNTED and SAID, never
+    inferred from a parameter count.
+    """
+
+    def test_a_name_matched_conv_is_reported_not_silently_dropped(self):
+        model = ConvToy()
+        result = inject_slot_lora(model, RANKS, TARGETS, scale_mode="unit")
+        assert result.skipped == (("patch_embed.q_proj", "Conv2d"),)
+        assert "patch_embed.q_proj" not in result.paths
+
+    def test_the_skipped_module_is_left_alone_and_frozen(self):
+        model = ConvToy()
+        inject_slot_lora(model, RANKS, TARGETS, scale_mode="unit")
+        assert type(model.patch_embed.q_proj) is nn.Conv2d
+        assert model.patch_embed.q_proj.weight.requires_grad is False
+
+    def test_the_linears_around_it_are_still_adapted(self):
+        model = ConvToy()
+        result = inject_slot_lora(model, RANKS, TARGETS, scale_mode="unit")
+        assert tuple(result.paths) == PATHS
+
+    def test_it_is_logged_once_at_warning_with_the_path_and_the_type(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="rlinf.models.slot_lora.inject"):
+            inject_slot_lora(ConvToy(), RANKS, TARGETS, scale_mode="unit")
+        warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert len(warnings) == 1
+        message = warnings[0].getMessage()
+        assert message.count("\n") == 0
+        assert "patch_embed.q_proj" in message
+        assert "Conv2d" in message
+
+    def test_nothing_is_logged_at_warning_when_every_target_is_a_linear(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="rlinf.models.slot_lora.inject"):
+            result = inject_slot_lora(Toy(), RANKS, TARGETS, scale_mode="unit")
+        assert result.skipped == ()
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_a_target_list_matching_only_non_linears_still_raises(self):
+        """The "matched no nn.Linear" guard must survive the new bookkeeping."""
+        model = ConvToy()
+        with pytest.raises(ValueError, match="matched no nn.Linear"):
+            inject_slot_lora(model, RANKS, ("patch_conv_only",), scale_mode="unit")
 
 
 class TestSharedGate:

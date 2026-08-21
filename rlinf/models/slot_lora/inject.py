@@ -26,6 +26,7 @@ from rlinf.models.slot_lora.modules import (
     SlotOut,
     SlotProj,
 )
+from rlinf.models.slot_lora.orth import _DEFAULT_NS_ITERS
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +55,18 @@ class SlotInjection:
             routing per MICRO-batch through it (``with result.gate.scoped(ids):``),
             so it has to survive the injection call; nothing else in the model
             exposes it, and re-deriving it means walking the module tree.
+        skipped: ``(path, type name)`` for every child whose NAME was in
+            ``target_modules`` but whose TYPE this pass cannot adapt, in the same
+            order. Empty on a model whose targets are all ``nn.Linear``. It is a
+            FIELD and not merely a log line because it is the only machine-readable
+            record of how far the slot arm's adapted set is from the PEFT baseline's
+            -- see :func:`inject_slot_lora` for the two real ``Conv2d`` this is
+            about.
     """
 
     paths: tuple[str, ...]
     gate: SlotGate
+    skipped: tuple[tuple[str, str], ...] = ()
 
 
 def _module_scale(in_features: int, scale_mode: str, ref_rank: int) -> float:
@@ -82,6 +91,7 @@ def inject_slot_lora(
     scale_mode: str = "match_mt4",
     ref_rank: int = 128,
     eps: float = 1e-6,
+    iters: int = _DEFAULT_NS_ITERS,
     strict_gate: bool = True,
 ) -> SlotInjection:
     """Replace every targeted ``nn.Linear`` with a :class:`SlotLoRALinear`; freeze the rest.
@@ -96,9 +106,22 @@ def inject_slot_lora(
     result because nothing else exposes it.
 
     WHAT COUNTS AS A TARGET is the child's ATTRIBUTE NAME being in ``target_modules``
-    and the child being an ``nn.Linear`` -- the same rule PEFT's ``target_modules``
-    uses in this repo, so the slot path adapts exactly the modules the PEFT baseline
-    adapted. Nothing already injected is touched again: a ``SlotLoRALinear`` is not an
+    AND the child being an ``nn.Linear``. The name half is the same rule PEFT's
+    ``target_modules`` uses in this repo; the type half is NOT, and the difference is
+    real rather than theoretical. On the OpenVLA-OFT student two name-matched children
+    are ``nn.Conv2d(3, 128, kernel_size=14)`` --
+    ``vision_backbone.featurizer.patch_embed.proj`` and
+    ``vision_backbone.fused_featurizer.patch_embed.proj``, both matched by ``"proj"`` in
+    ``SLOT_LORA_TARGET_MODULES``. PEFT adapts them; this pass cannot (a conv's ``ΔW``
+    is not ``B Ā`` over ``d_in``, and adding one would change the math this experiment
+    is measuring). MEASURED off the mt4 baseline's own adapter: 439 ``lora_A`` tensors,
+    437 of them 2-D and 2 of them 4-D -- so the slot arm adapts 437 modules where the
+    PEFT arm adapted 439, and those two convs stay frozen for the whole run. That is a
+    known, deliberate divergence between the two arms; every such child is COUNTED into
+    :attr:`SlotInjection.skipped` and named in a warning, because the only other way to
+    notice it is to compare parameter counts against a checkpoint nobody re-reads.
+
+    Nothing already injected is touched again: a ``SlotLoRALinear`` is not an
     ``nn.Linear``, and the walk never descends into one, so the frozen ``base`` inside
     it cannot be wrapped a second time (which would hide a second adapter from
     :meth:`SlotLoRALinear.delta_weight` and silently drop it at merge time).
@@ -113,13 +136,18 @@ def inject_slot_lora(
         ref_rank: The baseline LoRA rank ``match_mt4`` matches against. Ignored by
             ``"unit"``.
         eps: Floor on ``‖Z Zᵀ‖_F``, passed through to :func:`orthogonalize`.
+        iters: Newton-Schulz iteration count, passed through to
+            :func:`orthogonalize`. 12 is converged at the production shape; raising it
+            to 16 is the documented response to a degrading ``slot/orth_err``. See
+            :class:`~rlinf.models.slot_lora.modules.SlotProj`.
         strict_gate: Whether the gate raises when read with no routing installed.
             Leave it on unless the run genuinely never routes; a strict gate is what
             turns "the routing was not installed" into an error instead of a silently
             ungated forward that trains every slot on every sample.
 
     Returns:
-        A :class:`SlotInjection` carrying the replaced paths and the shared gate.
+        A :class:`SlotInjection` carrying the replaced paths, the shared gate, and
+        every name-matched child whose type this pass could not adapt.
 
     Raises:
         ValueError: if ``scale_mode`` is not one of ``("match_mt4", "unit")``, if
@@ -150,13 +178,23 @@ def inject_slot_lora(
     # created itself, which is what keeps a freshly wrapped `base` out of the results
     # without relying on when `named_modules` materializes its generator.
     candidates = []
+    skipped: list[tuple[str, str]] = []
     for parent_name, parent in model.named_modules():
         if isinstance(parent, SlotLoRALinear):
             continue  # its `base` is already adapted and already frozen
         for child_name, child in parent.named_children():
-            if child_name in targets and isinstance(child, nn.Linear):
-                path = f"{parent_name}.{child_name}" if parent_name else child_name
+            if child_name not in targets:
+                continue
+            path = f"{parent_name}.{child_name}" if parent_name else child_name
+            if isinstance(child, nn.Linear):
                 candidates.append((parent, child_name, child, path))
+            else:
+                # The name says "adapt me" and the type says "you cannot". Dropping it
+                # on the floor is what the divergence from the PEFT baseline (439 vs
+                # 437 adapted modules) used to be made of, and nothing downstream can
+                # recover it: the module simply stays frozen, the run trains, and the
+                # only witness is a parameter count nobody compares.
+                skipped.append((path, type(child).__name__))
     if not candidates:
         raise ValueError(
             f"slot-LoRA target_modules {sorted(targets)} matched no nn.Linear in this "
@@ -174,7 +212,7 @@ def inject_slot_lora(
     paths = []
     for parent, child_name, child, path in candidates:
         scale = _module_scale(child.in_features, scale_mode, ref_rank)
-        wrapper = SlotLoRALinear(child, ranks, scale, gate, eps=eps)
+        wrapper = SlotLoRALinear(child, ranks, scale, gate, eps=eps, iters=iters)
         setattr(parent, child_name, wrapper)
         adapted_bases.update(id(p) for p in wrapper.base.parameters())
         paths.append(path)
@@ -220,7 +258,32 @@ def inject_slot_lora(
         shown,
         more,
     )
-    return SlotInjection(paths=tuple(paths), gate=gate)
+    # NAMED, AT WARNING, AND ONLY WHEN IT HAPPENS. Unlike the freeze report above this
+    # does NOT fire on every injection -- it fires exactly when the target list names
+    # something this pass cannot adapt -- so it is news every time it appears, and a
+    # WARNING is what gets it read in a driver log. It does not RAISE, deliberately:
+    # the two OpenVLA-OFT convs are a permanent property of the shared target list, so
+    # raising would make the slot path unrunnable on the very model it was written for,
+    # and adding Conv2d support would change ΔW's parameterization in the middle of an
+    # experiment whose whole point is that ONE thing differs from the mt4 baseline.
+    # What must not happen is that the divergence goes unrecorded, and the number is
+    # what makes it checkable: 437 adapted + 2 skipped = the 439 PEFT adapted.
+    if skipped:
+        logger.warning(
+            "slot-LoRA: %d module(s) matched target_modules BY NAME but were NOT "
+            "adapted because they are not nn.Linear: %s. PEFT adapts several non-Linear "
+            "types, and the mt4 baseline's own adapter does carry a 4-D lora_A for each "
+            "of the two OpenVLA-OFT patch-embedding convs -- so the slot arm trains %d "
+            "modules where that baseline trained %d, and these stay frozen for the whole "
+            "run. Expected on OpenVLA-OFT, and reported rather than fixed: adding Conv2d "
+            "slots would change ΔW's parameterization, which is not what this experiment "
+            "varies.",
+            len(skipped),
+            ", ".join(f"{path} ({kind})" for path, kind in skipped),
+            len(paths),
+            len(paths) + len(skipped),
+        )
+    return SlotInjection(paths=tuple(paths), gate=gate, skipped=tuple(skipped))
 
 
 def _slot_layers(model: nn.Module) -> list[SlotLoRALinear]:

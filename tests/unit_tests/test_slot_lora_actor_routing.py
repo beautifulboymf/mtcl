@@ -122,9 +122,19 @@ def _inputs(n, device="cpu"):
 def _legacy_groups(texts, route, suite_to_path, default_path):
     """The grouping loop `_route_prepare` replaced, copied verbatim from git history.
 
-    Kept here as the reference the refactor must reproduce sample for sample: the
-    teacher side's behaviour is a baseline other runs are compared against, and a
+    Kept as the reference for the part of the refactor that is meant to be a pure
+    refactor: strip, lower-case, substring containment, and the fallback to the first
+    teacher. The teacher side is a baseline other runs are compared against, and a
     silently changed grouping would move it.
+
+    IT IS NO LONGER A REFERENCE FOR TIE-BREAKING, and must not be used as one. This
+    loop takes the FIRST key in the routing dict's iteration order, which is how
+    libero_10 task 122 ("turn on the stove and put the moka pot on it") ended up routed
+    to libero_goal by its prefix "turn on the stove"; `match_suite_ids` now takes the
+    LONGEST matching key instead, deliberately. See
+    `rlinf/models/slot_lora/routing.py` and
+    `tests/unit_tests/test_slot_lora_libero_routing.py`. The prompts below are all
+    mutually non-nested, so the two agree on them and the refactor half stays testable.
     """
     groups = {}
     for i, t in enumerate(texts):
@@ -170,7 +180,10 @@ def test_slot_ids_and_teacher_groups_agree_sample_for_sample():
         )
 
 
-def test_teacher_grouping_matches_the_loop_it_replaced():
+def test_teacher_grouping_matches_the_loop_it_replaced_on_unnested_prompts():
+    # No key in PROMPT_TO_SUITE is a substring of another, so first-key-wins and
+    # longest-key-wins cannot differ here and the refactor is comparable to the loop
+    # it replaced. Where they DO differ is the point of the change; see _legacy_groups.
     texts = [
         "pick up the black bowl and place it on the plate",
         "open the middle drawer of the cabinet",

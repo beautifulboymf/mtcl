@@ -506,6 +506,14 @@ def _apply_slot_lora(model, cfg: DictConfig, slot_cfg: DictConfig):
     * ``a_scale_ref_rank`` (optional, ``128``) -- the PEFT baseline rank ``match_mt4``
       matches ``ΔW``'s step-1 magnitude against.
     * ``orth_eps`` (optional, ``1e-6``) -- floor on ``‖Z Zᵀ‖_F``.
+    * ``orth_iters`` (optional, ``12``) -- Newton-Schulz iteration count for
+      ``Ā = (Z Zᵀ)^(-1/2) Z``. 12 is converged at the production shape. It exists as a
+      key because it is the ONE documented remediation for a ``slot/orth_err`` that
+      drifts into the 1e-3..5e-2 band -- raise it to 16 and change nothing else
+      (measured at cond(Z)=20: 11 -> 6.8e-2, 12 -> 1.07e-3, 13 -> 1.62e-4) -- and a
+      remediation with no config path is not a remediation. Bounded above as well: on
+      a rank-deficient Z the null-space component grows 1.5x per iteration and is NaN
+      by ~50, so 16 is safe and 40+ is not.
 
     Both required keys fail loudly when absent, and so does every disagreement between
     the two (a name in one and not the other, a repeated name): each of those produces a
@@ -527,6 +535,7 @@ def _apply_slot_lora(model, cfg: DictConfig, slot_cfg: DictConfig):
     import sys as _sys
 
     from rlinf.models.slot_lora import inject_slot_lora
+    from rlinf.models.slot_lora.orth import _DEFAULT_NS_ITERS
 
     if cfg.get("lora_path", None) is not None:
         raise ValueError(
@@ -596,6 +605,10 @@ def _apply_slot_lora(model, cfg: DictConfig, slot_cfg: DictConfig):
     scale_mode = str(slot_cfg.get("a_scale_mode", "match_mt4"))
     ref_rank = int(slot_cfg.get("a_scale_ref_rank", 128))
     eps = float(slot_cfg.get("orth_eps", 1e-6))
+    # The default is the CONSTANT, not a 12 written here: the number is only
+    # defensible together with the measurements in its docstring, and a literal in
+    # this file could drift away from them without anything noticing.
+    iters = int(slot_cfg.get("orth_iters", _DEFAULT_NS_ITERS))
 
     injection = inject_slot_lora(
         model,
@@ -604,6 +617,7 @@ def _apply_slot_lora(model, cfg: DictConfig, slot_cfg: DictConfig):
         scale_mode=scale_mode,
         ref_rank=ref_rank,
         eps=eps,
+        iters=iters,
     )
     _assert_slot_leaves_fsdp_wrappable(model)
 
@@ -640,10 +654,21 @@ def _apply_slot_lora(model, cfg: DictConfig, slot_cfg: DictConfig):
         value_head = "trainable"
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # `skipped` is on this line and not only in inject's own warning because THIS is
+    # the line the driver log is read for. A reader comparing the slot arm against the
+    # PEFT baseline needs "437 adapted + 2 skipped" in one place; "437" alone invites
+    # the conclusion that the two arms adapt the same set, which they do not.
+    skipped = (
+        "none"
+        if not injection.skipped
+        else ", ".join(f"{path} ({kind})" for path, kind in injection.skipped)
+    )
     _sys.stderr.write(
         f"[slot-lora] injected {len(injection.paths)} SlotLoRALinear "
         f"(targets=SLOT_LORA_TARGET_MODULES); order={order} ranks={ranks} "
-        f"R={sum(ranks)}; scale_mode={scale_mode} ref_rank={ref_rank} orth_eps={eps}; "
+        f"R={sum(ranks)}; scale_mode={scale_mode} ref_rank={ref_rank} orth_eps={eps} "
+        f"orth_iters={iters}; "
+        f"name-matched but not nn.Linear (NOT adapted, PEFT adapts them): {skipped}; "
         f"value_head={value_head}; trainable params={trainable}\n"
     )
     return model

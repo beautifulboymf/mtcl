@@ -125,6 +125,18 @@ def default_target_modules():
     than training did, the checkpoint's keys would not line up -- which the key check
     below does catch -- but a merely SMALLER set would line up for the modules it does
     cover and silently drop the rest.
+
+    It is the same LIST, which is not the same thing as the same adapted SET, and the
+    difference is worth naming here because this is the script that produces the model
+    the baseline is compared against. ``inject_slot_lora`` adapts a child only when its
+    name is in this list AND it is an ``nn.Linear``; on OpenVLA-OFT two name-matched
+    children are ``nn.Conv2d`` (``vision_backbone.featurizer.patch_embed.proj`` and
+    ``vision_backbone.fused_featurizer.patch_embed.proj``, both matched by ``"proj"``).
+    So training and this converter both adapt 437 modules -- consistently, which is all
+    the key check needs -- while the PEFT baseline this run is measured against adapted
+    439 (measured: 437 two-dimensional ``lora_A`` plus 2 four-dimensional ones). Those
+    two convs are frozen in the slot arm and merged from nothing here. See
+    ``inject_slot_lora``, which counts and logs them at injection time.
     """
     from rlinf.models import SLOT_LORA_TARGET_MODULES
 
