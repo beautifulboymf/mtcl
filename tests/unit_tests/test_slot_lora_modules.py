@@ -20,7 +20,12 @@ import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
-from rlinf.models.slot_lora.modules import SlotGate, SlotOut, SlotProj
+from rlinf.models.slot_lora.modules import (
+    SlotGate,
+    SlotLoRALinear,
+    SlotOut,
+    SlotProj,
+)
 
 
 def _ids(*values):
@@ -1248,3 +1253,423 @@ class TestCrossGramPairingContract:
         assert cross.abs().max() > 0.1  # the B half is NOT trivially zero
         assert truth.abs() < floor
         assert (predicted - truth).abs() < floor
+
+
+def _fsdp_lora_leaf(module: nn.Module) -> bool:
+    """The LoRA leaf-wrap predicate from ``rlinf/hybrid_engines/fsdp/utils.py:305-311``.
+
+    Copied verbatim so the layout assumptions of this package are pinned by a test
+    rather than by a comment. A module it accepts gets its OWN FSDP flat parameter.
+    """
+    return bool(
+        len(list(module.named_children())) == 0
+        and getattr(module, "weight", None) is not None
+        and module.weight.requires_grad
+        and getattr(module, "_to_lora", True) is True
+    )
+
+
+class TestSlotLoRALinear:
+    """The drop-in replacement for one nn.Linear: frozen base + K orthogonal slots."""
+
+    RANKS = (3, 5)  # slot0 -> columns 0:3, slot1 -> columns 3:8
+
+    def _layer(
+        self,
+        in_features=16,
+        out_features=6,
+        # NOT 1.0: at unit scale a delta_weight() that dropped the scale entirely would
+        # satisfy every merge test in this class.
+        scale=0.7,
+        bias=True,
+        dtype=torch.float64,
+        eps=1e-6,
+        ranks=None,
+        num_slots=None,
+    ):
+        ranks = self.RANKS if ranks is None else ranks
+        torch.manual_seed(2)
+        base = nn.Linear(in_features, out_features, bias=bias, dtype=dtype)
+        gate = SlotGate(num_slots=len(ranks) if num_slots is None else num_slots)
+        return SlotLoRALinear(base, ranks, scale, gate, eps=eps), gate
+
+    def _trained(self, **kwargs):
+        """A layer whose B is non-zero. At init ΔW == 0 and every merge test is vacuous."""
+        layer, gate = self._layer(**kwargs)
+        with torch.no_grad():
+            layer.slot_B.weight.copy_(torch.randn_like(layer.slot_B.weight))
+        return layer, gate
+
+    def _x(self, batch=4, in_features=16, dtype=torch.float64, requires_grad=False):
+        return torch.randn(batch, in_features, dtype=dtype, requires_grad=requires_grad)
+
+    # ---- structure -----------------------------------------------------------------
+
+    def test_holds_the_base_and_the_two_slot_sides(self):
+        layer, gate = self._layer()
+        assert [name for name, _ in layer.named_children()] == [
+            "base",
+            "slot_A",
+            "slot_B",
+        ]
+        assert isinstance(layer.slot_A, SlotProj)
+        assert isinstance(layer.slot_B, SlotOut)
+        assert layer.slot_A.weight.shape == (8, 16)  # (sum(ranks), d_in)
+        assert layer.slot_B.weight.shape == (6, 8)  # (d_out, sum(ranks))
+
+    def test_the_slots_share_the_gate_that_was_passed_in(self):
+        # One gate object per MODEL: installing a routing must be one attribute write,
+        # not a walk over the 200-400 gated linears of a 7B student.
+        layer, gate = self._layer()
+        assert layer.slot_B.gate is gate
+
+    def test_slot_parameters_inherit_the_base_dtype_and_device(self):
+        layer, _ = self._layer(dtype=torch.float64)
+        ref = layer.base.weight
+        for p in (layer.slot_A.weight, layer.slot_B.weight):
+            assert p.dtype == ref.dtype
+            assert p.device == ref.device
+
+    def test_scale_and_eps_are_stored_on_the_projection(self):
+        layer, _ = self._layer(scale=0.7, eps=1e-4)
+        assert layer.slot_A.scale == 0.7
+        assert layer.slot_A.eps == 1e-4
+
+    def test_match_mt4_style_scale_is_stored_verbatim(self):
+        # The scale POLICY (sqrt(d_in)/ref_rank, reproducing the row norm of PEFT's
+        # gaussian-initialized A) lives in the injection pass. This class only has to
+        # take the number it is handed and apply it -- see the delta_weight test below.
+        layer, _ = self._layer(in_features=16, scale=(16**0.5) / 128)
+        assert abs(layer.slot_A.scale - (16**0.5) / 128) < 1e-12
+
+    def test_it_is_not_an_fsdp_leaf_but_its_children_are(self):
+        # SlotLoRALinear HAS children, so the leaf predicate skips it and FSDP wraps
+        # slot_A and slot_B individually; the frozen base is left to fold into the
+        # enclosing transformer layer's flat param, which is uniformly frozen.
+        layer, _ = self._layer()
+        assert _fsdp_lora_leaf(layer) is False
+        assert _fsdp_lora_leaf(layer.slot_A) is True
+        assert _fsdp_lora_leaf(layer.slot_B) is True
+        assert _fsdp_lora_leaf(layer.base) is False  # frozen -> not its own flat param
+
+    # ---- freezing and trainability -------------------------------------------------
+
+    def test_base_parameters_are_frozen(self):
+        layer, _ = self._layer()
+        assert layer.base.weight.requires_grad is False
+        assert layer.base.bias.requires_grad is False
+
+    def test_only_the_two_slot_parameters_are_trainable(self):
+        layer, _ = self._layer()
+        trainable = sorted(n for n, p in layer.named_parameters() if p.requires_grad)
+        assert trainable == ["slot_A.weight", "slot_B.weight"]
+
+    def test_a_rejected_construction_leaves_the_caller_base_untouched(self):
+        # Validation happens BEFORE the base is frozen, so a config error caught here
+        # does not leave the caller holding a half-frozen model.
+        base = nn.Linear(16, 6, dtype=torch.float64)
+        with pytest.raises(ValueError):
+            SlotLoRALinear(base, self.RANKS, 1.0, SlotGate(num_slots=4))
+        assert base.weight.requires_grad is True
+
+    # ---- forward -------------------------------------------------------------------
+
+    def test_output_equals_the_base_exactly_at_init(self):
+        # B is zero-initialized, so ΔW == 0 and the student starts as its base model.
+        layer, gate = self._layer()
+        x = self._x()
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            out = layer(x)
+        assert torch.equal(out, layer.base(x))
+
+    def test_forward_matches_base_plus_delta_weight(self):
+        # THE property the whole merge path rests on. fp64, tight.
+        layer, gate = self._trained()
+        x = self._x()
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            out = layer(x)
+        expected = layer.base(x) + x @ layer.delta_weight().to(x.dtype).T
+        assert torch.allclose(out, expected, atol=1e-12)
+
+    def test_forward_carries_a_sequence_dimension_through(self):
+        layer, gate = self._trained()
+        x = torch.randn(2, 3, 16, dtype=torch.float64)
+        with gate.scoped(_ids(0, 1)):  # one id per SAMPLE, not per token
+            out = layer(x)
+        assert out.shape == (2, 3, 6)
+        expected = layer.base(x) + x @ layer.delta_weight().to(x.dtype).T
+        assert torch.allclose(out, expected, atol=1e-12)
+
+    def test_forward_works_without_a_bias(self):
+        layer, gate = self._trained(bias=False)
+        assert layer.base.bias is None
+        assert sorted(n for n, p in layer.named_parameters() if p.requires_grad) == [
+            "slot_A.weight",
+            "slot_B.weight",
+        ]
+        x = self._x()
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            out = layer(x)
+        expected = layer.base(x) + x @ layer.delta_weight().to(x.dtype).T
+        assert torch.allclose(out, expected, atol=1e-12)
+
+    # ---- gating --------------------------------------------------------------------
+
+    def test_gradient_reaches_only_the_owning_slot_columns(self):
+        # The routing arrives through the SHARED gate holder, never as a call argument:
+        # nothing in this test passes ids to the layer.
+        layer, gate = self._trained()
+        x = self._x(requires_grad=True)
+        with gate.scoped(torch.tensor([0, 0, 0, 0])):
+            layer(x).sum().backward()
+        assert layer.slot_B.weight.grad[:, 0:3].abs().sum() > 0
+        assert torch.count_nonzero(layer.slot_B.weight.grad[:, 3:8]) == 0
+        assert layer.base.weight.grad is None  # frozen
+
+    def test_an_entirely_unrouted_batch_trains_nothing(self):
+        layer, gate = self._trained()
+        x = self._x(requires_grad=True)
+        with gate.scoped(torch.tensor([-1, -1, -1, -1])):
+            layer(x).sum().backward()
+        assert torch.count_nonzero(layer.slot_B.weight.grad) == 0
+        assert torch.count_nonzero(layer.slot_A.weight.grad) == 0
+
+    def test_a_strict_gate_with_no_routing_raises_instead_of_running_ungated(self):
+        layer, _ = self._trained()
+        with pytest.raises(RuntimeError, match="no slot routing"):
+            layer(self._x())
+
+    def test_survives_checkpoint_recomputation(self):
+        # Gradient checkpointing re-runs this forward during backward on the autograd
+        # engine's worker thread; the gate has to still be visible there.
+        layer, gate = self._trained()
+        x = self._x(requires_grad=True)
+        with gate.scoped(torch.tensor([0, 0, 0, 0])):
+            out = checkpoint(layer, x, use_reentrant=False)
+            out.sum().backward()
+        assert torch.count_nonzero(layer.slot_B.weight.grad[:, 3:8]) == 0
+        assert layer.slot_B.weight.grad[:, 0:3].abs().sum() > 0  # not "all zero"
+        assert x.grad.abs().sum() > 0
+
+    # ---- delta_weight --------------------------------------------------------------
+
+    def test_delta_weight_is_exactly_zero_at_init(self):
+        layer, _ = self._layer()
+        assert layer.delta_weight().abs().max().item() == 0.0
+
+    def test_delta_weight_has_the_shape_of_the_base_weight(self):
+        layer, _ = self._trained()
+        assert layer.delta_weight().shape == layer.base.weight.shape
+
+    def test_delta_weight_scales_linearly_with_the_scale(self):
+        # Ā is invariant to the scale of Z, so the ONLY place s enters ΔW is this factor.
+        one, _ = self._trained(scale=1.0)
+        many, _ = self._trained(scale=2.5)
+        assert torch.equal(one.slot_B.weight, many.slot_B.weight)  # same seed
+        assert torch.allclose(many.delta_weight(), 2.5 * one.delta_weight(), atol=1e-12)
+
+    def test_delta_weight_builds_no_graph(self):
+        layer, _ = self._trained()
+        delta = layer.delta_weight()
+        assert delta.requires_grad is False
+        assert delta.grad_fn is None
+        assert layer.slot_A.weight.grad is None
+        assert layer.slot_B.weight.grad is None
+
+    def test_delta_weight_is_never_narrower_than_fp32(self):
+        # fp32 is a FLOOR, the same convention orthogonalize uses: a bf16 adapter is
+        # widened, a fp64 one is NOT thrown away.
+        bf16, _ = self._trained(dtype=torch.bfloat16)
+        assert bf16.delta_weight().dtype == torch.float32
+        fp32, _ = self._trained(dtype=torch.float32)
+        assert fp32.delta_weight().dtype == torch.float32
+        fp64, _ = self._trained(dtype=torch.float64)
+        assert fp64.delta_weight().dtype == torch.float64
+
+    def test_delta_weight_keeps_its_precision_inside_an_ambient_autocast(self):
+        # autocast intercepts per op, so the B @ Ā matmul would be demoted to bf16 even
+        # though both operands were widened by hand -- silently halving the precision of
+        # every merged checkpoint produced from inside an autocast region.
+        layer, _ = self._trained(dtype=torch.float32)
+        outside = layer.delta_weight()
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            inside = layer.delta_weight()
+        assert inside.dtype == torch.float32
+        assert torch.equal(inside, outside)
+
+    # ---- the merge the converter actually performs ----------------------------------
+
+    def _merged(self, layer, bias=None):
+        merged = nn.Linear(
+            layer.base.in_features,
+            layer.base.out_features,
+            bias=bias is not None,
+            dtype=layer.base.weight.dtype,
+        )
+        with torch.no_grad():
+            merged.weight.copy_(layer.base.weight + layer.delta_weight())
+            if bias is not None:
+                merged.bias.copy_(bias)
+        return merged
+
+    def test_a_merged_plain_linear_reproduces_the_gated_forward(self):
+        layer, gate = self._trained()
+        x = self._x()
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            trained = layer(x)
+        merged = self._merged(layer, bias=layer.base.bias)
+        assert torch.allclose(merged(x), trained, atol=1e-12)
+
+    def test_the_merge_test_would_catch_a_doubled_bias(self):
+        # delta_weight() is WEIGHT-only; the bias belongs to the base and must be
+        # carried over ONCE. A converter that adds it into both halves passes every
+        # weight-space check and produces a model that is wrong by exactly one bias.
+        layer, gate = self._trained()
+        x = self._x()
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            trained = layer(x)
+        doubled = self._merged(layer, bias=layer.base.bias * 2)
+        assert not torch.allclose(doubled(x), trained, atol=1e-12)
+        assert torch.allclose(doubled(x) - trained, layer.base.bias.expand_as(trained))
+
+    def test_the_merge_test_would_catch_a_dropped_bias(self):
+        layer, gate = self._trained()
+        x = self._x()
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            trained = layer(x)
+        assert not torch.allclose(self._merged(layer)(x), trained, atol=1e-12)
+
+    def test_the_checkpoint_carries_everything_the_merge_needs(self):
+        # The converter rebuilds this structure, loads the state dict with
+        # missing == unexpected == 0, and merges. Z is what is stored -- never Ā.
+        layer, _ = self._trained(scale=0.7)
+        state = layer.state_dict()
+        assert set(state) == {
+            "base.weight",
+            "base.bias",
+            "slot_A.weight",
+            "slot_A._extra_state",
+            "slot_B.weight",
+        }
+        fresh, _ = self._layer(scale=0.7)
+        report = fresh.load_state_dict(state, strict=True)
+        assert report.missing_keys == [] and report.unexpected_keys == []
+        assert torch.equal(fresh.delta_weight(), layer.delta_weight())
+
+    # ---- diagnostics ---------------------------------------------------------------
+
+    def test_arm_diag_arms_both_halves_of_the_same_layer(self):
+        # The two halves of ⟨ΔW_s, ΔW_t⟩_F must come from ONE layer. Walking a model for
+        # "the first SlotProj" and "the first SlotOut" separately pairs them by module
+        # registration order, and a mismatched pair has the right SHAPES in a model whose
+        # layers are all d_in x d_out -- a wrong number, not an error.
+        layer, gate = self._trained()
+        layer.arm_diag()
+        assert layer.slot_A._collect_diag is True
+        assert layer.slot_B._collect_diag is True
+        assert layer.slot_A._diag is None and layer.slot_B._diag is None
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            layer(self._x())
+        assert layer.slot_A._diag is not None and layer.slot_B._diag is not None
+        assert layer.slot_A._collect_diag is False
+        assert layer.slot_B._collect_diag is False
+
+    def test_arm_diag_arms_only_the_layer_it_was_called_on(self):
+        armed, gate = self._trained()
+        other, _ = self._trained()
+        other.slot_B.gate = gate
+        armed.arm_diag()
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            x = self._x()
+            armed(x)
+            other(x)
+        assert armed.slot_A._diag is not None
+        assert other.slot_A._diag is None and other.slot_B._diag is None
+
+    def test_re_arming_without_a_forward_reads_absent_not_stale(self):
+        layer, gate = self._trained()
+        layer.arm_diag()
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            layer(self._x())
+        layer.arm_diag()
+        assert layer.slot_A._diag is None and layer.slot_B._diag is None
+
+    # ---- construction-time validation ----------------------------------------------
+
+    def test_a_rank_wider_than_the_input_is_rejected(self):
+        with pytest.raises(ValueError, match="total_rank <= in_features"):
+            self._layer(in_features=4)  # sum(RANKS) == 8 > 4
+
+    def test_a_gate_whose_slot_count_disagrees_is_rejected(self):
+        with pytest.raises(ValueError, match="num_slots=4"):
+            self._layer(num_slots=4)
+
+    def test_a_base_that_carries_its_own_adapter_is_rejected(self):
+        # A PEFT lora.Linear IS an nn.Linear subclass, and wrapping one would put a
+        # second adapter inside `base` that delta_weight() knows nothing about: the
+        # merged checkpoint would silently drop it.
+        base = nn.Linear(16, 6, dtype=torch.float64)
+        base.lora_A = nn.Linear(16, 4, bias=False, dtype=torch.float64)
+        with pytest.raises(ValueError, match="child module"):
+            SlotLoRALinear(base, self.RANKS, 1.0, SlotGate(num_slots=2))
+
+    def test_a_non_linear_base_is_rejected(self):
+        with pytest.raises(ValueError, match="nn.Linear"):
+            SlotLoRALinear(
+                nn.Conv1d(16, 6, 1, dtype=torch.float64),
+                self.RANKS,
+                1.0,
+                SlotGate(num_slots=2),
+            )
+
+
+class TestSlotLoRALinearBf16:
+    """bf16 is the production dtype; the rest of the class is exercised in fp64."""
+
+    RANKS = (3, 5)
+
+    def _layer(self, in_features=16, out_features=6, scale=0.7):
+        torch.manual_seed(3)
+        base = nn.Linear(in_features, out_features, dtype=torch.bfloat16)
+        gate = SlotGate(num_slots=len(self.RANKS))
+        layer = SlotLoRALinear(base, self.RANKS, scale, gate)
+        with torch.no_grad():
+            layer.slot_B.weight.copy_(torch.randn_like(layer.slot_B.weight) * 0.1)
+        return layer, gate
+
+    def test_bf16_base_gives_bf16_slots_and_a_bf16_output(self):
+        layer, gate = self._layer()
+        assert layer.slot_A.weight.dtype == torch.bfloat16
+        assert layer.slot_B.weight.dtype == torch.bfloat16
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            out = layer(torch.randn(4, 16, dtype=torch.bfloat16))
+        assert out.dtype == torch.bfloat16
+        assert out.shape == (4, 6)
+
+    def test_bf16_backward_routes_gradient_to_the_owner_only(self):
+        layer, gate = self._layer()
+        x = torch.randn(4, 16, dtype=torch.bfloat16, requires_grad=True)
+        with gate.scoped(torch.tensor([0, 0, 0, 0])):
+            layer(x).sum().backward()
+        assert layer.slot_B.weight.grad.dtype == torch.bfloat16
+        assert torch.isfinite(layer.slot_B.weight.grad).all()
+        assert layer.slot_B.weight.grad[:, 0:3].abs().sum() > 0
+        assert torch.count_nonzero(layer.slot_B.weight.grad[:, 3:8]) == 0
+
+    def test_the_merged_bf16_weight_agrees_to_the_bf16_rounding_floor(self):
+        # The training forward computes Ā, h and the per-slot matmuls in bf16; the merge
+        # forms ΔW in fp32 and rounds ONCE into the base weight. The two therefore agree
+        # only to bf16 rounding, never bitwise: measured max|Δ| 3.906e-3 against max|out|
+        # 2.281 here (relative 1.7e-3), and 3.4e-3 relative Frobenius at the production
+        # shape (R=256, d_in=4096) -- see the delta_weight docstring.
+        layer, gate = self._layer()
+        x = torch.randn(4, 16, dtype=torch.bfloat16)
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            trained = layer(x).float()
+        merged = nn.Linear(16, 6, dtype=torch.bfloat16)
+        with torch.no_grad():
+            merged.weight.copy_(
+                layer.base.weight + layer.delta_weight().to(torch.bfloat16)
+            )
+            merged.bias.copy_(layer.base.bias)
+        assert (merged(x).float() - trained).abs().max() <= 2e-2 * trained.abs().max()

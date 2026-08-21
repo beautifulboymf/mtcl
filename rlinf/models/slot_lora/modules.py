@@ -20,14 +20,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ``_pinned_precision`` is imported across modules WITHIN this package on purpose. The
-# diagnostic Gram below must be formed under the same "no autocast, no TF32" guard that
-# :func:`orthogonalize` computes under, and a second copy of that guard living here
-# could drift from the one it has to agree with. It stays underscored because it is
+# ``_pinned_precision`` and ``_compute_dtype`` are imported across modules WITHIN this
+# package on purpose. The diagnostic Gram below, and the merged ΔW further down, must be
+# formed under the same "no autocast, no TF32" guard and the same fp32 FLOOR that
+# :func:`orthogonalize` computes under, and a second copy of either rule living here
+# could drift from the one it has to agree with. They stay underscored because they are
 # package-internal precision plumbing, not something the rest of the repo should reach
-# for -- and promoting it would mean editing ``orth.py`` to widen an API that has
-# exactly one other caller.
-from rlinf.models.slot_lora.orth import _pinned_precision, orthogonalize
+# for -- and promoting them would mean editing ``orth.py`` to widen an API that has
+# exactly two other callers.
+from rlinf.models.slot_lora.orth import (
+    _compute_dtype,
+    _pinned_precision,
+    orthogonalize,
+)
 
 
 def _check_gate_ids(ids: Optional[torch.Tensor], num_slots: Optional[int]) -> None:
@@ -782,3 +787,214 @@ class SlotOut(nn.Module):
             contribution = torch.where(owns, contribution, contribution.detach())
             out = contribution if out is None else out + contribution
         return out
+
+
+class SlotLoRALinear(nn.Module):
+    """A frozen ``nn.Linear`` plus K per-suite LoRA slots on mutually orthogonal subspaces.
+
+    This is the only thing the rest of the model sees. It exists because the two slot
+    modules above are each deliberately a LEAF -- that is what earns them their own FSDP
+    flat parameter (``rlinf/hybrid_engines/fsdp/utils.py:306``) -- and a leaf cannot also
+    own a base weight and a merge routine. So the composition lives here, one level up,
+    where it costs nothing: this class has CHILDREN and no ``.weight``, so that predicate
+    skips it, ``slot_A`` and ``slot_B`` are still wrapped individually, and the frozen
+    ``base`` is left to fold into the enclosing transformer layer's flat parameter. That
+    is the arrangement ``use_orig_params=False`` (this repo's default,
+    ``rlinf/config.py:419``) needs, since it requires uniform ``requires_grad`` within a
+    flat parameter: everything trainable sits in the two slot units, and what folds into
+    the transformer layer is uniformly FROZEN -- as long as the injection pass freezes
+    every non-slot parameter, which is exactly what it does.
+
+    WHY IT REPLACES PEFT'S ``lora.Linear`` AT ALL. K distillation teachers writing into
+    ONE shared LoRA block overwrite each other: the block has no structure that keeps
+    suite k's update from moving suite j's function. Here ``ΔW = Σ_k B_k Ā_k`` with the
+    row blocks of ``Ā`` mutually orthonormal, so ``⟨ΔW_s, ΔW_t⟩_F = tr(B_sᵀB_t ·
+    Ā_tĀ_sᵀ)`` vanishes whatever the B side does, and :class:`SlotGate` keeps each
+    sample's gradient inside its own slot. Only the STUDENT is built this way; the
+    teachers and the dual-KL anchor keep using PEFT and are untouched.
+
+    IT IS THE IDENTITY AT INITIALIZATION. ``B`` is zero, so ``ΔW`` is exactly zero and
+    the student's first forward is its base model's, bit for bit -- not approximately.
+    That is what makes injection safe to switch on mid-project without moving any
+    baseline.
+
+    THE MERGE IS THE OTHER HALF OF THIS CLASS. A checkpoint is worthless if it cannot be
+    turned back into a plain HF model, and the conversion is ``W <- W + delta_weight()``
+    followed by swapping this module out for its ``base``. That path is only correct if
+    :meth:`delta_weight` reproduces what the forward actually computed, which is why it
+    recomputes ``Ā`` from the stored ``Z`` through :meth:`SlotProj.orth_weight` -- the
+    same call the forward makes -- rather than re-deriving it some other way. ``Z`` is
+    what the checkpoint carries; ``Ā`` is never stored, and it is never a random seed to
+    be replayed.
+    """
+
+    def __init__(
+        self,
+        base: nn.Linear,
+        slot_ranks: "tuple[int, ...]",
+        scale: float,
+        gate: SlotGate,
+        eps: float = 1e-6,
+    ):
+        """Wrap one linear, freeze it, and give it its slots.
+
+        Args:
+            base: The ``nn.Linear`` to adapt. Taken over by reference and frozen in
+                place; the slots inherit its dtype and device, so it must already be
+                where and what the model wants it to be.
+            slot_ranks: Per-slot rank, one entry per slot, in slot-index order. Their
+                sum is the width of the shared orthonormal basis and must not exceed
+                ``base.in_features``.
+            scale: LoRA scaling ``s``, applied once, on the ``Ā`` side. The POLICY that
+                picks the number (matching the row norm of PEFT's gaussian-initialized
+                A, so ``ΔW`` moves at the same rate on step 1 and the learning rate is
+                not a hidden variable in the comparison) lives in the injection pass;
+                this class applies whatever it is handed and records it in the
+                checkpoint via :meth:`SlotProj.get_extra_state`.
+            gate: The model's single :class:`SlotGate`, shared by every gated module.
+                Passed to :class:`SlotOut`, which reads it inside every forward.
+            eps: Passed through to :func:`orthogonalize`.
+
+        Raises:
+            ValueError: if ``base`` is not a childless ``nn.Linear``, if the ranks do
+                not fit the input width, or if ``gate``'s slot count disagrees with
+                ``slot_ranks``.
+        """
+        super().__init__()
+        if not isinstance(base, nn.Linear):
+            raise ValueError(
+                f"SlotLoRALinear wraps an nn.Linear; got {type(base).__name__}. The "
+                "merge path assumes a (d_out, d_in) `weight` and an optional `bias`, "
+                "so a module that stores its weight transposed (HF Conv1D) or "
+                "quantized would merge into a silently wrong ΔW."
+            )
+        if list(base.named_children()):
+            raise ValueError(
+                f"SlotLoRALinear was handed a base with child module(s) "
+                f"{[n for n, _ in base.named_children()]}. A PEFT `lora.Linear` IS an "
+                "nn.Linear subclass, and wrapping one would hide a SECOND adapter "
+                "inside `base` that delta_weight() knows nothing about: training would "
+                "work, and the merged checkpoint would silently drop it. Wrap the "
+                "plain linear, before any other adapter."
+            )
+        ranks = tuple(int(r) for r in slot_ranks)
+        ref = base.weight
+        # The children are built BEFORE the base is frozen, so a config error they
+        # reject (a rank wider than the input, a gate whose slot count disagrees) leaves
+        # the caller's model exactly as it was rather than half frozen by a constructor
+        # that then raised.
+        self.base = base
+        self.slot_A = SlotProj(
+            base.in_features,
+            sum(ranks),
+            scale,
+            eps,
+            dtype=ref.dtype,
+            device=ref.device,
+        )
+        self.slot_B = SlotOut(
+            base.out_features, ranks, gate, dtype=ref.dtype, device=ref.device
+        )
+        for param in self.base.parameters():
+            param.requires_grad_(False)
+
+    def arm_diag(self) -> None:
+        """Arm the orthogonality/interference diagnostics on BOTH halves of this layer.
+
+        Exposed here, rather than left to a consumer reaching into ``slot_A`` and
+        ``slot_B``, because the two halves are only meaningful TOGETHER and only from
+        the SAME layer: ``⟨ΔW_s, ΔW_t⟩_F`` pairs this layer's ``Ā_tĀ_sᵀ`` block with
+        this layer's ``B_tᵀB_s``. A consumer that walks the model for "the first
+        SlotProj" and "the first SlotOut" separately pairs them by module registration
+        order, and in a 7B model full of same-shaped projections a mismatched pair has
+        the right shapes and yields a WRONG NUMBER rather than an error. One call on one
+        layer removes that failure mode entirely.
+
+        Both halves clear their previous readings; see :meth:`SlotProj.arm_diag` for why
+        arming must never leave a stale one behind.
+        """
+        self.slot_A.arm_diag()
+        self.slot_B.arm_diag()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``base(x) + Σ_k B_k (s · Ā_k x)``.
+
+        The routing is NOT an argument: it reaches :class:`SlotOut` through the shared
+        gate the model installed for this micro-batch, because this layer is called by
+        code (a HuggingFace attention block) that knows nothing about slots.
+
+        Args:
+            x: Input of shape ``(B, ..., d_in)``, where ``B`` is the micro-batch the
+                installed routing describes.
+
+        Returns:
+            The adapted output, of shape ``(B, ..., d_out)``.
+        """
+        return self.base(x) + self.slot_B(self.slot_A(x))
+
+    @torch.no_grad()
+    def delta_weight(self) -> torch.Tensor:
+        """``s · B Ā`` -- exactly what the merge adds into the base weight.
+
+        THE ONE INVARIANT: this must equal what the forward computed, or every converted
+        checkpoint is silently wrong -- it still loads, still runs, and is simply a
+        different model than the one that was trained. So ``Ā`` is recomputed from the
+        stored ``Z`` through :meth:`SlotProj.orth_weight`, the same call
+        :meth:`SlotProj.forward` makes, rather than through a "more accurate" fp32
+        re-derivation of ``Ā`` from the same ``Z``. Those two are NOT the same matrix:
+        ``orth_weight`` returns in the PARAMETER's dtype, so in production the forward
+        consumes a bf16 ``Ā`` whose entries sit at the bf16 rounding floor, 1.66e-3
+        relative Frobenius away from the fp32 one (measured at R=256, 3 seeds: 1.661e-3
+        to 1.670e-3 at d_in=1024 and 1.662e-3 to 1.664e-3 at d_in=4096, i.e. the same
+        floor at both widths), and that difference passes 1:1 into ``ΔW``.
+
+        THE FP32 ``Ā`` IS THE MORE ACCURATE MATRIX AND THE WRONG ONE TO MERGE. Measured
+        against the adapter output the TRAINING forward actually produced, this route is
+        closer at every width and seed: 3.70e-3 relative versus 4.05e-3 for the fp32
+        re-derivation (R=256, bf16; 3.69-3.71e-3 vs 4.04-4.07e-3 across 3 seeds at both
+        widths). Neither is zero, because the training forward rounds ``h`` to bf16
+        between the two matmuls and this one does not; the point is that reproducing the
+        trained model beats improving on it. Downstream of the merge that margin is
+        swallowed anyway -- ``ΔW`` is rounded into the bf16 base weight (1.6e-3 to 1.8e-3
+        relative on ``W`` by itself), leaving the two routes indistinguishable at the
+        merged model's OUTPUT (3.38e-3 vs 3.36e-3 at d_in=1024, 3.48e-3 vs 3.51e-3 at
+        4096) -- so this choice buys correctness of definition, not accuracy.
+
+        PRECISION IS A FLOOR, NOT A CAST. The product is formed no NARROWER than fp32,
+        which is what matters in production (bf16 ``B @ Ā`` at R=256 is not a merge, it
+        is a second rounding), but a parameter that is already WIDER keeps its own dtype
+        rather than being thrown away -- the same convention :func:`orthogonalize` uses,
+        which is what lets the fp64 tests assert this identity to 1e-12 instead of to
+        fp32 slop. The whole thing runs under ``_pinned_precision``: autocast intercepts
+        per op, so an ambient bf16 region would demote the ``B @ Ā`` matmul even though
+        both operands were widened by hand, and TF32 (process-global, and turned on
+        elsewhere in this repo) would leave that matmul with 10 mantissa bits.
+
+        WHAT IT DOES NOT COVER IS THE BIAS. ``ΔW`` is weight-only; the bias lives on
+        ``base`` and the merge carries it over unchanged, exactly once.
+
+        IT NEEDS THE WHOLE ``Z``. ``Ā = (Z Zᵀ)^(-1/2) Z`` is not computable from a slice
+        of ``Z``, so this must run on an UNSHARDED module: the converter's plain model,
+        or inside ``summon_full_params``. Under FSDP with ``use_orig_params=False`` the
+        slot parameters carry sharded views outside the module's own forward, and
+        orthogonalizing a fragment of ``Z`` is a different matrix, not an approximation
+        of the right one.
+
+        Returns:
+            ``(d_out, d_in)``, detached, in fp32 or wider. Exactly zero at
+            initialization.
+        """
+        compute_dtype = _compute_dtype(self.slot_A.weight.dtype)
+        with _pinned_precision(self.slot_A.weight.device.type):
+            # The scale is folded into Ā in the PARAMETER's dtype, before widening,
+            # because that is where SlotProj.forward folds it (``orth_weight() *
+            # self.scale``). It is not cosmetic at every width: with the match_mt4
+            # policy s = sqrt(d_in)/128, which at d_in 1024 and 4096 is 0.25 and 0.5 --
+            # exact powers of two, so bf16 rounds nothing and the two placements are
+            # BITWISE identical. At any other width it rounds: measured relative error
+            # against the training forward's adapter output, folding it in first gives
+            # 3.78e-3 vs 4.13e-3 at d_in=2048 and 3.70e-3 vs 4.07e-3 at d_in=11008
+            # (llama-7b's MLP width), the same margin as the Ā route above and for the
+            # same reason.
+            a = (self.slot_A.orth_weight() * self.slot_A.scale).to(compute_dtype)
+            return self.slot_B.weight.to(compute_dtype) @ a
