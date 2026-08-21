@@ -422,6 +422,97 @@ class TestSlotProjRankValidation:
             SlotProj(8, 16, 1.0)
 
 
+class TestSlotProjScaleValidation:
+    """s = 0 is a PERMANENTLY DEAD adapter that reports nothing at all.
+
+    Measured before this check existed: with scale=0.0 the wrapper's forward is
+    BITWISE the frozen base's, both weight.grad tensors stay at exactly zero non-zero
+    elements, and |delta-W|max is 0.0 for the whole run -- no error, no NaN, and a loss
+    curve that is simply the base model's. The injection pass derives
+    s = sqrt(d_in) / ref_rank from config, so a missing key or a zero ref_rank produces
+    exactly that. SlotOut already rejects a non-positive rank and SlotGate a
+    non-positive slot count with the same reasoning; scale was the one that got missed.
+    """
+
+    def test_zero_scale_raises_naming_the_value(self):
+        with pytest.raises(ValueError, match="scale=0.0"):
+            SlotProj(32, 8, 0.0)
+
+    def test_negative_scale_raises_naming_the_value(self):
+        with pytest.raises(ValueError, match="scale=-1.5"):
+            SlotProj(32, 8, -1.5)
+
+    def test_nan_scale_raises(self):
+        with pytest.raises(ValueError, match="scale=nan"):
+            SlotProj(32, 8, float("nan"))
+
+    def test_inf_scale_raises(self):
+        with pytest.raises(ValueError, match="scale=inf"):
+            SlotProj(32, 8, float("inf"))
+
+    def test_negative_inf_scale_raises(self):
+        with pytest.raises(ValueError, match="scale=-inf"):
+            SlotProj(32, 8, float("-inf"))
+
+    def test_a_very_small_positive_scale_is_allowed(self):
+        # Only ZERO is dead. A small-but-finite s is a legitimate (if timid) config,
+        # and this class must not turn a knob into a policy.
+        assert SlotProj(32, 8, 1e-8).scale == 1e-8
+
+    def test_the_mt4_style_scale_is_allowed(self):
+        assert SlotProj(1024, 8, (1024**0.5) / 128).scale == (1024**0.5) / 128
+
+    def test_it_raises_before_allocating_the_parameter(self):
+        # A constructor check, like the rank one: a dead scale must not cost a 7B
+        # model build and an FSDP wrap before it says anything.
+        with pytest.raises(ValueError):
+            SlotProj(32, 8, 0.0)
+
+    def test_the_rank_check_still_runs_first(self):
+        # Both are wrong here; the rank message is the one that names the shape, and
+        # a scale check that jumped the queue would hide it.
+        with pytest.raises(ValueError, match="total_rank"):
+            SlotProj(8, 16, 0.0)
+
+
+class TestSlotProjOrthWeightCollect:
+    """orth_weight() CONSUMES an arming; the merge path must be able to opt out.
+
+    ``_diag`` is a paired measurement -- SlotProj contributes the Gram and SlotOut the
+    cross blocks -- and both halves have to describe the SAME moment. A merge that
+    silently disarmed the A side would leave the two halves separated by an optimizer
+    step, and would also write ``_diag`` from something that is not a forward, breaking
+    arm_diag's "None means not collected, full stop".
+    """
+
+    def _proj(self):
+        torch.manual_seed(0)
+        return SlotProj(32, 8, 0.7, dtype=torch.float64)
+
+    def test_the_default_still_consumes_the_arming(self):
+        proj = self._proj()
+        proj.arm_diag()
+        proj.orth_weight()
+        assert proj._collect_diag is False
+        assert proj._diag is not None
+
+    def test_collect_false_leaves_the_arming_untouched(self):
+        proj = self._proj()
+        proj.arm_diag()
+        proj.orth_weight(collect=False)
+        assert proj._collect_diag is True
+        assert proj._diag is None
+
+    def test_collect_false_returns_the_same_matrix(self):
+        proj = self._proj()
+        assert torch.equal(proj.orth_weight(collect=False), proj.orth_weight())
+
+    def test_collect_false_is_a_no_op_on_an_unarmed_module(self):
+        proj = self._proj()
+        proj.orth_weight(collect=False)
+        assert proj._collect_diag is False and proj._diag is None
+
+
 class TestSlotProjExtraState:
     """scale is config, not a tensor -- but the checkpoint still has to record it.
 
@@ -1317,6 +1408,23 @@ class TestSlotLoRALinear:
         assert layer.slot_A.weight.shape == (8, 16)  # (sum(ranks), d_in)
         assert layer.slot_B.weight.shape == (6, 8)  # (d_out, sum(ranks))
 
+    def test_the_base_is_held_by_reference_not_copied(self):
+        # The repo's weight-sync path writes model parameters IN PLACE
+        # (bucket_syncer / fsdp_model_manager copy into the live tensors), so a
+        # constructor that deep-copied or re-created the base would take the frozen
+        # weights out of the graph the syncer writes to: the rollout policy would
+        # quietly keep the weights it was built with. Every other test in this class
+        # passes under a copying implementation.
+        torch.manual_seed(2)
+        base = nn.Linear(16, 6, dtype=torch.float64)
+        weight = base.weight
+        layer = SlotLoRALinear(base, self.RANKS, 0.7, SlotGate(num_slots=2))
+        assert layer.base is base
+        assert layer.base.weight is weight
+        with torch.no_grad():
+            weight.add_(1.0)  # what an in-place weight sync does
+        assert torch.equal(layer.base.weight, weight)
+
     def test_the_slots_share_the_gate_that_was_passed_in(self):
         # One gate object per MODEL: installing a routing must be one attribute write,
         # not a walk over the 200-400 gated linears of a 7B student.
@@ -1414,6 +1522,38 @@ class TestSlotLoRALinear:
         assert torch.allclose(out, expected, atol=1e-12)
 
     # ---- gating --------------------------------------------------------------------
+
+    def test_an_ungated_window_takes_the_single_matmul_path_and_matches_the_merge(self):
+        # eval and rollout run inside gate.ungated(), where SlotOut does ONE matmul
+        # over the whole of B instead of accumulating K per-slot terms. That is the
+        # path the acting policy uses and therefore the path the MERGED checkpoint has
+        # to reproduce, and nothing in this class covered it through the wrapper.
+        layer, gate = self._trained()
+        x = self._x()
+        with gate.ungated():
+            out = layer(x)
+        expected = layer.base(x) + x @ layer.delta_weight().to(x.dtype).T
+        assert torch.allclose(out, expected, atol=1e-12)
+
+    def test_the_ungated_and_gated_paths_agree_on_the_value(self):
+        # Same value, different summation order (see SlotOut's docstring): equal to
+        # fp64 slop, never bitwise.
+        layer, gate = self._trained()
+        x = self._x()
+        with gate.ungated():
+            ungated = layer(x)
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            gated = layer(x)
+        assert torch.allclose(ungated, gated, atol=1e-12)
+
+    def test_an_ungated_window_lets_every_slot_take_gradient(self):
+        # The flip side: no routing means no isolation. Pinned so that "ungated" can
+        # never quietly become "routed to slot 0".
+        layer, gate = self._trained()
+        with gate.ungated():
+            layer(self._x(requires_grad=True)).sum().backward()
+        assert layer.slot_B.weight.grad[:, 0:3].abs().sum() > 0
+        assert layer.slot_B.weight.grad[:, 3:8].abs().sum() > 0
 
     def test_gradient_reaches_only_the_owning_slot_columns(self):
         # The routing arrives through the SHARED gate holder, never as a call argument:
@@ -1594,6 +1734,53 @@ class TestSlotLoRALinear:
         layer.arm_diag()
         assert layer.slot_A._diag is None and layer.slot_B._diag is None
 
+    def test_delta_weight_does_not_consume_an_armed_diagnostic(self):
+        # delta_weight() reaches into slot_A.orth_weight(), which is also what ARMS
+        # consume. Measured before this was fixed: a merge between arm_diag() and the
+        # forward disarmed the A side and stashed its Gram from the merge -- so
+        # _diag["gram"] described the pre-step Z while _diag["cross"] described the
+        # post-step B, and arm_diag's "None means not collected" no longer held.
+        layer, gate = self._trained()
+        layer.arm_diag()
+        layer.delta_weight()
+        assert layer.slot_A._collect_diag is True
+        assert layer.slot_A._diag is None
+        assert layer.slot_B._collect_diag is True
+        assert layer.slot_B._diag is None
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            layer(self._x())
+        assert layer.slot_A._diag is not None and layer.slot_B._diag is not None
+        assert layer.slot_A._collect_diag is False
+        assert layer.slot_B._collect_diag is False
+
+    def test_both_halves_describe_the_moment_of_the_forward_not_of_the_merge(self):
+        # The behavioural half of the test above. `scale` is read straight into
+        # _diag, so changing it between the merge and the forward makes the two
+        # moments distinguishable: a consumed arming reports the merge's value.
+        layer, gate = self._trained(scale=0.7)
+        layer.arm_diag()
+        layer.delta_weight()
+        layer.slot_A.scale = 2.5  # stands in for the step that lands in between
+        with gate.scoped(_ids(0, 1, 0, -1)):
+            layer(self._x())
+        assert layer.slot_A._diag["scale"] == 2.5
+
+    def test_a_merge_that_raises_still_leaves_the_arming_intact(self):
+        # The merge path must not need an unwind to keep its promise: nothing it does
+        # mutates the arming, so there is no window an exception can leave open.
+        layer, _ = self._trained()
+        layer.arm_diag()
+        layer.slot_B.weight = nn.Parameter(torch.zeros(6, 99, dtype=torch.float64))
+        with pytest.raises(RuntimeError):
+            layer.delta_weight()
+        assert layer.slot_A._collect_diag is True
+        assert layer.slot_A._diag is None
+
+    def test_an_unarmed_merge_records_nothing(self):
+        layer, _ = self._trained()
+        layer.delta_weight()
+        assert layer.slot_A._diag is None and layer.slot_B._diag is None
+
     # ---- construction-time validation ----------------------------------------------
 
     def test_a_rank_wider_than_the_input_is_rejected(self):
@@ -1605,13 +1792,29 @@ class TestSlotLoRALinear:
             self._layer(num_slots=4)
 
     def test_a_base_that_carries_its_own_adapter_is_rejected(self):
-        # A PEFT lora.Linear IS an nn.Linear subclass, and wrapping one would put a
-        # second adapter inside `base` that delta_weight() knows nothing about: the
-        # merged checkpoint would silently drop it.
+        # An nn.Linear SUBCLASS that hides an adapter in a child module would put a
+        # second delta-W inside `base` that delta_weight() knows nothing about: the
+        # merged checkpoint would silently drop it. Note that the pinned peft does NOT
+        # reach this guard -- see the test below for which one it actually hits.
         base = nn.Linear(16, 6, dtype=torch.float64)
         base.lora_A = nn.Linear(16, 4, bias=False, dtype=torch.float64)
         with pytest.raises(ValueError, match="child module"):
             SlotLoRALinear(base, self.RANKS, 1.0, SlotGate(num_slots=2))
+
+    def test_a_real_peft_lora_linear_hits_the_isinstance_guard(self):
+        # Pins WHICH guard fires, because the two messages say different things and
+        # the answer is version-dependent. peft's lora.Linear was an nn.Linear
+        # subclass before 0.4; at the pinned 0.11.1 its MRO is
+        # ['Linear', 'Module', 'LoraLayer', 'BaseTunerLayer', 'ABC', 'object'] -- not
+        # an nn.Linear at all -- so it is refused by the isinstance guard and the
+        # child-module guard never gets a look at it.
+        lora = pytest.importorskip("peft.tuners.lora")
+        base = nn.Linear(16, 6, dtype=torch.float64)
+        adapted = lora.Linear(base, adapter_name="default", r=4)
+        assert not isinstance(adapted, nn.Linear)
+        assert [n for n, _ in adapted.named_children()]  # would trip the other guard
+        with pytest.raises(ValueError, match="wraps an nn.Linear"):
+            SlotLoRALinear(adapted, self.RANKS, 1.0, SlotGate(num_slots=2))
 
     def test_a_non_linear_base_is_rejected(self):
         with pytest.raises(ValueError, match="nn.Linear"):
@@ -1621,6 +1824,126 @@ class TestSlotLoRALinear:
                 1.0,
                 SlotGate(num_slots=2),
             )
+
+    def test_a_quantized_base_is_rejected_for_its_dtype(self):
+        # bitsandbytes' Linear8bitLt / Linear4bit ARE nn.Linear subclasses with no
+        # children, so they sail past both guards above. Measured before this check
+        # existed: construction got as far as nn.Parameter(torch.empty(..., uint8))
+        # and died with an unrelated RuntimeError about integer parameters. A
+        # non-float base cannot be merged -- delta_weight() would be added into a
+        # quantized weight -- so it is refused by NAME here.
+        base = nn.Linear(16, 6)
+        base.weight = nn.Parameter(
+            torch.zeros(6, 16, dtype=torch.uint8), requires_grad=False
+        )
+        with pytest.raises(ValueError, match="floating-point"):
+            SlotLoRALinear(base, self.RANKS, 1.0, SlotGate(num_slots=2))
+
+    def test_an_empty_slot_ranks_is_rejected_with_a_message_about_slots(self):
+        # sum(()) == 0 used to reach SlotProj first, which reported
+        # "total_rank=0, in_features=16" -- a rank complaint for what is really "you
+        # asked for no slots at all", and SlotOut's clearer message was unreachable.
+        # A countless gate, so that the empty rank list is the ONLY thing wrong here.
+        base = nn.Linear(16, 6, dtype=torch.float64)
+        with pytest.raises(ValueError, match="at least one slot"):
+            SlotLoRALinear(base, (), 0.7, SlotGate())
+
+    def test_a_lazy_linear_is_rejected_by_name(self):
+        # nn.LazyLinear is an nn.Linear subclass with no children whose in_features is
+        # 0 until its first forward, so it too reached SlotProj and reported
+        # "in_features=0" -- true, and useless.
+        with pytest.raises(ValueError, match="in_features > 0"):
+            SlotLoRALinear(nn.LazyLinear(6), self.RANKS, 1.0, SlotGate(num_slots=2))
+
+    def test_a_zero_scale_is_rejected_through_the_wrapper(self):
+        # The wrapper hands `scale` straight to SlotProj, so the guard covers both.
+        with pytest.raises(ValueError, match="scale=0.0"):
+            self._layer(scale=0.0)
+
+    def test_a_non_finite_scale_is_rejected_through_the_wrapper(self):
+        with pytest.raises(ValueError, match="scale=nan"):
+            self._layer(scale=float("nan"))
+
+    def test_a_rejected_scale_leaves_the_caller_base_untouched(self):
+        base = nn.Linear(16, 6, dtype=torch.float64)
+        with pytest.raises(ValueError, match="scale"):
+            SlotLoRALinear(base, self.RANKS, 0.0, SlotGate(num_slots=2))
+        assert base.weight.requires_grad is True
+
+
+class TestSlotLoRALinearSlotCounts:
+    """K == 1 and K >= 3. Everything else in this file is pinned at K == 2 only.
+
+    The wrapper computes ``sum(slot_ranks)`` for SlotProj while SlotOut computes the
+    column offsets independently from the same tuple, so the two have to agree for
+    every K. At the single shape the rest of the class uses -- RANKS = (3, 5) -- a
+    great many wrong pairings still line up.
+    """
+
+    RANK_SETS = [(4,), (2, 3, 4), (1, 1, 1, 1, 1)]
+
+    def _layer(self, ranks, in_features=16, out_features=6, scale=0.7):
+        torch.manual_seed(4)
+        base = nn.Linear(in_features, out_features, dtype=torch.float64)
+        gate = SlotGate(num_slots=len(ranks))
+        layer = SlotLoRALinear(base, ranks, scale, gate)
+        with torch.no_grad():
+            layer.slot_B.weight.copy_(torch.randn_like(layer.slot_B.weight))
+        return layer, gate
+
+    @pytest.mark.parametrize("ranks", RANK_SETS)
+    def test_the_two_halves_agree_on_the_shared_width(self, ranks):
+        layer, _ = self._layer(ranks)
+        assert layer.slot_A.total_rank == sum(ranks)
+        assert layer.slot_B.total_rank == sum(ranks)
+        assert layer.slot_A.weight.shape == (sum(ranks), 16)
+        assert layer.slot_B.weight.shape == (6, sum(ranks))
+        assert layer.slot_B.slot_ranks == ranks
+
+    @pytest.mark.parametrize("ranks", RANK_SETS)
+    def test_forward_matches_base_plus_delta_weight(self, ranks):
+        layer, gate = self._layer(ranks)
+        x = torch.randn(4, 16, dtype=torch.float64)
+        with gate.scoped(torch.zeros(4, dtype=torch.long)):
+            out = layer(x)
+        expected = layer.base(x) + x @ layer.delta_weight().T
+        assert torch.allclose(out, expected, atol=1e-12)
+
+    @pytest.mark.parametrize("ranks", RANK_SETS)
+    def test_delta_weight_is_the_sum_of_the_per_slot_products(self, ranks):
+        # delta-W = sum_k B_k (s . A-bar_k). Pins that SlotOut's offsets carve the SAME
+        # blocks out of B that SlotProj's rows carve out of A-bar.
+        layer, _ = self._layer(ranks)
+        a = layer.slot_A.orth_weight() * layer.slot_A.scale
+        expected = torch.zeros_like(layer.base.weight)
+        for start, rank in zip(layer.slot_B.offsets, layer.slot_B.slot_ranks):
+            stop = start + rank
+            expected = expected + layer.slot_B.weight[:, start:stop] @ a[start:stop]
+        assert torch.allclose(layer.delta_weight(), expected, atol=1e-12)
+
+    @pytest.mark.parametrize("ranks", RANK_SETS)
+    def test_every_slot_owns_exactly_its_own_columns(self, ranks):
+        layer, gate = self._layer(ranks)
+        for k, (start, rank) in enumerate(
+            zip(layer.slot_B.offsets, layer.slot_B.slot_ranks)
+        ):
+            layer.zero_grad(set_to_none=True)
+            with gate.scoped(torch.full((4,), k, dtype=torch.long)):
+                layer(torch.randn(4, 16, dtype=torch.float64)).sum().backward()
+            grad = layer.slot_B.weight.grad
+            assert grad[:, start : start + rank].abs().sum() > 0
+            assert torch.count_nonzero(grad[:, :start]) == 0
+            assert torch.count_nonzero(grad[:, start + rank :]) == 0
+
+    @pytest.mark.parametrize("ranks", RANK_SETS)
+    def test_the_ungated_path_agrees_with_the_gated_one(self, ranks):
+        layer, gate = self._layer(ranks)
+        x = torch.randn(4, 16, dtype=torch.float64)
+        with gate.ungated():
+            ungated = layer(x)
+        with gate.scoped(torch.zeros(4, dtype=torch.long)):
+            gated = layer(x)
+        assert torch.allclose(ungated, gated, atol=1e-12)
 
 
 class TestSlotLoRALinearBf16:
@@ -1673,3 +1996,36 @@ class TestSlotLoRALinearBf16:
             )
             merged.bias.copy_(layer.base.bias)
         assert (merged(x).float() - trained).abs().max() <= 2e-2 * trained.abs().max()
+
+    def test_the_scale_is_folded_into_a_bar_before_the_widening(self):
+        # SlotProj.forward computes orth_weight() * scale in the PARAMETER's dtype, so
+        # the merge has to fold it in at the same place -- multiplying the fp32 product
+        # afterwards is a different number. It is only visible at a scale that is not a
+        # power of two: with the match_mt4 policy s = sqrt(d_in)/128 is exactly 0.25 at
+        # d_in=1024 and 0.5 at 4096, where bf16 rounds nothing and the two placements
+        # are bitwise identical -- which is why this test picks 0.7 and the one below
+        # pins the power-of-two case that cannot tell them apart. At the widths where
+        # they DO differ, folding in first is measurably closer to the training
+        # forward's adapter output at every width and seed; the numbers are in the
+        # delta_weight docstring, and only the ORDER is pinned here.
+        layer, _ = self._layer(scale=0.7)
+        delta = layer.delta_weight()
+        with torch.no_grad():
+            a = layer.slot_A.orth_weight()
+            assert a.dtype == torch.bfloat16
+            folded_in = layer.slot_B.weight.float() @ (a * layer.slot_A.scale).float()
+            folded_after = (
+                layer.slot_B.weight.float() @ a.float()
+            ) * layer.slot_A.scale
+        assert torch.equal(delta, folded_in)
+        assert not torch.equal(delta, folded_after)
+
+    def test_the_two_placements_are_bitwise_equal_at_a_power_of_two_scale(self):
+        # Why the test above has to pick its scale deliberately: at s = 0.25 the
+        # bf16 multiply is exact and the distinction it pins disappears entirely.
+        layer, _ = self._layer(scale=0.25)
+        with torch.no_grad():
+            a = layer.slot_A.orth_weight()
+            folded_in = layer.slot_B.weight.float() @ (a * 0.25).float()
+            folded_after = (layer.slot_B.weight.float() @ a.float()) * 0.25
+        assert torch.equal(folded_in, folded_after)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Optional
@@ -333,15 +334,18 @@ class SlotProj(nn.Module):
             in_features: ``d_in`` of the linear this projects the input of.
             total_rank: ``R``, the summed rank of all slots. Must be
                 ``<= in_features`` or no row-orthonormal Ā exists.
-            scale: LoRA scaling applied to the projection output. See the note on
-                the attribute below.
+            scale: LoRA scaling applied to the projection output. Must be finite and
+                strictly positive -- see the check below for why zero is not merely a
+                degenerate value but a silently dead run. See also the note on the
+                attribute below.
             eps: Passed through to :func:`orthogonalize` as the floor on the
                 Frobenius norm of ``Z Zᵀ``.
             dtype: Parameter dtype; ``None`` uses the torch default.
             device: Parameter device; ``None`` uses the torch default.
 
         Raises:
-            ValueError: if ``0 < total_rank <= in_features`` does not hold.
+            ValueError: if ``0 < total_rank <= in_features`` does not hold, or if
+                ``scale`` is not finite and strictly positive.
         """
         super().__init__()
         self.in_features = int(in_features)
@@ -364,6 +368,30 @@ class SlotProj(nn.Module):
         # It IS persisted, via get_extra_state/set_extra_state -- see there for why
         # the checkpoint has to carry it.
         self.scale = float(scale)
+        # Checked HERE, and not left to the caller, because s = 0 is the quietest
+        # possible failure in this package. Measured with scale=0.0: the wrapper's
+        # forward is BITWISE the frozen base's, both weight.grad tensors come back with
+        # zero non-zero elements, and |ΔW|max is 0.0 -- forever. Nothing errors, nothing
+        # goes NaN, and the loss curve is simply the base model's. The injection pass
+        # derives s = sqrt(d_in) / ref_rank from config, so a missing key or a zero
+        # ref_rank produces exactly that: a whole distillation run that is a no-op and
+        # looks fine. SlotOut already refuses a non-positive slot rank and SlotGate a
+        # non-positive slot count with the same reasoning -- "trains nothing while
+        # still looking routed" -- and scale is the argument that got missed. NaN and
+        # inf are refused for the mirror-image reason: they DO show up, but only as
+        # a NaN loss 200-400 gated linears deep, where the config key that caused it
+        # is no longer visible. Negative s is not rejected as meaningless (it is just a
+        # sign absorbed by B) but as unreachable from any policy that computes it.
+        if not math.isfinite(self.scale) or self.scale <= 0.0:
+            raise ValueError(
+                f"SlotProj needs a finite, strictly positive scale; got "
+                f"scale={self.scale}. s multiplies every slot's contribution to ΔW, so "
+                "s=0 makes the adapter output exactly zero and its gradients exactly "
+                "zero for the whole run -- no error, no NaN, and the frozen base's own "
+                "loss curve. The injection pass computes s = sqrt(d_in) / ref_rank, so "
+                "check that ref_rank is set and non-zero in the config; a non-finite s "
+                "means that arithmetic already produced nan/inf."
+            )
         self.eps = float(eps)
         self.weight = nn.Parameter(
             torch.empty(self.total_rank, self.in_features, dtype=dtype, device=device)
@@ -389,12 +417,16 @@ class SlotProj(nn.Module):
         without a forward, and ``_diag`` still held the old values. These numbers are
         plotted to answer "is this slot dead?", so a stale constant is the exact
         failure they must not produce. After this call, ``_diag is None`` means "not
-        collected", full stop.
+        collected", full stop -- which is why every non-forward caller of
+        :meth:`orth_weight` (there is one, :meth:`SlotLoRALinear.delta_weight`) passes
+        ``collect=False``: a merge that happened to run between the arming and the
+        forward would otherwise write ``_diag`` from a moment that is not the forward's,
+        and disarm the A side so the forward never corrected it.
         """
         self._collect_diag = True
         self._diag = None
 
-    def orth_weight(self) -> torch.Tensor:
+    def orth_weight(self, collect: bool = True) -> torch.Tensor:
         """Ā = (Z Zᵀ)^(-1/2) Z, differentiable w.r.t. Z, in the parameter's dtype.
 
         When armed (see :meth:`arm_diag`) this also refreshes ``self._diag`` with
@@ -403,11 +435,26 @@ class SlotProj(nn.Module):
         the consumer carves out the block it wants; see :meth:`SlotOut._stash_diag`
         for the exact slicing and the ``scale**2`` factor that pair it with the B side.
 
+        Args:
+            collect: Whether this call may CONSUME an arming. ``True`` (the default) is
+                the forward's behaviour. ``False`` is for callers that need ``Ā`` but
+                are not the forward -- :meth:`SlotLoRALinear.delta_weight` -- and it
+                touches neither ``_collect_diag`` nor ``_diag``.
+
+                A parameter rather than a save/restore at the call site, because the
+                two invariants at stake are both about state that must not be WRITTEN,
+                and the only unbreakable way to promise that is to not write it: there
+                is no window for an exception mid-merge to leave half-restored, and
+                nothing to forget to unwind on a new call path. Restoring
+                ``_collect_diag`` afterwards would not be enough anyway -- ``_diag``
+                would already hold a reading taken outside a forward, which is exactly
+                what :meth:`arm_diag` promises cannot happen.
+
         Returns:
             The row-orthonormal ``(R, d_in)`` matrix.
         """
         a = orthogonalize(self.weight, eps=self.eps)
-        if self._collect_diag:
+        if collect and self._collect_diag:
             # The precision guard has to wrap the GRAM as well, not just the
             # orthogonalization. orthogonalize pins autocast and TF32 off internally,
             # but autocast intercepts per op, so an ambient bf16 autocast demotes the
@@ -819,13 +866,14 @@ class SlotLoRALinear(nn.Module):
     baseline.
 
     THE MERGE IS THE OTHER HALF OF THIS CLASS. A checkpoint is worthless if it cannot be
-    turned back into a plain HF model, and the conversion is ``W <- W + delta_weight()``
-    followed by swapping this module out for its ``base``. That path is only correct if
-    :meth:`delta_weight` reproduces what the forward actually computed, which is why it
-    recomputes ``Ā`` from the stored ``Z`` through :meth:`SlotProj.orth_weight` -- the
-    same call the forward makes -- rather than re-deriving it some other way. ``Z`` is
-    what the checkpoint carries; ``Ā`` is never stored, and it is never a random seed to
-    be replayed.
+    turned back into a plain HF model, and the conversion is
+    ``W <- W + delta_weight().to(W.dtype)`` followed by swapping this module out for its
+    ``base``; the cast is part of the contract, not tidiness (see :meth:`delta_weight`).
+    That path is only correct if :meth:`delta_weight` reproduces what the forward
+    actually computed, which is why it recomputes ``Ā`` from the stored ``Z`` through
+    :meth:`SlotProj.orth_weight` -- the same call the forward makes -- rather than
+    re-deriving it some other way. ``Z`` is what the checkpoint carries; ``Ā`` is never
+    stored, and it is never a random seed to be replayed.
     """
 
     def __init__(
@@ -856,29 +904,68 @@ class SlotLoRALinear(nn.Module):
             eps: Passed through to :func:`orthogonalize`.
 
         Raises:
-            ValueError: if ``base`` is not a childless ``nn.Linear``, if the ranks do
-                not fit the input width, or if ``gate``'s slot count disagrees with
-                ``slot_ranks``.
+            ValueError: if ``base`` is not a childless ``nn.Linear`` with a
+                materialized floating-point weight, if ``slot_ranks`` is empty or does
+                not fit the input width, if ``scale`` is not finite and positive, or if
+                ``gate``'s slot count disagrees with ``slot_ranks``.
         """
         super().__init__()
         if not isinstance(base, nn.Linear):
             raise ValueError(
                 f"SlotLoRALinear wraps an nn.Linear; got {type(base).__name__}. The "
                 "merge path assumes a (d_out, d_in) `weight` and an optional `bias`, "
-                "so a module that stores its weight transposed (HF Conv1D) or "
-                "quantized would merge into a silently wrong ΔW."
+                "so a module that stores its weight transposed (HF Conv1D) would merge "
+                "into a silently wrong ΔW."
             )
         if list(base.named_children()):
             raise ValueError(
                 f"SlotLoRALinear was handed a base with child module(s) "
-                f"{[n for n, _ in base.named_children()]}. A PEFT `lora.Linear` IS an "
-                "nn.Linear subclass, and wrapping one would hide a SECOND adapter "
-                "inside `base` that delta_weight() knows nothing about: training would "
-                "work, and the merged checkpoint would silently drop it. Wrap the "
-                "plain linear, before any other adapter."
+                f"{[n for n, _ in base.named_children()]}. An nn.Linear SUBCLASS that "
+                "keeps its adaptation in a child would hide a SECOND ΔW inside `base` "
+                "that delta_weight() knows nothing about: training would work, and the "
+                "merged checkpoint would silently drop it. Wrap the plain linear, "
+                "before any other adapter. (The peft this repo pins, 0.11.1, does not "
+                "reach here: its `lora.Linear` is not an nn.Linear subclass at all -- "
+                "MRO Linear, Module, LoraLayer, BaseTunerLayer -- so it is refused by "
+                "the isinstance check above. That was not true before peft 0.4, and "
+                "any wrapper that subclasses nn.Linear still lands here.)"
+            )
+        # in_features is read below to size Z, and nn.LazyLinear -- also an nn.Linear
+        # subclass, also childless -- reports 0 for it until its first forward. Left to
+        # SlotProj that surfaced as "total_rank=8, in_features=0", which is true and
+        # tells the caller nothing about what to fix.
+        if base.in_features <= 0:
+            raise ValueError(
+                f"SlotLoRALinear needs a base with in_features > 0; got "
+                f"in_features={base.in_features}. An nn.LazyLinear reports 0 until its "
+                "first forward materializes its weight, and the slots have to be sized "
+                "from the real width at construction. Run one forward through the base "
+                "(or build a plain nn.Linear) before wrapping it."
+            )
+        ref = base.weight
+        # bitsandbytes' Linear8bitLt and Linear4bit ARE nn.Linear subclasses with no
+        # children, so they pass both guards above. Measured: construction then got as
+        # far as nn.Parameter(torch.empty(..., dtype=uint8)) and died with an unrelated
+        # RuntimeError about integer parameters. ΔW cannot be added into a quantized
+        # weight at all, so this refuses it by name instead.
+        if not ref.is_floating_point():
+            raise ValueError(
+                f"SlotLoRALinear needs a floating-point base weight; got "
+                f"{ref.dtype}. The slots inherit the base's dtype and the merge adds "
+                "ΔW straight into `base.weight`, neither of which is meaningful for a "
+                "quantized (int8/uint8/nf4) weight. Wrap the linear before quantizing "
+                "it, or de-quantize first."
             )
         ranks = tuple(int(r) for r in slot_ranks)
-        ref = base.weight
+        # sum(()) is 0, and taking it before SlotProj is built turned "you asked for no
+        # slots" into SlotProj's "total_rank=0, in_features=16" -- a rank complaint --
+        # while SlotOut's much clearer message was unreachable from here.
+        if not ranks:
+            raise ValueError(
+                "SlotLoRALinear needs at least one slot; got an empty slot_ranks. With "
+                "no slots there are no columns in B, so ΔW is identically zero and the "
+                "adapter cannot learn anything."
+            )
         # The children are built BEFORE the base is frozen, so a config error they
         # reject (a rank wider than the input, a gate whose slot count disagrees) leaves
         # the caller's model exactly as it was rather than half frozen by a constructor
@@ -970,6 +1057,30 @@ class SlotLoRALinear(nn.Module):
         both operands were widened by hand, and TF32 (process-global, and turned on
         elsewhere in this repo) would leave that matmul with 10 mantissa bits.
 
+        THE CALLER OWNS THE CAST. This returns fp32 or wider while ``base.weight`` is
+        bf16 in production, so the merge is ``W.data.add_(layer.delta_weight().to(
+        W.dtype))`` and the ``.to`` is part of the contract, not a tidiness. Measured:
+        ``W.data.add_(layer.delta_weight())`` does NOT raise -- ``add_`` downcasts the
+        operand to the destination dtype and lands on the same answer -- so a converter
+        that omits it is lucky rather than correct, and stays lucky only for as long as
+        the two dtypes happen to relate that way.
+
+        IT DIVERGES FROM THE FORWARD IN ONE CONFIGURATION. Everything above assumes the
+        forward orthogonalized the same ``Z`` this reads, which holds whenever the
+        parameter dtype IS the model dtype -- true for this repo's shipped configs
+        (``examples/embodiment/config/training_backend/fsdp.yaml:23`` leaves
+        ``param_dtype: null``, so parameters stay at ``model.precision``). It stops
+        holding under ``model.precision: fp32`` plus ``mixed_precision.param_dtype:
+        bf16`` -- the CPU-offload arrangement
+        ``examples/sft/config/libero_sft_dreamzero.yaml:48`` describes -- and equally
+        under ``fsdp_config.amp_autocast.enabled: True``: the training forward then
+        orthogonalizes a bf16 ``Z`` while the checkpoint hands the converter the fp32
+        master copy, and this method silently becomes the fp32 rederivation its own
+        argument above rejects. The result is still a valid merge, ~4e-3 relative rather
+        than ~3.7e-3 away from the trained adapter, but it is no longer the SAME route
+        the forward took. Nothing detects it; if such a config is ever used, the merge
+        has to cast ``Z`` down before orthogonalizing.
+
         WHAT IT DOES NOT COVER IS THE BIAS. ``ΔW`` is weight-only; the bias lives on
         ``base`` and the merge carries it over unchanged, exactly once.
 
@@ -996,5 +1107,12 @@ class SlotLoRALinear(nn.Module):
             # 3.78e-3 vs 4.13e-3 at d_in=2048 and 3.70e-3 vs 4.07e-3 at d_in=11008
             # (llama-7b's MLP width), the same margin as the Ā route above and for the
             # same reason.
-            a = (self.slot_A.orth_weight() * self.slot_A.scale).to(compute_dtype)
+            # collect=False: this is not a forward, and an arm_diag() waiting for one
+            # must survive a merge that happens to run in between. Consuming it here
+            # would pair a Gram taken at THIS moment with a cross block taken after the
+            # next optimizer step, and would write `_diag` from a non-forward, which is
+            # precisely what SlotProj.arm_diag promises cannot happen.
+            a = (self.slot_A.orth_weight(collect=False) * self.slot_A.scale).to(
+                compute_dtype
+            )
             return self.slot_B.weight.to(compute_dtype) @ a
