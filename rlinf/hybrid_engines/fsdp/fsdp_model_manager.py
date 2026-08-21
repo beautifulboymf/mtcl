@@ -14,7 +14,7 @@
 
 import os
 import warnings
-from typing import ContextManager, Union
+from typing import Any, ContextManager, Iterable, Union
 
 import torch
 import torch.nn as nn
@@ -45,6 +45,115 @@ warnings.filterwarnings(
     message=".*NO_SHARD.*full_state_dict.*",
     category=UserWarning,
 )
+
+# Optimizer param-group names. Every group built here carries one under the "name" key,
+# because a group is otherwise identified only by its index -- and the index moves as
+# soon as a group ahead of it turns out to be empty. Consumers that reach in to retune a
+# group (the alternating slot_A/slot_B schedule zeroes one group's lr before each step)
+# look it up by this name.
+PARAM_GROUP_ACTOR = "actor"
+PARAM_GROUP_CRITIC = "critic"
+PARAM_GROUP_SLOT_A = "slot_A"
+PARAM_GROUP_SLOT_B = "slot_B"
+
+# slot-LoRI factor markers, matched as substrings of the PARAMETER NAME. Z lives in a
+# leaf module attribute called ``slot_A`` and B in one called ``slot_B``; the surrounding
+# dots are part of the marker so only a real path component matches.
+#
+# NAMES, NOT MODULE TYPES, and deliberately: rlinf.models.slot_lora's own injection pass
+# decides what stays trainable with exactly this test (``".slot_A." in name``), so the
+# name convention is already load-bearing upstream of the optimizer. If it ever broke,
+# the freeze pass would leave the model with nothing trainable and the run would fail
+# long before the grouping mattered -- an isinstance check would buy no robustness the
+# freeze does not already require, while making this engine-level module import the
+# model package. Both forms of matching survive FSDP equally: with use_orig_params=False
+# the per-leaf wrap policy gives slot_A/slot_B their own flat parameter, whose name keeps
+# the wrapped leaf's path (verified: ``...q_proj.slot_A._fsdp_wrapped_module._flat_param``).
+SLOT_A_NAME_MARKER = ".slot_A."
+SLOT_B_NAME_MARKER = ".slot_B."
+
+
+def _is_value_head_param(name: str) -> bool:
+    """Whether a parameter belongs to the critic's value head."""
+    return "value_head" in name or "model.value_head" in name
+
+
+def build_slot_aware_param_groups(
+    named_parameters: Iterable[tuple[str, nn.Parameter]],
+    *,
+    lr: float,
+    value_lr: float,
+    betas: tuple[float, float],
+    weight_decay: float,
+) -> list[dict[str, Any]]:
+    """Sort trainable parameters into named optimizer groups.
+
+    Four buckets, in this precedence order: the value head goes to ``critic`` (which is
+    what routes it to ``value_lr``), then the slot-LoRI factors ``slot_A`` and
+    ``slot_B``, then everything else to ``actor``. The value head wins a collision so
+    that this classification stays byte-for-byte what it was before slots existed and so
+    that it agrees with the critic-warmup path, which collects value-head parameters and
+    freezes everything else; a value head containing slot parameters cannot arise under
+    slot-LoRI anyway, since the injection pass freezes every non-slot parameter.
+
+    ``slot_A`` gets ``weight_decay=0.0``. This is a correctness constraint, not a tuning
+    choice: ``slot_A`` holds ``Z`` and the model uses only ``Ā = (Z Zᵀ)^(-1/2) Z``, which
+    is exactly invariant to the scale of ``Z`` (``orthogonalize(cZ) == orthogonalize(Z)``).
+    Decay on ``Z`` therefore cannot change the function at all -- all it does is shrink
+    ``Z`` toward zero and degrade the conditioning of ``Z Zᵀ``, and poor conditioning is
+    the one thing that makes the orthogonalization silently stop being orthogonal.
+
+    Args:
+        named_parameters: ``(name, parameter)`` pairs to group. The caller has already
+            decided which parameters are trainable; everything passed in is grouped.
+        lr: Learning rate for the actor and both slot groups.
+        value_lr: Learning rate for the critic group.
+        betas: Adam betas, applied to every group.
+        weight_decay: The global weight decay, applied to every group but ``slot_A``.
+
+    Returns:
+        The param-group dicts, in the order ``actor, critic, slot_A, slot_B``, with the
+        empty ones dropped. Actor and critic keep the first two slots so that anything
+        indexing the pre-slot groups positionally (lr lists, schedulers, saved optimizer
+        state) is unaffected by a model that has no slots.
+    """
+    buckets: dict[str, list[nn.Parameter]] = {
+        PARAM_GROUP_ACTOR: [],
+        PARAM_GROUP_CRITIC: [],
+        PARAM_GROUP_SLOT_A: [],
+        PARAM_GROUP_SLOT_B: [],
+    }
+    for name, param in named_parameters:
+        if _is_value_head_param(name):
+            buckets[PARAM_GROUP_CRITIC].append(param)
+        elif SLOT_A_NAME_MARKER in name:
+            buckets[PARAM_GROUP_SLOT_A].append(param)
+        elif SLOT_B_NAME_MARKER in name:
+            buckets[PARAM_GROUP_SLOT_B].append(param)
+        else:
+            buckets[PARAM_GROUP_ACTOR].append(param)
+
+    # weight_decay is written on every group, not just the one that overrides it: a
+    # group that inherits the optimizer default and one that pins the same value are
+    # indistinguishable when read back off param_groups, and this is a setting whose
+    # value has to be auditable per group.
+    specs = (
+        (PARAM_GROUP_ACTOR, lr, weight_decay),
+        (PARAM_GROUP_CRITIC, value_lr, weight_decay),
+        (PARAM_GROUP_SLOT_A, lr, 0.0),
+        (PARAM_GROUP_SLOT_B, lr, weight_decay),
+    )
+    return [
+        {
+            "name": group_name,
+            "params": buckets[group_name],
+            "lr": group_lr,
+            "betas": betas,
+            "weight_decay": group_weight_decay,
+        }
+        for group_name, group_lr, group_weight_decay in specs
+        if buckets[group_name]
+    ]
 
 
 class FSDPModelManager:
@@ -459,6 +568,11 @@ class FSDPModelManager:
         """
         Build the optimizer based on the configuration, currently only support Adam optimizer.
 
+        Trainable parameters are split by :func:`build_slot_aware_param_groups` into up
+        to four named groups -- ``actor``, ``critic``, ``slot_A``, ``slot_B`` -- of which
+        the empty ones are dropped; see there for the grouping rules and for why
+        ``slot_A`` must not be weight-decayed.
+
         Args:
             model: The model to optimize, can be nn.Module, FSDPModule (used in FSDP2) or FSDP.
             enable_critic_warmup: Whether to enable critic warmup used for value network.
@@ -470,16 +584,15 @@ class FSDPModelManager:
         adam_eps = self._cfg.optim.get("adam_eps", 1e-8)
         weight_decay = self._cfg.optim.get("weight_decay", 1e-2)
 
-        params_actor = []
-        params_critic = []
+        trainable_named_params = []
 
         if enable_critic_warmup:
             self._logger.info("[FSDP] Enable critic warmup for value head.")
             for name, param in model.named_parameters():
                 if param.requires_grad:
                     self.store_requires_grad_param_name.append(name)
-                    if "value_head" in name or "model.value_head" in name:
-                        params_critic.append(param)
+                    if _is_value_head_param(name):
+                        trainable_named_params.append((name, param))
                         continue
                     param.requires_grad = False
 
@@ -488,27 +601,26 @@ class FSDPModelManager:
                 if name in self.store_requires_grad_param_name:
                     param.requires_grad = True
                 if param.requires_grad:
-                    if "value_head" in name or "model.value_head" in name:
-                        params_critic.append(param)
-                    else:
-                        params_actor.append(param)
+                    trainable_named_params.append((name, param))
 
-        param_groups = []
-        if len(params_actor) > 0:
-            param_groups.append(
-                {
-                    "params": params_actor,
-                    "lr": self._cfg.optim.lr,
-                    "betas": betas,
-                }
-            )
-        if len(params_critic) > 0:
-            param_groups.append(
-                {
-                    "params": params_critic,
-                    "lr": self._cfg.optim.value_lr,
-                    "betas": betas,
-                }
+        param_groups = build_slot_aware_param_groups(
+            trainable_named_params,
+            lr=self._cfg.optim.lr,
+            value_lr=self._cfg.optim.value_lr,
+            betas=betas,
+            weight_decay=weight_decay,
+        )
+        if any(
+            group["name"] in (PARAM_GROUP_SLOT_A, PARAM_GROUP_SLOT_B)
+            for group in param_groups
+        ):
+            self._logger.info(
+                "[FSDP] Optimizer param groups: "
+                + ", ".join(
+                    f"{group['name']}(n={len(group['params'])}, lr={group['lr']}, "
+                    f"wd={group['weight_decay']})"
+                    for group in param_groups
+                )
             )
         optimizer = torch.optim.AdamW(
             param_groups,
