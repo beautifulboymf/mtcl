@@ -1094,6 +1094,21 @@ Expected: 51 passed
                 ref_rank=int(_slot_cfg.get("a_scale_ref_rank", 128)),
                 eps=float(_slot_cfg.get("orth_eps", 1e-6)),
             )
+            # The FSDP leaf-wrap guarantee SlotProj depends on has a fourth condition
+            # that is easy to miss: rlinf/hybrid_engines/fsdp/utils.py:306 also requires
+            # `getattr(module, "_to_lora", True) is True`, and tag_vlm_subtree(model,
+            # False) (rlinf/models/__init__.py:362) stamps _to_lora=False on EVERY
+            # module. Only the pi0 branch calls it today, so the slot path is clean --
+            # but if that ever changes, Z would be folded into someone else's flat param
+            # and the forward would no longer see the full Z, with NO error raised.
+            # Convert that silent failure into a loud one.
+            for _m in model.modules():
+                if type(_m).__name__ in ("SlotProj", "SlotOut"):
+                    assert getattr(_m, "_to_lora", True) is True, (
+                        f"{type(_m).__name__} was tagged _to_lora=False; FSDP would not "
+                        "give it its own flat param and orthogonalize() would see a "
+                        "sharded Z"
+                    )
             _ntr = sum(p.numel() for p in model.parameters() if p.requires_grad)
             _sys.stderr.write(
                 f"[slot-lora] injected {len(_replaced)} SlotLoRALinear; "
@@ -1626,6 +1641,11 @@ def merge_slots(model):
 在 `main()` 里：`build_base_model(...)` 之后调 `wrap_with_slots(...)`，`load_state_dict` 之后调 `merge_slots(model)`，随后沿用原脚本的 `save_pretrained` + 拷贝 aux 文件那几步不变。CLI 新增参数：
 
 ```python
+    # `scale` is persisted in the checkpoint via SlotProj.get_extra_state, so the
+    # converter must VERIFY the value it derives from these flags against the stored one
+    # and abort on mismatch. Recomputing it blindly is how training and conversion end up
+    # silently disagreeing by a constant factor: the merge still succeeds, the model still
+    # runs, and every delta is simply the wrong size.
     ap.add_argument("--slot-ranks", default="128,64,48,16",
                     help="comma-separated, in slot_order (10,goal,spatial,object)")
     ap.add_argument("--slot-scale-mode", default="match_mt4", choices=["match_mt4", "unit"])
