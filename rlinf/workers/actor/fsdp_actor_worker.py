@@ -3058,11 +3058,31 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         TrainPhaseProfiler header). Leave it off for production runs.
         """
         enabled = bool(self.cfg.algorithm.get("profile_train_phases", False))
+        # WHY stderr AND log_info. self.log_info writes into ray's per-worker log files
+        # under the session tmpdir, which run_iso.sh places in /tmp/rayiso_* and which is
+        # deleted when the session ends. Measured: [VLA-OPD] lines (log_info) appear ZERO
+        # times in any driver log, including mt4's own successful run, while [slot-lora]
+        # lines (sys.stderr.write) all survive. A profile that lands only in a directory
+        # about to be removed is a profile that does not exist -- which is exactly what
+        # happened on the first profiling run: the flag was on, three steps ran, and not
+        # one [prof] line reached the log.
+        def _emit(_msg: str) -> None:
+            import sys as _sys
+
+            _sys.stderr.write(_msg + "\n")
+            self.log_info(_msg)
+
+        def _emit_warn(_msg: str) -> None:
+            import sys as _sys
+
+            _sys.stderr.write(_msg + "\n")
+            self.log_warning(_msg)
+
         return TrainPhaseProfiler(
             enabled=enabled,
             log_every=int(self.cfg.algorithm.get("profile_log_every", 0)),
-            log_fn=self.log_info,
-            warn_fn=self.log_warning,
+            log_fn=_emit,
+            warn_fn=_emit_warn,
             rank=getattr(self, "_rank", 0),
             step=getattr(self, "version", None),
         )
