@@ -1030,6 +1030,13 @@ def inject_slot_lora(
 
 
 def enable_slot_diag(model: nn.Module) -> bool:
+    # NOTE (from Task 4): arm through SlotLoRALinear.arm_diag(), NOT by finding "the first
+    # SlotProj" and "the first SlotOut" separately. The cosine pairs Ā_tĀ_sᵀ with B_tᵀB_s and
+    # they MUST come from the same layer; separate searches pair by module registration order,
+    # and in a 7B model full of same-shaped projections a mispairing has the right shape and
+    # the wrong numbers, with nothing to raise. i.e.:
+    #   layer = next(m for m in model.modules() if isinstance(m, SlotLoRALinear))
+    #   layer.arm_diag()          # arms both children and clears the previous _diag
     """Arm the diagnostics on ONE SlotLoRALinear; they are computed inside its forward.
 
     Doing it inside the forward is what keeps this free under FSDP: the module's full
@@ -1059,7 +1066,7 @@ def collect_slot_diag(model: nn.Module) -> dict:
     metrics = {"slot/orth_err": (gram - eye).norm().item()}
 
     offsets, ranks = out.offsets, out.slot_ranks
-    norms = out._diag["norms"]
+    norms = out._diag["b_norms"]   # NOT "norms" -- SlotOut._stash_diag stores it as b_norms
     for k, norm in enumerate(norms):
         metrics[f"slot/dw_norm_{k}"] = (proj._diag["scale"] * norm).item()
     for (s, t), p_ts in out._diag["cross"].items():
@@ -1126,6 +1133,12 @@ Expected: 51 passed
 在 `if cfg.is_lora:` 之后、`from peft import ...` 之前插入：
 
 ```python
+        # `cfg.is_lora` MUST stay True on the slot path. The per-leaf FSDP wrap policy that
+        # gives slot_A/slot_B their own flat params is only registered when is_lora is set
+        # (rlinf/hybrid_engines/fsdp/strategy/fsdp.py:163). Without it the trainable slot
+        # params land in the enclosing transformer layer's flat param together with the
+        # FROZEN base, and FSDP refuses to flatten mixed requires_grad under
+        # use_orig_params=False. That is a loud failure, but an avoidable one.
         _slot_cfg = cfg.get("slot_lora", None)
         if _slot_cfg is not None and _slot_cfg.get("enabled", False):
             # slot-LoRI: K per-suite LoRA slots on mutually orthogonal input subspaces,
@@ -1707,6 +1720,8 @@ def merge_slots(model):
 `load_state_dict` 之后必须保留原脚本那三行断言（`unexpected == 0`、`missing == 0`），它们是键名对齐的唯一保险。
 
 `convert_oft_slot_ckpt.sh` 里把调用的 py 文件名换成 `convert_oft_slot_ckpt.py`，并把 `--lora-rank` 换成 `--slot-ranks "$SLOT_RANKS"`（默认 `128,64,48,16`）。
+
+**合并的验收容差（Task 4 实测）**：合并后的模型每层相对训练时 forward 的相对误差约 **3.4e-3**，这是把 ΔW 舍入进 bf16 base weight 的地板（`‖Ā_bf16 − Ā_fp32‖/‖Ā‖ = 1.66e-3`），不是 merge 错误。**不要期待逐位相等**，用 ~1e-2 的相对容差。另外 `delta_weight()` 必须走 forward 同一条路线（`orth_weight()`），不要在转换器里用 fp32 重新推导 Ā —— 转换器的职责是复现被训练的那个模型，不是改进它（实测同路线 3.70e-3 vs fp32 重推 4.05e-3，同路线在每个宽度每个 seed 都更近）。
 
 - [ ] **Step 3: 用玩具模型验证 merge 数学**
 
