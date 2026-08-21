@@ -1080,7 +1080,11 @@ def collect_slot_diag(model: nn.Module) -> dict:
         q_st = gram[
             offsets[t] : offsets[t] + ranks[t], offsets[s] : offsets[s] + ranks[s]
         ]
-        inner = torch.einsum("ij,ji->", p_ts.to(q_st.dtype), q_st)
+        # ELEMENTWISE, not einsum("ij,ji->"). cross[(s,t)] is (r_t, r_s) and pairs with
+        # gram[t_slice, s_slice] of the same shape, so the contraction is a plain Hadamard
+        # sum. The einsum form transposes one of them: for unequal ranks it raises, for
+        # EQUAL ranks it silently computes Σ P⊙Qᵀ, a different quantity.
+        inner = (p_ts.to(q_st.dtype) * q_st).sum()
         # ⟨ΔW_s, ΔW_t⟩_F = scale² · Σ(B_tᵀB_s ⊙ Ā_tĀ_sᵀ) and ‖ΔW_k‖_F = scale · ‖B_k‖_F,
         # so scale² cancels in the cosine and must NOT be applied here. It does NOT cancel
         # in dw_norm_k above, which is why that one carries an explicit factor.
@@ -1150,7 +1154,7 @@ Expected: 51 passed
             _ranks_map = dict(_slot_cfg["slot_ranks"])
             _order = list(_slot_cfg["slot_order"])
             _ranks = [int(_ranks_map[s]) for s in _order]
-            _replaced = inject_slot_lora(
+            _inj = inject_slot_lora(
                 model,
                 _ranks,
                 SLOT_LORA_TARGET_MODULES,
@@ -1173,6 +1177,17 @@ Expected: 51 passed
                         "give it its own flat param and orthogonalize() would see a "
                         "sharded Z"
                     )
+            # inject_slot_lora returns a frozen dataclass SlotInjection(paths, gate) --
+            # deliberately NOT a tuple or a list: a NamedTuple would let `len(result)`
+            # silently return 2 (the field count) in the very log line that reports how
+            # many layers were adapted, and would let `paths, gate = inject(...)` keep
+            # working by accident. Use `_inj.paths` / `_inj.gate` explicitly.
+            #
+            # The GATE MUST BE KEPT: the actor installs per-micro-batch routing through it
+            # (`with gate.scoped(ids):`). Stash it where the actor can reach it, or
+            # re-derive it as `next(m for m in model.modules() if isinstance(m, SlotOut)).gate`
+            # (safe -- every layer shares the one instance).
+            _replaced = _inj.paths
             _ntr = sum(p.numel() for p in model.parameters() if p.requires_grad)
             _sys.stderr.write(
                 f"[slot-lora] injected {len(_replaced)} SlotLoRALinear; "
