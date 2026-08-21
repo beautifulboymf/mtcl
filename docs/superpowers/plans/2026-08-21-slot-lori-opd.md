@@ -21,6 +21,41 @@ cd /home/fanruochen/CL/RLinf
 
 ---
 
+---
+
+## ⚠️ API 变更（Task 2 返工后，Task 3/4/6/9 以此为准）
+
+原计划把 per-sample gate 用 `ContextVar` 传递，**这是错的**：autograd 引擎在 CUDA 上用每设备的 worker 线程跑反向节点，而本仓库会开 gradient checkpointing（`fsdp_model_manager.py:253`），重算发生在反向、在那个线程上。实测复现：作用域在主线程仍开着，重算里读到的是 `None` → 门控整个不生效、四个 slot 梯度互相串、**不报错也不 NaN**，曲线完全正常。
+
+现在改为**共享 holder 对象**（属性访问不受线程和重算影响），`slot_gate()` / `get_slot_gate()` 已删除：
+
+```python
+from rlinf.models.slot_lora import SlotGate
+
+gate = SlotGate(strict=True)      # 每个模型一个，注入时创建，所有 gated 模块共享同一个引用
+
+class SlotOut(nn.Module):
+    def __init__(self, out_features, slot_ranks, gate, ...):
+        self.gate = gate          # 只存引用，不在这里读
+    def forward(self, h):         # 注意：没有 gate_ids 参数了
+        gate_ids = self.gate.current()      # strict 且未设置时 raise
+
+# 调用方（fsdp_actor_worker）：
+with gate.scoped(ids):            # ids: LongTensor[B]，B = 本 micro-batch，-1 = 无 slot 拥有
+    loss = student(**batch)
+    loss.backward()               # ★ backward 必须在作用域内 —— checkpoint 会重跑 forward
+```
+
+- `gate.current()` 严格读取（strict 下未设置就 raise）；`gate.current_unchecked()` 是唯一的逃生口，只给 metrics 用，故意起得难看以便在 diff 里显眼。
+- `SlotGate(strict=False)` 用于单 suite 无路由的 run；`gate.ungated()` 在 strict 模型里开一个不门控的窗口（eval / rollout）。
+- **strict 还堵住了 holder 本身堵不住的一个洞**：作用域在 `.backward()` 之前就退出。这种情况现在 raise，而不是静默地重算成 ungated。
+- ids 的 device 归调用方管（读路径每次前向要跑 200-400 次，不能在那里 `.to(device)`）。
+- `self.gate = gate` 是普通对象属性，不增加 children 也不增加 parameter，所以 `utils.py:306` 的 FSDP 叶子判定仍然成立。
+
+下面 Task 3/4 正文里凡是 `SlotOut.forward(h, gate_ids)`、`get_slot_gate()`、`slot_gate(...)` 的写法，按本节替换。
+
+---
+
 ## 文件结构
 
 | 文件 | 职责 |

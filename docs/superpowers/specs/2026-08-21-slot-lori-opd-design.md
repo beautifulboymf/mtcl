@@ -121,7 +121,8 @@ frozen 的 `base` 是叶子但 `weight.requires_grad=False`，不会被单独包
 
 - teacher 用哪张表分 suite，slot 就用同一张表 —— **同一个样本的 teacher 和 slot 必然配对**，不存在"用 goal 的 teacher 去更新 long 的 slot"。
 - **顺序陷阱（必须处理）**：学生前向在 `fsdp_actor_worker.py:2131`，`_teacher_forward` 在 `:2155` —— teacher 在**后**。所以 `self._last_groups`（`:1300` 才写入）在学生前向时是**上一个 micro-batch 的**，直接拿来当 gate 会整体错位一个 micro-batch。必须把"decode prompt → suite"抽成 `_route_prepare(forward_inputs)`，在**学生前向之前**调用，`_teacher_forward` 复用其结果（顺带省掉一次 `batch_decode`）。
-- 每个 micro-batch：`_route_prepare` 产出的 per-sample gate 张量通过模块级上下文（`set_slot_gate(ids)`）传给所有 `SlotOut`，学生前向后清空。
+- 每个 micro-batch：`_route_prepare` 产出的 per-sample gate 张量通过**共享 holder** 交给所有 `SlotOut`（`with gate.scoped(ids):`）。**不能用 `ContextVar`** —— autograd 在 CUDA 上用每设备 worker 线程跑反向，gradient checkpointing 的重算发生在那里，ContextVar 会读到 `None` 从而静默地整个不门控（已实测复现）。holder 是普通对象属性，不受线程和重算影响。
+- **作用域必须同时覆盖 forward 和 backward**：checkpoint 会重跑 forward，若作用域在 `.backward()` 前就退出，strict 模式下会 raise（而不是静默 ungated）。
 - prompt 匹配不上时的 fallback：与 teacher 侧**完全一致**（落到 default），并记录 `route_fallback_frac`。这四个 suite 的 40 个任务 prompt 都在表里，预期为 0；非 0 说明路由表有洞，必须先修再看结果。
 
 ## 5. 交替训练调度
