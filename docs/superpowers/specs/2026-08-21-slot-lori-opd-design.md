@@ -1,0 +1,221 @@
+# slot-LoRI joint 多 teacher OPD — 设计文档
+
+日期：2026-08-21
+状态：设计已确认，待写实现计划
+相关：`project_mt4_4teacher_opd_result`（要打破的对照）、LoRI（arXiv 2504.07448, COLM 2025）
+
+---
+
+## 1. 问题
+
+joint 4-teacher routed OPD 跑了两次，都只**搬运**能力、不**增加**能力：
+
+| 运行 | 变化 | 四 suite 均值 |
+|---|---|---|
+| mt4 | long +0.28 / goal −0.20 | 0.745 |
+| mt4w2 | goal +0.12 / long −0.10 | 0.750（0.12 SE = 没动） |
+
+两次的涨跌互为镜像，spatial / object 从不动。诊断：四个 teacher 的 KL 梯度在**同一个 backward** 里落到**同一份 r=128 的学生 LoRA** 上，彼此没有任何隔离手段，最终解是四路梯度的折中，而不是四份能力的叠加。
+
+优化本身没问题（distill_loss 1.090→0.364，opd_kl 1.238→0.657 单调下降），所以瓶颈不在"学不动"，在"学到的互相覆盖"。
+
+## 2. 方案
+
+把学生的单份 LoRA 拆成 **4 个 slot**，每个 suite 一个，**子空间严格正交**，梯度按 suite 硬路由。
+
+ΔW = Σ_k B_k Ā_k，其中 Ā_k 是 Ā 的第 k 个行块，Ā 的所有行两两正交。
+
+正交为什么解决问题：两个 slot 更新的 Frobenius 内积
+
+    ⟨ΔW_s, ΔW_t⟩_F = tr( B_sᵀ B_t · Ā_t Ā_sᵀ )
+
+只要 Ā_t Ā_sᵀ = 0，内积恒为 0，**与 B 无关**。B 怎么训都不会让两个 slot 互相干扰。这是构造出来的性质，不依赖数据、不依赖训练过程。
+
+**四个 slot 在前向中永远全部激活**，推理不做路由，最终 merge 成一个 HF 模型。这不是 MoE / adapter zoo：slot 只是训练期的梯度隔离手段，产物仍是单模型。
+
+### 2.1 Z 参数化（正交性进计算图）
+
+不把 Ā 当参数，而是存自由矩阵 **Z ∈ ℝ^{R×d_in}**（R = Σ r_k），前向里现算
+
+    Ā = (Z Zᵀ)^(-1/2) · Z          （对称/Löwdin 正交化）
+
+整个式子对 Z 可微（`torch.linalg.eigh` 支持反向），autograd 直接给出约束梯度，**不需要任何 optimizer 之后的投影/retraction 步骤**。正交性由构造保证，任何时刻 ĀĀᵀ = I。
+
+选它而不是"训完再正交化"的理由：后者是 optimizer.step() 之后的事后处理，不进计算图，训练目标和实际参数更新之间有一层不可见的修正；Z 参数化没有这个缝。
+
+数值细节：
+- `Z Zᵀ` 在 **fp32** 下计算，`eigh` 在 fp32 下做，特征值 `clamp_min(1e-6)` 后取 −1/2 次幂，结果 cast 回 bf16。
+- Ā 对 Z 的**尺度不变**（Z → cZ 得到同一个 Ā）。因此 **Z 这一组的 weight_decay 必须设 0**：wd 只会把 Z 拉向 0、恶化 ZZᵀ 的条件数，对函数没有任何影响。这是一个必须显式处理的坑（全局 wd = 0.01）。
+- Z 初始化：对每个被 LoRA 的权重矩阵独立采一个 R×d_in 高斯阵。随机高斯阵满秩，正交化后即为一组随机正交基；不需要额外 QR。
+
+### 2.2 尺度对齐
+
+现有学生 LoRA：`r=128, lora_alpha=128 → scaling = 1.0`，`init_lora_weights="gaussian"`（A 的元素 std = 1/r）。所以 mt4 里 A 的行范数 ≈ √d_in / 128。
+
+Ā 的行是单位向量（范数 1），直接用会让 ΔW 每步比 mt4 大若干倍，混淆"结构变了"和"学习率变了"。因此乘一个固定常数：
+
+    Ā_used = s · Ā,   s = √d_in / 128   （逐模块，按该模块的 d_in 算）
+
+其余 scaling 保持 1.0。这样 step 1 的 ΔW 量级与 mt4 一致，消融里学习率不是变量。配置项 `slot_a_scale_mode: match_mt4 | unit`，默认 `match_mt4`。
+
+副作用（接受并记录）：slot k 的每步步长随 √r_k 增长，即 rank 大的 slot 不仅子空间大、步子也略大。这与"给 long 多投入"的意图同向。
+
+### 2.3 per-slot rank
+
+底座 `lwf_long_e1000_merged` 的 post-hoc 起点（temp 1.0 / 50 env）：long 0.56、goal 0.68、spatial 0.76、object 0.96，均值 0.740。按赤字分配容量：
+
+| slot | suite | 起点 SR | 赤字 | rank |
+|---|---|---|---|---|
+| slot_10 | libero_10 (long) | 0.56 | 0.44 | 128 |
+| slot_goal | libero_goal | 0.68 | 0.32 | 64 |
+| slot_spatial | libero_spatial | 0.76 | 0.24 | 48 |
+| slot_object | libero_object | 0.96 | 0.04 | 16 |
+
+R = 256。d_in 最小的被 LoRA 模块（vision 侧约 1024）也远大于 256，正交基一定存在。
+
+## 3. 模块结构
+
+新建 `SlotLoRALinear`，替换学生侧的 PEFT LoRA 注入（teacher / anchor 侧完全不动，仍走 PEFT）。
+
+```
+SlotLoRALinear(base_linear, slot_ranks, scale)
+├── base   : nn.Linear，frozen（requires_grad=False）
+├── slot_A : SlotProj  — weight = Z (R × d_in)，trainable，叶子模块
+└── slot_B : SlotOut   — weight = B (d_out × R)，trainable，零初始化，叶子模块
+```
+
+前向：
+
+```
+h  = slot_A(x)                    # 内部：Ā = orth(Z); return F.linear(x, s·Ā)  -> (..., R)
+out = base(x) + slot_B(h, gates)  # 内部：按 rank 块切 h，逐 slot 算贡献后带门求和
+```
+
+`SlotOut.forward(h, gates)`：
+
+```
+c_k = F.linear(h[..., off_k:off_k+r_k], B[:, off_k:off_k+r_k])      # slot k 的贡献
+out = Σ_k [ c_k                if 该样本属于 suite k
+          | c_k.detach()       otherwise ]
+```
+
+**为什么必须逐 slot 算贡献再 detach，而不是在 h 上乘门**：B 是一整块参数，∂L/∂B_j = outer(grad_out, h_j) 对所有 j 都非零；只有把非归属 slot 的**整条贡献** detach 掉，梯度才不会进 B_j 和 Z_j。同时 `c` 与 `c.detach()` 数值相同，**前向输出仍是四个 slot 的完整和**——策略行为 = 全 slot 合并模型，训练/推理一致。
+
+### 3.1 FSDP 约束
+
+`use_orig_params=False`（`rlinf/config.py:419`），同一个 flat param 内 requires_grad 必须一致。现有 LoRA 逐叶子包策略（`rlinf/hybrid_engines/fsdp/utils.py:306`）的判据是"无子模块 + 有 `.weight` + `weight.requires_grad`"。
+
+`SlotProj` / `SlotOut` 都满足（无子模块、持有 `.weight`、可训），会各自成为独立 FSDP 单元 → requires_grad 均匀，且**在各自 forward 内部 weight 已被 all-gather 成完整张量**，这正是 `Ā = orth(Z)` 需要的（必须拿到全部 R 行才能算 ZZᵀ）。
+
+frozen 的 `base` 是叶子但 `weight.requires_grad=False`，不会被单独包，随所在 transformer 层一起被包 —— 与现在 PEFT 的情形一致。
+
+## 4. 路由
+
+复用现成的 teacher 路由表：`self.teacher_prompt_to_suite`（`fsdp_actor_worker.py:1176` 构建，`:1230 _teacher_forward` 使用，分组结果写在 `self._last_groups`，`:1300`）。
+
+- teacher 用哪张表分 suite，slot 就用同一张表 —— **同一个样本的 teacher 和 slot 必然配对**，不存在"用 goal 的 teacher 去更新 long 的 slot"。
+- **顺序陷阱（必须处理）**：学生前向在 `fsdp_actor_worker.py:2131`，`_teacher_forward` 在 `:2155` —— teacher 在**后**。所以 `self._last_groups`（`:1300` 才写入）在学生前向时是**上一个 micro-batch 的**，直接拿来当 gate 会整体错位一个 micro-batch。必须把"decode prompt → suite"抽成 `_route_prepare(forward_inputs)`，在**学生前向之前**调用，`_teacher_forward` 复用其结果（顺带省掉一次 `batch_decode`）。
+- 每个 micro-batch：`_route_prepare` 产出的 per-sample gate 张量通过模块级上下文（`set_slot_gate(ids)`）传给所有 `SlotOut`，学生前向后清空。
+- prompt 匹配不上时的 fallback：与 teacher 侧**完全一致**（落到 default），并记录 `route_fallback_frac`。这四个 suite 的 40 个任务 prompt 都在表里，预期为 0；非 0 说明路由表有洞，必须先修再看结果。
+
+## 5. 交替训练调度
+
+按**优化器更新**交替，不按训练步交替（一次 rollout 内有 `global_batch 192` × 3 次更新）：
+
+    B, B, A, B, B, A, ... 且最后一次更新必为 B
+
+- `slot_alt_schedule: "BBA"`（默认），`null` 表示 A、B 联合训练（消融用）。
+- 冻结方式：**把对应参数组的 lr 设为 0**，不改 `requires_grad`（`use_orig_params=False` 下中途改 requires_grad 会破坏 FSDP flat param）。
+- 同时把被冻结那组的 `p.grad = None` 再调 `optimizer.step()`：否则 AdamW 的 exp_avg / exp_avg_sq 会在冻结阶段继续吸收梯度，等该组解冻时第一步用的是上一阶段积下来的动量。
+- 需要在 `fsdp_model_manager.py:496` 的 `build_optimizer` 里把 slot 参数拆成 `slot_A` / `slot_B` 两个 param group，`slot_A` 组 `weight_decay=0`。
+- B 收尾：调度按 BBA 循环，但**每个训练 step 的最后一次优化器更新强制为 B**（若循环恰好落在 A，该次改为 B）。比"只保证 run 的最后一次是 B"更强，且因为 checkpoint 是按 step 存的，**每个存下来的 checkpoint 都是 B 收尾**。
+
+理由：B 固定时 ΔW 对 A 线性，反之亦然，交替 = 坐标下降，每个子问题条件数更好（AltLoRA 报告过同样的收益）。注意**交替本身不提供正交性**——正交性完全来自 Z 参数化；交替只影响优化质量。
+
+## 6. 动态蒸馏力度
+
+已有实现 `_dw_refresh_weights`（`fsdp_actor_worker.py:1967`）：每步用各 suite 的 KL(student‖teacher) 做 EMA，权重 ∝ (KL_k / mean)^γ，clamp 到 [`distill_w_min`, `distill_w_max`]。它按 KL 走、不按训练内 SR 走 —— 训练内 per-suite SR 已被证明在两个方向上偏差可达 ±0.33，**任何在线自适应都不得以它为输入**。
+
+它在 mt4w2 里因 `run_training` 重复定义被遮蔽而全程失效（权重恒为 1.000），调用点现已在生效的那个定义里。本设计首次真正启用：
+
+    distill_dyn_weight: 1.0 / distill_w_ema: 0.9 / distill_w_min: 0.25 / distill_w_max: 4.0
+
+在 slot 结构下它的语义更干净：各 suite 梯度落在不同 B_k 上，per-suite 权重 = **per-slot 步长倍率**，不再改变合成梯度的方向。
+
+另外保留静态旋钮：per-suite 采样权重（`SEQCL_SUITE_WEIGHTS`），给 long 多分 env。
+
+## 7. 产物与转换
+
+- checkpoint 键变为 `...slot_A.weight`（Z）/ `...slot_B.weight`（B）。**存 Z 不存 Ā**，也不靠重放随机种子。
+- 转换（`opd_distill/scripts/convert_oft_lora_ckpt.py` 与 `/share/fanruochen-local/dev/scripts/extract_lora_adapter.py`）需增加分支：读 Z → 用与训练**完全相同**的 fp32 过程算 Ā → `W ← W + s·B·Ā` → 存 HF 模型。
+- 产物仍是一个 15G 的 merged HF 模型，**评测脚本零改动**。
+- `RLINF_CONVERT_VALUE_HEAD=False` 照旧。
+
+## 8. 配置项
+
+配置必须挂在 **`actor.model`** 下面，不能挂在 `actor` 下面：rollout worker 在 `rlinf/workers/rollout/hf/huggingface_worker.py:95` 里 `deepcopy(cfg.actor.model)` 后调同一个 `get_model`，所以放在 `actor.model` 里 rollout 侧会**自动**得到结构完全相同的模型，权重同步（走裸 state_dict 的键名匹配，`fsdp_actor_worker.py:1630 get_rollout_state_dict`）零改动即可工作。
+
+```yaml
+actor:
+ model:
+  slot_lora:
+    enabled: true
+    slot_ranks: {libero_spatial: 48, libero_object: 16, libero_goal: 64, libero_10: 128}
+    a_scale_mode: match_mt4        # match_mt4 | unit
+    alt_schedule: "BBA"            # null = 联合训练
+    orth_eps: 1.0e-6
+algorithm:
+  distill_dyn_weight: 1.0
+  distill_w_ema: 0.9
+  distill_w_min: 0.25
+  distill_w_max: 4.0
+```
+
+## 9. 观测量
+
+**正确性（必须先看，不对就是实现有 bug，结果无意义）**
+- `slot/orth_err` = ‖ĀĀᵀ − I‖_F，预期 ~1e-6（fp32 下）
+- `slot/cos_st` = cos⟨ΔW_s, ΔW_t⟩_F 全部 6 个 pair，预期 ~0。**不要展开 ΔW**（d_out×d_in 太贵）：用 ⟨ΔW_s,ΔW_t⟩_F = tr(B_sᵀB_t · Ā_tĀ_sᵀ) 只算 R×R 的小矩阵，Ā 的 Gram 前向里已经有了
+- `slot/route_fallback_frac`，预期 0
+- `slot/dynw_*`，必须随步数变化；恒为 1.000 = 机制没接上
+
+**研究量**
+- 每个 slot 的 ‖ΔW_k‖_F 随步数（容量用了多少，long 是否真的用得比别人多）
+- 四条 per-suite KL(student‖teacher) 曲线
+- `distill_loss` / `opd_kl` 总曲线，与 mt4 的 1.090→0.364 / 1.238→0.657 对齐比较
+
+## 10. 实验
+
+底座：**`inc_sft_opd/lwf_long_e1000_merged`** —— 与 mt4 的起点逐字节相同（已核 `opd_mt4_driver.log` 的 `model_path`），因此 mt4（0.745）与 mt4w2（0.750）**直接作为对照，零额外算力**。选它而不是更强的 `lwf_long_e2000_merged`（0.835）的原因就是这个：e2000 上没有任何匹配的 joint-OPD 对照，要自己再跑一次 15 步才有守恒带。
+
+teacher / 步数 / env / batch 全部沿用 mt4：4 个按 prompt 路由的 per-suite expert，long 的 teacher 是 `lwf_long_e1000_merged::long_opd130`（与学生同血统，其 base 就是学生起点），另外三个是 `base_stats130::<per-suite adapter>`；15 步、6 GPU、envs 48、group_size 4、rollout_epoch 3、micro 8、global_batch 192。`anchor_lambda=0`、`distill_fail_alpha` 不设 —— mt4 / mt4w2 的配置里就没有这两项，保持一致。
+
+| 跑次 | 配置 | 问题 |
+|---|---|---|
+| R1 | slot-LoRI + BBA + dynw | 主结果 |
+| R2（条件性） | slot-LoRI + 联合训练（`alt_schedule: null`） | 交替值不值 |
+| R3（条件性） | 单 LoRA r=128 + dynw（其余同 mt4） | 收益来自 slot，还是来自"dynw 第一次真的生效" |
+
+R2/R3 只在 R1 有信号时才跑。R3 之所以仍有必要：mt4 / mt4w2 都配了 `distill_dyn_weight: 1.0`，但机制被 `run_training` 重复定义遮蔽而全程失效（权重恒为 1.000），所以那两次实际是**均匀权重**；R1 是"slot + 活的 dynw"，R3 把这两个因素分开。
+
+**判据**（post-hoc 50 env、temp 1.0、四 suite，唯一可信口径）：
+1. 四 suite 均值是否脱离 0.745 ± 0.04 的守恒带（起点 0.740，mt4 0.745，mt4w2 0.750）；
+2. 是否仍出现"一涨一等量跌"的镜像。
+
+均值涨了但仍是镜像 → 只是换了个搬运方式；均值涨且各 suite 不再互相抵消 → 结构有效。
+
+## 11. 风险
+
+- **可塑性**：Ā 的行被约束为正交，slot k 不能转进兄弟已占的 ≤224 维；但 d_in=4096 中还有 3840 维空闲，且自身 r_k 维内可任意旋转。判定信号：`distill_loss` 下降明显慢于 mt4（1.09→0.36）。
+- **Z 的病态**：wd 必须为 0；仍需监控 ZZᵀ 的最小特征值，逼近 `orth_eps` 说明 Z 退化，应周期性行归一化（不改变 Ā）。
+- **eigh 的数值稳定性**：`torch.linalg.eigh` 的反向在特征值接近简并时会放大误差（梯度里有 1/(λ_i−λ_j)）。随机高斯 Z 的谱一般是分离的，但需监控 ZZᵀ 的谱间隔；若出现简并，改用 Newton–Schulz 迭代算 M^(-1/2)（只含矩阵乘、全程可微、无特征分解），数学结果相同。
+- **eigh 的反向开销**：每模块每次前向一个 R×R（256×256）的 eigh。数百个模块 × 每 micro-batch 一次，需在实现后实测；若成为瓶颈，可在 B 阶段缓存 Ā（该阶段 Z 不动，Ā 是常数），只在 A 阶段重算。这条优化 B 阶段完全等价，不改变数学。
+- **显存**：与 2026-08-20 夜里的 OOM 无关（那是 student+teacher+anchor 三份 7B 挤单卡）。slot 总参数量约为原 r=128 单 LoRA 的两倍，可忽略。
+- **前置条件**：GPU 0-3 当前被其他租户占用（78-80% util）。启动前按 `run_serial_cycle.sh` 的双重预检（显存 + 利用率采样 3 次）确认，并 `df -h /share/fanruochen-local`（当前 97% / 806G，一段 OPD 约写 29G）。
+
+## 12. 明确不做（YAGNI）
+
+- **LoRI 的 B 稀疏 mask**：slot 之间参数本就不相交，mask 防遗忘的作用冗余；其唯一剩余收益是省参数量，而参数量不是瓶颈。代价是每 suite 多一段校准 OPD。留作 v2。
+- **数据驱动的 A 初始化**（LoRA-GA / PiSSA 式，对 teacher 初始梯度做 SVD）：四 suite 输入高度重叠，主方向需再做跨 slot 正交化，引入"谁先占方向"的排序偏置，正好把要消除的不对称塞回来；且 on-policy 下 teacher 的梯度方向随策略移动而变。Z 参数化下 A 本来就能随数据学，此路的收益被覆盖。
+- **重新拉平四 suite 的血统**（回到共同祖先重训四段）：底座固定为 mt4 的起点 `lwf_long_e1000_merged`，血统不对称原样保留，只用 rank 分配 + 采样权重 + dynw 来应对。这样换来的是 mt4 / mt4w2 两个现成对照。
+- **推理期 slot 路由**：产物必须是单模型。
