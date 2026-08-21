@@ -15,6 +15,7 @@
 import asyncio
 import os
 import time
+from contextlib import nullcontext
 from functools import partial
 from typing import Optional
 
@@ -1002,6 +1003,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer")
         self.weight_syncer = WeightSyncer.create(weight_syncer_cfg)
 
+        # ---- slot-LoRI ------------------------------------------------------------
+        # K per-suite LoRA slots on orthogonal input subspaces instead of one shared
+        # block, so K distillation teachers stop overwriting each other. Read from
+        # CONFIG, which makes it identical on every rank -- the routing metric below is
+        # emitted on this condition, and all_reduce_dict sizes its packed tensor by the
+        # key count, so a rank-dependent metric key set deadlocks the collective.
+        self._slot_enabled = bool(
+            OmegaConf.select(cfg, "actor.model.slot_lora.enabled", default=False)
+        )
+        self._slot_gate = None  # the student's SlotGate; resolved in init_worker
+        self._slot_order = ()  # slot index -> suite name, read off the model
+        self._slot_gate_ids = None  # THIS micro-batch's routing (set by _route_prepare)
+        self._slot_fallback = 0.0  # fraction of samples that matched no suite
+        self._route_ready = False  # was the routing prepared for THIS micro-batch?
+
     def _setup_rollout_weight_dst_ranks(self) -> None:
         """
         Setup destination ranks for weight communication.
@@ -1045,6 +1061,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ):
             self._load_base_model()
 
+        # slot-LoRI: resolve the gate ONCE (find_slot_gate walks the module tree when
+        # the explicit handle is missing, and this is read once per micro-batch), and
+        # check the teacher routing table can actually fill every slot. AFTER the
+        # teachers, because that check needs their routing table.
+        self._slot_routing_setup()
+
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
@@ -1079,6 +1101,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 tcfg.model_path = path
                 tcfg.is_lora = _adapter is not None
                 tcfg.lora_path = _adapter
+                # A teacher is a PEFT/full model, NEVER a slot-LoRI student: it is
+                # frozen and only scores. On a slot run actor.model carries
+                # slot_lora.enabled=true and this deepcopy drags it along, and
+                # get_model would then take the slot path -- which refuses to run
+                # together with lora_path (it would silently ignore the adapter), so
+                # every adapter-form teacher dies at load. Drop the key here instead.
+                if tcfg.get("slot_lora", None) is not None:
+                    tcfg.slot_lora = None
                 # teacher may have DIFFERENT native norm_stats than the student. Teacher
                 # only SCORES (never acts), so its unnorm_key is a load-time validation
                 # only. Optional override; default (None) = inherit student's key.
@@ -1227,6 +1257,275 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 f"{self.cfg.actor.teacher_model_path}"
             )
 
+    def _slot_routing_setup(self) -> None:
+        """Resolve the student's :class:`SlotGate` and check the routing can drive it.
+
+        Called once, from :meth:`init_worker`, after the model and the teachers exist.
+        Every failure below is a config error whose symptom appears a long way from its
+        cause:
+
+        * no gate on a slot run -> every one of the 200-400 gated linears reads a
+          routing that was never installed (a strict gate raises from inside the model;
+          a non-strict one runs ungated and trains every slot on every sample, with no
+          error and a normal-looking loss curve);
+        * no prompt->suite table -> there is nothing to build a routing FROM, so every
+          sample would land on slot ``-1`` and the whole run would train nothing;
+        * a teacher-routed suite with no slot -> those samples ARE scored by their
+          expert and folded into the loss, but their gradient reaches no slot at all.
+
+        Doing it here costs ~two minutes of startup instead of one rollout (~25 min)
+        plus a forward.
+
+        Raises:
+            RuntimeError: on any of the three above.
+        """
+        if not self._slot_enabled:
+            return
+
+        from rlinf.models import find_slot_gate
+
+        self._slot_gate = find_slot_gate(self.model)
+        if self._slot_gate is None:
+            raise RuntimeError(
+                "actor.model.slot_lora.enabled=true but the built student has no "
+                "SlotGate. get_model only takes the slot path when actor.model.is_lora "
+                "is also true (see rlinf/models/__init__.py), so this usually means "
+                "is_lora=false, a checkpoint reload that rebuilt the modules, or a "
+                "model built by some other path entirely. Routing through a missing "
+                "gate is exactly the ungated forward the strict gate exists to prevent."
+            )
+        order = getattr(self.model, "_slot_order", None)
+        if not order:
+            raise RuntimeError(
+                "the student has a SlotGate but no _slot_order. The slot INDEX order "
+                "is what routing produces (match_suite_ids returns "
+                "suite_order.index(suite)), and it must be the same value the slots "
+                "were built from -- it is stashed on the model by _apply_slot_lora, "
+                "not re-read from config here, so that the two cannot drift apart."
+            )
+        self._slot_order = tuple(str(s) for s in order)
+
+        route = getattr(self, "teacher_prompt_to_suite", None)
+        if not route:
+            raise RuntimeError(
+                f"slot-LoRI is on with slots {list(self._slot_order)}, but there is no "
+                "prompt->suite routing table, so no sample can be assigned to a slot. "
+                "The table is built in _load_teacher_model and only exists for a "
+                "MULTI-teacher run (actor.teacher_map with more than one entry); with "
+                "one teacher there is nothing to route among and slots buy nothing. "
+                "Either give the run its teacher_map, or turn "
+                "actor.model.slot_lora.enabled off."
+            )
+        suite_to_path = getattr(self, "teacher_suite_to_path", None) or {}
+        unslotted = sorted(set(suite_to_path) - set(self._slot_order))
+        if unslotted:
+            raise RuntimeError(
+                f"suites {unslotted} have a teacher but no slot "
+                f"(actor.model.slot_lora.slot_order={list(self._slot_order)}). Their "
+                "samples would still be SCORED by their expert and folded into the "
+                "distillation loss while their gradient reached no slot at all -- a "
+                "silent one-way loss of exactly those suites' signal."
+            )
+        dead = [s for s in self._slot_order if s not in suite_to_path]
+        if dead:
+            self.log_warning(
+                f"[slot-lora] slots {dead} have no teacher in teacher_map; no sample "
+                "can be routed to them, so they stay at their zero initialization for "
+                "the whole run while still costing their rank."
+            )
+        self.log_info(
+            f"[slot-lora] routing ON: slots {list(self._slot_order)} <- "
+            f"{len(route)} task prompts over suites {sorted(suite_to_path)}"
+        )
+
+    def _route_match_order(self):
+        """Suite names the router matches against: the slots' order first.
+
+        A suite that has a TEACHER but no slot is appended rather than dropped, so it
+        still reaches its own expert instead of whichever one happens to be first.
+        (:meth:`_slot_routing_setup` refuses that combination on a slot run; this keeps
+        the plain multi-teacher path, where there are no slots at all, unchanged.)
+
+        Returns:
+            The list ``match_suite_ids`` indexes into. Cached: it is derived from
+            config and is identical on every rank and every micro-batch.
+        """
+        order = getattr(self, "_route_match_order_cache", None)
+        if order is None:
+            order = list(self._slot_order)
+            extra = set(getattr(self, "teacher_suite_to_path", None) or {})
+            route = getattr(self, "teacher_prompt_to_suite", None) or {}
+            extra |= set(route.values())
+            order += sorted(s for s in extra if s not in order)
+            self._route_match_order_cache = order
+        return order
+
+    def _route_prepare(self, forward_inputs) -> None:
+        """Decode THIS micro-batch's prompts ONCE and derive BOTH routings from them.
+
+        Sets, for the current micro-batch:
+
+        * ``self._last_groups`` -- teacher ckpt path -> sample indices, what
+          :meth:`_teacher_forward` splits and scatters its per-expert forwards with.
+        * ``self._slot_gate_ids`` -- ``LongTensor[B]`` giving each sample's slot, with
+          ``-1`` for "no slot owns this sample", on the input's device (which is the
+          activations' device). ``None`` when slot-LoRI is off.
+        * ``self._slot_fallback`` -- the fraction of samples that matched no suite.
+
+        WHY THIS IS NOT PART OF _teacher_forward. The STUDENT forward runs first and
+        the teacher forward second, so a gate built from ``self._last_groups`` at the
+        student forward would carry the PREVIOUS micro-batch's routing: every sample's
+        slot shifted by one micro-batch, with no error, no NaN and a normal-looking
+        loss curve. This runs before the student forward; _teacher_forward then reuses
+        what it produced instead of decoding a second time.
+
+        WHY BOTH ROUTINGS COME FROM ONE DECODE AND ONE MATCH. If the slot router and
+        the teacher router could disagree about a sample, that sample would be scored
+        by one suite's expert while its gradient was written into another suite's slot,
+        and nothing would raise. So the suite is resolved ONCE, by
+        :func:`~rlinf.models.slot_lora.match_suite_ids` -- whose matching semantics are
+        the verbatim mirror of the loop this replaced -- and the teacher path and the
+        slot index are both read off that one answer.
+
+        Args:
+            forward_inputs: This micro-batch's model inputs; ``input_ids`` carries the
+                tokenized task prompt and fixes the device the ids are built on.
+
+        Raises:
+            RuntimeError: if the share of samples matching no suite exceeds
+                ``algorithm.slot_route_fallback_tol`` (default ``0.0``). See the
+                message for why a single unmatched sample is worth stopping for.
+        """
+        from rlinf.models.slot_lora import match_suite_ids
+
+        self._last_groups = None
+        self._slot_gate_ids = None
+        self._slot_fallback = 0.0
+        # Set BEFORE the early returns: every exit from here is a fully prepared
+        # micro-batch, and _teacher_forward keys its "compute it myself" fallback off
+        # this flag -- an exit that left it False would decode the prompts twice.
+        self._route_ready = True
+
+        route = getattr(self, "teacher_prompt_to_suite", None)
+        models = getattr(self, "teacher_models", None)
+        if not route or not models or len(models) <= 1:
+            return  # single teacher (or no routing table): nothing to route
+        # The embodied actor has no self.tokenizer; the (frozen) teacher model carries
+        # the OFT input_processor, whose .tokenizer decodes the rollout prompts.
+        tok = getattr(self, "_route_tokenizer", None)
+        if tok is None:
+            proc = getattr(self.teacher_model, "input_processor", None)
+            tok = getattr(proc, "tokenizer", None) if proc is not None else None
+            self._route_tokenizer = tok
+        if tok is None:
+            return
+
+        ids = forward_inputs["input_ids"]
+        bsz = ids.shape[0]
+        texts = tok.batch_decode(ids, skip_special_tokens=True)
+        match_order = self._route_match_order()
+        matched = match_suite_ids(texts, route, match_order)
+        suites = [match_order[m] if m >= 0 else None for m in matched]
+
+        # Expose the teacher routing so the OPD loss can (a) build per-suite masks and
+        # (b) CROSS-SCORE: re-score suite i's states with suite j's expert.
+        # Cross-scoring is the functional-space test of "do the teachers fight" -- if
+        # KL(expert_j || student) RISES on suite i's states while KL(expert_i ||
+        # student) falls, the student is paying for one teacher with another. Note the
+        # teachers never meet in the loss itself (each scores only its own suite), so
+        # any conflict has to be parameter-level interference; this measures its
+        # behavioural shadow.
+        default_path = next(iter(models))
+        groups: dict = {}
+        for i, suite in enumerate(suites):
+            path = (
+                self.teacher_suite_to_path.get(suite, default_path)
+                if suite
+                else default_path
+            )
+            groups.setdefault(path, []).append(i)
+        self._last_groups = groups
+        self._slot_fallback = sum(1 for s in suites if s is None) / max(bsz, 1)
+
+        if not self._slot_enabled:
+            return
+        slot_of = self._slot_index_of()
+        self._slot_gate_ids = torch.as_tensor(
+            [slot_of.get(s, -1) if s is not None else -1 for s in suites],
+            dtype=torch.long,
+            device=ids.device,
+        )
+        if self._slot_fallback > 0.0:
+            unmatched = [t for t, s in zip(texts, suites) if s is None]
+            msg = (
+                f"[slot-lora] route_fallback: {len(unmatched)}/{bsz} samples of this "
+                f"micro-batch match no suite in the {len(route)}-prompt routing table, "
+                f"e.g. {unmatched[:3]!r}. Such a sample is ASYMMETRIC: the teacher "
+                f"router hands it to {default_path} (whichever expert loaded first) "
+                "and its KL is folded into the distillation loss, while the slot "
+                "router gives it -1, so its gradient reaches no slot at all -- it only "
+                "dilutes the loss denominator for the samples that ARE routed. All 40 "
+                "task prompts of this experiment are in the table, so the expected "
+                "value is EXACTLY 0 and any other value means the table has a hole "
+                "(and that other samples may be misrouted too, which is not visible "
+                "here). Fix the table; set algorithm.slot_route_fallback_tol above "
+                f"{self._slot_fallback:.4f} only if unrouted samples are deliberate."
+            )
+            if self._slot_fallback > float(
+                self.cfg.algorithm.get("slot_route_fallback_tol", 0.0)
+            ):
+                raise RuntimeError(msg)
+            if not getattr(self, "_slot_fallback_warned", False):
+                # Once per run, not once per micro-batch: it is tolerated by config
+                # here, so it is news exactly once.
+                self._slot_fallback_warned = True
+                self.log_warning(msg)
+
+    def _slot_index_of(self):
+        """``{suite name: slot index}``, cached. Empty when slot-LoRI is off."""
+        cache = getattr(self, "_slot_index_cache", None)
+        if cache is None:
+            cache = {s: i for i, s in enumerate(self._slot_order)}
+            self._slot_index_cache = cache
+        return cache
+
+    def _slot_scope(self):
+        """Install THIS micro-batch's slot routing, for the forward AND its backward.
+
+        Returned as a context manager rather than applied here because of what the
+        scope has to COVER. Gradient checkpointing (fsdp_model_manager.py) re-executes
+        the wrapped forward during ``backward()``, on the autograd engine's per-device
+        worker thread; a scope that closed after the forward leaves that recomputation
+        with no routing installed at all. A strict gate raises there (from inside a
+        backward, on another thread); a non-strict one silently runs ungated, every
+        slot takes gradient from every sample, and the isolation mechanism is entirely
+        off with no error and a normal-looking loss curve. So the block must enclose
+        the student forward, the loss, and ``scale(loss).backward()``.
+
+        Returns:
+            ``gate.scoped(ids)`` on a slot run, else :func:`contextlib.nullcontext` --
+            so with slot-LoRI off this is the code path it was before.
+
+        Raises:
+            RuntimeError: on a slot run whose routing was never prepared. The strict
+                gate would raise anyway, but 200-400 gated linears deep and with
+                nothing naming the micro-batch that skipped _route_prepare.
+        """
+        gate = self._slot_gate
+        if gate is None:
+            return nullcontext()
+        ids = self._slot_gate_ids
+        if ids is None:
+            raise RuntimeError(
+                "slot-LoRI is enabled but this micro-batch has no slot routing: "
+                "_route_prepare either was not called or found nothing to route "
+                "(no prompt->suite table, no tokenizer, or no forward_inputs). "
+                "Routing must be prepared from THIS micro-batch, before the student "
+                "forward -- reusing the previous one shifts every sample's slot by a "
+                "micro-batch, silently."
+            )
+        return gate.scoped(ids)
+
     def _teacher_forward(self, forward_inputs, kwargs):
         """Score the student's rollout with the teacher(s).
 
@@ -1265,39 +1564,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         ids = forward_inputs["input_ids"]
         bsz = ids.shape[0]
-        # decode prompts once -> suite -> teacher path (unknown prompt falls back to default).
-        # The embodied actor has no self.tokenizer; the (frozen) teacher model carries the
-        # OFT input_processor, whose .tokenizer decodes the rollout prompts.
-        _tok = getattr(self, "_route_tokenizer", None)
-        if _tok is None:
-            _proc = getattr(self.teacher_model, "input_processor", None)
-            _tok = getattr(_proc, "tokenizer", None) if _proc is not None else None
-            self._route_tokenizer = _tok
-        if _tok is None:
+        # The grouping is computed in _route_prepare, BEFORE the student forward, so
+        # that the slot gate and this split come from the same decode and the same
+        # match (see that docstring). Recompute only when this is called standalone --
+        # i.e. nothing prepared a routing for this micro-batch.
+        if not getattr(self, "_route_ready", False):
+            self._route_prepare(forward_inputs)
+        groups = self._last_groups
+        if not groups:
+            # No routing available (no tokenizer): one teacher for the whole
+            # micro-batch, exactly as before.
             return self.teacher_model(
                 forward_inputs=forward_inputs, compute_logprobs=True,
                 use_cache=False, **kwargs,
             )
-        texts = _tok.batch_decode(ids, skip_special_tokens=True)
-        _default_path = next(iter(_models))
-        groups: dict = {}
-        for i, t in enumerate(texts):
-            tl = t.strip().lower()
-            suite = None
-            for k, v in _route.items():   # instruction is a substring of the full prompt
-                if k in tl:
-                    suite = v
-                    break
-            path = self.teacher_suite_to_path.get(suite, _default_path) if suite else _default_path
-            groups.setdefault(path, []).append(i)
-
-        # Expose the routing so the OPD loss can (a) build per-suite masks and (b) CROSS-SCORE:
-        # re-score suite i's states with suite j's expert. Cross-scoring is the functional-space
-        # test of "do the teachers fight" -- if KL(expert_j || student) RISES on suite i's states
-        # while KL(expert_i || student) falls, the student is paying for one teacher with another.
-        # Note the teachers never meet in the loss itself (each scores only its own suite), so any
-        # conflict has to be parameter-level interference; this measures its behavioural shadow.
-        self._last_groups = groups
 
         if len(groups) == 1:  # whole micro-batch is one suite -> single forward
             only_path = next(iter(groups))
@@ -2127,515 +2407,558 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         True if self.cfg.algorithm.adv_type == "gae" else False
                     )
 
-                    with self.amp_context:
-                        output_dict = self.model(
-                            forward_inputs=forward_inputs,
-                            compute_logprobs=True,
-                            compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
-                            compute_values=compute_values,
-                            use_cache=False,
-                            **kwargs,
-                        )
-
-                    if (
-                        SupportedModel(self.cfg.actor.model.model_type)
-                        == SupportedModel.GR00T
+                    # ---- slot-LoRI: route BEFORE the student forward --------------
+                    # _teacher_forward runs AFTER this forward and is what used to
+                    # compute the prompt->suite grouping, so a gate built from
+                    # self._last_groups here would carry the PREVIOUS micro-batch's
+                    # routing -- every sample's slot shifted by one micro-batch, with
+                    # no error and a normal-looking loss curve. _route_prepare derives
+                    # the slot ids AND that grouping from one decode and one match.
+                    # Cleared UNCONDITIONALLY, before the call that may not happen:
+                    # leaving the previous micro-batch's ids in place is the exact
+                    # stale-routing failure this method exists to prevent, and it is
+                    # invisible (same shape, plausible values). With them cleared, a
+                    # micro-batch that reaches the forward unprepared raises instead.
+                    self._route_ready = False
+                    self._slot_gate_ids = None
+                    self._slot_fallback = 0.0
+                    if forward_inputs is not None and (
+                        self._slot_enabled or self.cfg.algorithm.adv_type == "opd"
                     ):
-                        prev_logprobs = output_dict["prev_logprobs"]
+                        self._route_prepare(forward_inputs)
+                    # The scope must reach the BACKWARD too: gradient checkpointing
+                    # re-runs the wrapped forward during backward(), on the autograd
+                    # engine's worker thread, and a scope closed after the forward
+                    # leaves that recomputation ungated. nullcontext when slot-LoRI is
+                    # off, so that path is unchanged. NOTE: an enable_sft_co_train run
+                    # would put _train_sft_epoch's forward (a DIFFERENT batch size)
+                    # inside this scope; SlotOut refuses a routing that does not match
+                    # its batch, loudly, which is the right outcome -- that combination
+                    # has no defined per-sample routing.
+                    with self._slot_scope():
+                        with self.amp_context:
+                            output_dict = self.model(
+                                forward_inputs=forward_inputs,
+                                compute_logprobs=True,
+                                compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                                compute_values=compute_values,
+                                use_cache=False,
+                                **kwargs,
+                            )
 
-                    if self.cfg.algorithm.adv_type == "opd":
-                        # VLA-OPD: frozen teacher scores the SAME actions the student executed
-                        # (forward_inputs holds the rollout action tokens); the reverse-KL
-                        # log-ratio is the advantage (detached -> constant reward).
-                        # Sequential CL uses ONE generalist teacher for all suites, so
-                        # self.teacher_model is used directly here. For TRUE multi-teacher
-                        # (per-suite experts) route with self.teacher_suite_to_path using
-                        # the sample's suite -- the rest of this block is unchanged.
-                        with torch.no_grad(), self.amp_context:
-                            teacher_out = self._teacher_forward(
-                                forward_inputs, kwargs
-                            )
-                        t_lp = teacher_out["logprobs"].detach()
-                        # per-token reverse-KL -> aggregate to per-chunk (num_action_chunks) so it
-                        # matches RLinf's action-granularity advantages. logprobs are
-                        # [B, num_action_chunks * action_dim]; the loss preprocessing reduces
-                        # logprobs over action_dim, and expects advantages already at [B, num_action_chunks].
-                        rkl = (t_lp - prev_logprobs).detach()  # [B, chunks*action_dim]
-                        sad = self.cfg.actor.model.get("action_dim", 7)
-                        # MEAN over the action_dim (not sum) -> per-chunk RKL, avoids one outlier
-                        # token dominating the whole chunk's advantage.
-                        adv = rkl.reshape(rkl.shape[0], -1, sad).mean(dim=-1)  # [B, chunks]
-                        # STANDARDIZE the advantage (masked) — the EmbodiedFSDPActor path has no
-                        # normalize_advantages, so raw RKL gave grad_norm 200-670 -> divergence.
-                        # Bring it to ~O(1) so PPO updates are stable.
-                        if self.cfg.algorithm.get("normalize_advantages", False):
-                            m = (loss_mask.to(adv.dtype) if loss_mask is not None
-                                 else torch.ones_like(adv))
-                            cnt = m.sum().clamp_min(1.0)
-                            mean = (adv * m).sum() / cnt
-                            var = (((adv - mean) ** 2) * m).sum() / cnt
-                            adv = ((adv - mean) / (var.sqrt() + 1e-6)) * m
-                        advantages = adv
-                        opd_gap = rkl.mean().item()  # mean(log pi_tea - log pi_stu) on executed actions
-                        # DIFFERENTIABLE on-policy distillation (pi0 op_distill analog): directly
-                        # minimize KL(student||teacher) over the 256 action bins on the student's
-                        # rollout states. Teacher detached (frozen); student side carries gradient.
-                        # This realizes OPD's reverse-KL objective as a DIFFERENTIABLE loss (GKD-style),
-                        # NOT the REINFORCE/advantage route (which wouldn't converge here).
-                        if "action_logits" in output_dict and "action_logits" in teacher_out:
-                            ls = torch.log_softmax(output_dict["action_logits"].float(), dim=-1)
-                            lt = torch.log_softmax(
-                                teacher_out["action_logits"].float().detach(), dim=-1
-                            )
-                            # Base-Centered Policy-Shift MOPD (BCF-MOPD): distill toward
-                            #   q ∝ π_0 · exp((log π_tea − log π_0)/β)  i.e.
-                            #   log q = log_softmax( lb + (lt − lb)/β )
-                            # instead of the full teacher lt. Only the teacher's SHIFT relative
-                            # to base is transferred, base-anchored: β>1 → q between base and
-                            # expert (preserves base generalization); β=1 → q=teacher (vanilla).
-                            # ONE coherent target -> no dual-KL anchor conflict.
-                            _sbeta = float(self.cfg.algorithm.get("shift_beta", 0.0))
-                            if _sbeta > 0.0 and getattr(self, "base_model", None) is not None:
+                        if (
+                            SupportedModel(self.cfg.actor.model.model_type)
+                            == SupportedModel.GR00T
+                        ):
+                            prev_logprobs = output_dict["prev_logprobs"]
+
+                        if self.cfg.algorithm.adv_type == "opd":
+                            # VLA-OPD: frozen teacher scores the SAME actions the student executed
+                            # (forward_inputs holds the rollout action tokens); the reverse-KL
+                            # log-ratio is the advantage (detached -> constant reward).
+                            # Sequential CL uses ONE generalist teacher for all suites, so
+                            # self.teacher_model is used directly here. For TRUE multi-teacher
+                            # (per-suite experts) route with self.teacher_suite_to_path using
+                            # the sample's suite -- the rest of this block is unchanged.
+                            with torch.no_grad(), self.amp_context:
+                                teacher_out = self._teacher_forward(
+                                    forward_inputs, kwargs
+                                )
+                            t_lp = teacher_out["logprobs"].detach()
+                            # per-token reverse-KL -> aggregate to per-chunk (num_action_chunks) so it
+                            # matches RLinf's action-granularity advantages. logprobs are
+                            # [B, num_action_chunks * action_dim]; the loss preprocessing reduces
+                            # logprobs over action_dim, and expects advantages already at [B, num_action_chunks].
+                            rkl = (t_lp - prev_logprobs).detach()  # [B, chunks*action_dim]
+                            sad = self.cfg.actor.model.get("action_dim", 7)
+                            # MEAN over the action_dim (not sum) -> per-chunk RKL, avoids one outlier
+                            # token dominating the whole chunk's advantage.
+                            adv = rkl.reshape(rkl.shape[0], -1, sad).mean(dim=-1)  # [B, chunks]
+                            # STANDARDIZE the advantage (masked) — the EmbodiedFSDPActor path has no
+                            # normalize_advantages, so raw RKL gave grad_norm 200-670 -> divergence.
+                            # Bring it to ~O(1) so PPO updates are stable.
+                            if self.cfg.algorithm.get("normalize_advantages", False):
+                                m = (loss_mask.to(adv.dtype) if loss_mask is not None
+                                     else torch.ones_like(adv))
+                                cnt = m.sum().clamp_min(1.0)
+                                mean = (adv * m).sum() / cnt
+                                var = (((adv - mean) ** 2) * m).sum() / cnt
+                                adv = ((adv - mean) / (var.sqrt() + 1e-6)) * m
+                            advantages = adv
+                            opd_gap = rkl.mean().item()  # mean(log pi_tea - log pi_stu) on executed actions
+                            # DIFFERENTIABLE on-policy distillation (pi0 op_distill analog): directly
+                            # minimize KL(student||teacher) over the 256 action bins on the student's
+                            # rollout states. Teacher detached (frozen); student side carries gradient.
+                            # This realizes OPD's reverse-KL objective as a DIFFERENTIABLE loss (GKD-style),
+                            # NOT the REINFORCE/advantage route (which wouldn't converge here).
+                            if "action_logits" in output_dict and "action_logits" in teacher_out:
+                                ls = torch.log_softmax(output_dict["action_logits"].float(), dim=-1)
+                                lt = torch.log_softmax(
+                                    teacher_out["action_logits"].float().detach(), dim=-1
+                                )
+                                # Base-Centered Policy-Shift MOPD (BCF-MOPD): distill toward
+                                #   q ∝ π_0 · exp((log π_tea − log π_0)/β)  i.e.
+                                #   log q = log_softmax( lb + (lt − lb)/β )
+                                # instead of the full teacher lt. Only the teacher's SHIFT relative
+                                # to base is transferred, base-anchored: β>1 → q between base and
+                                # expert (preserves base generalization); β=1 → q=teacher (vanilla).
+                                # ONE coherent target -> no dual-KL anchor conflict.
+                                _sbeta = float(self.cfg.algorithm.get("shift_beta", 0.0))
+                                if _sbeta > 0.0 and getattr(self, "base_model", None) is not None:
+                                    with torch.no_grad(), self.amp_context:
+                                        _shift_base_out = self.base_model(
+                                            forward_inputs=forward_inputs,
+                                            compute_logprobs=True,
+                                            use_cache=False,
+                                            **kwargs,
+                                        )
+                                    if "action_logits" in _shift_base_out:
+                                        _lb_s = torch.log_softmax(
+                                            _shift_base_out["action_logits"].float().detach(),
+                                            dim=-1,
+                                        )
+                                        lt = torch.log_softmax(
+                                            _lb_s + (lt - _lb_s) / _sbeta, dim=-1
+                                        )
+                                # diagnostic: reverse KL(student||teacher) (comparable across runs)
+                                opd_kl = (ls.exp() * (ls - lt)).sum(dim=-1).detach().mean().item()
+                                # LOSS direction (distill_kl):
+                                #   forward  = KL(teacher||student), teacher-weighted, MODE-COVERING
+                                #     (student covers teacher's good actions without deleting its own ->
+                                #      FORGETS LESS; matches pi0 velocity-MSE that worked).
+                                #   reverse  = KL(student||teacher), MODE-SEEKING (zero-forces student
+                                #      onto teacher's OOD flatness -> catastrophic forgetting; what failed).
+                                _dkl = self.cfg.algorithm.get("distill_kl", "forward")
+                                if _dkl == "reverse":
+                                    kl_tok = (ls.exp() * (ls - lt)).sum(dim=-1)
+                                elif _dkl == "jsd":
+                                    # Generalized JSD (GKD, verified recommendation): beta->0 = forward
+                                    # (mode-covering), beta->1 = reverse; bounded by log2 so NO off-support
+                                    # blow-up, and closed-form so NO dropped state-visitation bias / no
+                                    # REINFORCE variance. Small beta = the weak-student sweet spot.
+                                    beta = float(self.cfg.algorithm.get("jsd_beta", 0.3))
+                                    pt = lt.exp()
+                                    ps = ls.exp()
+                                    m = (beta * pt + (1.0 - beta) * ps).clamp_min(1e-8)
+                                    lm = m.log()
+                                    kl_tok = (
+                                        beta * (pt * (lt - lm)).sum(dim=-1)
+                                        + (1.0 - beta) * (ps * (ls - lm)).sum(dim=-1)
+                                    )
+                                else:
+                                    pt = lt.exp()  # teacher probs (detached)
+                                    kl_tok = (pt * (lt - ls)).sum(dim=-1)  # forward KL, grad via ls
+                                # CONFIDENCE FILTER (kit): down-weight tokens where the TEACHER itself is
+                                # uncertain (high entropy = OOD / off-support state) so we don't distill the
+                                # teacher's garbage on the weak student's own drifted states.
+                                _conf_tau = float(self.cfg.algorithm.get("distill_conf_tau", 0.0))
+                                if _conf_tau > 0.0:
+                                    with torch.no_grad():
+                                        pt_d = lt.exp()
+                                        t_ent = -(pt_d * lt).sum(dim=-1)  # teacher entropy per token
+                                        ent_max = torch.log(
+                                            torch.tensor(float(pt_d.shape[-1]), device=pt_d.device)
+                                        )
+                                        conf_w = (1.0 - t_ent / ent_max).clamp_min(0.0).pow(_conf_tau)
+                                    kl_tok = kl_tok * conf_w
+                                # FAILURE-ONLY distillation (distill_on_failure=True): only distill where
+                                # the student's own rollout FAILED. Where it already succeeds, the
+                                # teacher's disagreement is style, not substance -- we measured that
+                                # three models which ALL solve object still disagree on 25-42% of
+                                # actions, i.e. as much as the student-teacher gap itself, so copying it
+                                # wastes the shared LoRA capacity and is what makes several per-suite
+                                # experts fight each other.
+                                # The flag is "traj_fail", precomputed in _process_received_rollout_batch
+                                # where the trajectory structure still exists (see the comment there for
+                                # why computing it from this micro-batch's rewards is WRONG).
+                                # Two ways to emphasise what the student got WRONG:
+                                #   distill_on_failure=True  -> HARD filter, successful positions are
+                                #                               dropped entirely (mtok *= fail).
+                                #   distill_fail_alpha=a>0   -> SOFT weight, failed positions count
+                                #                               (1+a)x and successful ones still count 1.
+                                # Soft is the default choice: the hard filter throws away every state the
+                                # student already handles, which is also where "don't break what works"
+                                # has to be learned. Hard wins ties (both set = hard).
+                                _fail_only = bool(
+                                    self.cfg.algorithm.get("distill_on_failure", False)
+                                )
+                                _fail_alpha = float(
+                                    self.cfg.algorithm.get("distill_fail_alpha", 0.0)
+                                )
+                                fail_m = None
+                                if _fail_only or _fail_alpha > 0.0:
+                                    fail_m = batch.get("traj_fail", None)
+                                    if fail_m is None:
+                                        raise RuntimeError(
+                                            "distill_on_failure=True but 'traj_fail' is missing from the "
+                                            "batch -- it must be built in _process_received_rollout_batch; "
+                                            "refusing to silently fall back to distilling everything."
+                                        )
+                                    fail_m = fail_m.to(kl_tok.dtype)
+                                if loss_mask is not None:
+                                    # loss_mask is per-chunk [B, chunks]; expand to per-token to mask kl_tok
+                                    mtok = (
+                                        loss_mask.to(kl_tok.dtype)
+                                        .unsqueeze(-1)
+                                        .expand(-1, -1, sad)
+                                        .reshape(kl_tok.shape[0], -1)
+                                    )
+                                else:
+                                    mtok = torch.ones_like(kl_tok)
+                                if fail_m is not None:
+                                    # traj_fail is per-chunk [B, chunks] like loss_mask -> expand the same way
+                                    fm = (
+                                        fail_m.unsqueeze(-1)
+                                        .expand(-1, -1, sad)
+                                        .reshape(kl_tok.shape[0], -1)
+                                    )
+                                    if _fail_only:
+                                        mtok = mtok * fm
+                                    else:
+                                        mtok = mtok * (1.0 + _fail_alpha * fm)
+                                    # fraction of the VALID (loss_mask'd) positions we actually distil on.
+                                    # SELF-CHECK: this must land near (1 - success_rate), NOT ~0.98.
+                                    with torch.no_grad():
+                                        _base = (
+                                            loss_mask.to(kl_tok.dtype)
+                                            .unsqueeze(-1)
+                                            .expand(-1, -1, sad)
+                                            .reshape(kl_tok.shape[0], -1)
+                                            if loss_mask is not None
+                                            else torch.ones_like(kl_tok)
+                                        )
+                                        # fraction of VALID positions that are failures -- identical in
+                                        # both modes, so the "must land near (1 - success_rate)" check
+                                        # still applies when soft weighting rescales mtok.
+                                        self._last_fail_frac = (
+                                            (_base * fm).sum() / _base.sum().clamp_min(1.0)
+                                        ).item()
+                                # ---- DYNAMIC PER-SUITE DISTILL STRENGTH ----------------------
+                                # "push harder where the student is further from its teacher." The
+                                # distance is measured by the KL itself, computed on this very forward
+                                # pass -- NOT by the per-suite success rate seen during training, which
+                                # was measured wrong by +0.32 (long) and -0.33 (goal) against a post-hoc
+                                # 50-env eval and would have weighted exactly backwards.
+                                #
+                                # w_s = clip((ema_kl_s / mean_ema_kl) ** alpha, w_min, w_max), then
+                                # renormalised to mean 1 so the loss scale (and the usable lr) does not
+                                # drift. w_min > 0 on purpose: a suite the student already matches still
+                                # needs a nonzero pull or the other suites' gradients walk it back.
+                                #
+                                # TWO THINGS THIS VERSION GETS RIGHT AND THE FIRST ONE DID NOT:
+                                #  1. NO GPU->CPU SYNC IN THE HOT PATH. The first cut called .item() per
+                                #     suite per micro-batch (plus a host->device copy per suite for the
+                                #     index list) -- ~12 syncs per micro-batch, which across 6 FSDP ranks
+                                #     stalls every rank at the next collective and took the update phase
+                                #     from ~15 min to ~39 min. Everything below stays on the GPU:
+                                #     index_add_ for the per-suite means, EMA as a device tensor.
+                                #  2. A FIXED SUITE KEY SET. The metrics emitted at the bottom must not
+                                #     depend on which suites this rank's micro-batch happened to contain:
+                                #     all_reduce_dict packs the metric dict into ONE tensor sized by key
+                                #     count, so a rank that saw 3 suites and a rank that saw 4 would
+                                #     all-reduce different-sized tensors and hang forever. Same failure
+                                #     that was fixed in libero_env.py earlier; do not reintroduce it.
+                                # Per-suite distillation strength. The WEIGHTS themselves are
+                                # recomputed once per training step in _dw_refresh_weights(); this
+                                # path only gathers them and accumulates the KL that feeds the next
+                                # refresh. NOTHING here may force a device sync -- `.any()`, `.item()`
+                                # and boolean-mask indexing all do, and 32 micro-batches x ~6 syncs
+                                # measured run_training at 80.0 min against a 14.3 min baseline on an
+                                # otherwise identical config (2026-08-20). Keep it gather-only.
+                                _dynw = float(self.cfg.algorithm.get("distill_dyn_weight", 0.0))
+                                _wrow = None
+                                if _dynw > 0.0 and getattr(self, "_last_groups", None):
+                                    with torch.no_grad():
+                                        if not hasattr(self, "_dw_paths"):
+                                            _s2p = getattr(self, "teacher_suite_to_path", {}) or {}
+                                            self._dw_paths = sorted(set(_s2p.values()))
+                                            self._dw_w = None
+                                        _paths = self._dw_paths
+                                        _np = len(_paths)
+                                        if _np > 1:
+                                            _dev, _dt = kl_tok.device, kl_tok.dtype
+                                            if getattr(self, "_dw_w", None) is None:
+                                                self._dw_w = torch.ones(_np, device=_dev, dtype=_dt)
+                                                self._dw_ema = torch.zeros(_np, device=_dev, dtype=_dt)
+                                                self._dw_n = torch.zeros(_np, device=_dev, dtype=_dt)
+                                                self._dw_d = torch.zeros(_np, device=_dev, dtype=_dt)
+                                                self._dw_w_list = None
+                                                self._dw_kl_list = None
+                                            _pi = {p: i for i, p in enumerate(_paths)}
+                                            _B = kl_tok.shape[0]
+                                            _g = [-1] * _B
+                                            for _p, _idxs in self._last_groups.items():
+                                                _k = _pi.get(_p)
+                                                if _k is not None:
+                                                    for _i in _idxs:
+                                                        if 0 <= _i < _B:
+                                                            _g[_i] = _k
+                                            # pinned staging buffer -> the H2D copy is async and does
+                                            # NOT drain the compute stream the way a pageable copy does
+                                            _hb = getattr(self, "_dw_hostbuf", None)
+                                            if _hb is None or _hb.numel() < _B:
+                                                self._dw_hostbuf = torch.empty(
+                                                    _B, dtype=torch.long, pin_memory=True
+                                                )
+                                                _hb = self._dw_hostbuf
+                                            _hb = _hb[:_B]
+                                            _hb.copy_(torch.as_tensor(_g, dtype=torch.long))
+                                            _gidx = _hb.to(_dev, non_blocking=True)
+                                            _valid = (_gidx >= 0).to(_dt)
+                                            _safe = _gidx.clamp_min(0)
+                                            # feed the NEXT refresh (index_add_ never syncs); rows with
+                                            # no routed teacher contribute exactly 0 via _valid
+                                            self._dw_n.index_add_(
+                                                0, _safe, (kl_tok * mtok).sum(-1) * _valid
+                                            )
+                                            self._dw_d.index_add_(0, _safe, mtok.sum(-1) * _valid)
+                                            # weights from the last refresh; unrouted rows get 1.0
+                                            _wrow = self._dw_w[_safe] * _valid + (1.0 - _valid)
+                                if _wrow is not None:
+                                    _wt = _wrow.unsqueeze(-1)
+                                    opd_distill_loss = (kl_tok * mtok * _wt).sum() / (mtok * _wt).sum().clamp_min(1.0)
+                                else:
+                                    opd_distill_loss = (kl_tok * mtok).sum() / mtok.sum().clamp_min(1.0)
+
+                                # How many suites this micro-batch actually contains. Both probes are
+                                # meaningless on a single-suite micro-batch (there is no other expert
+                                # to compare against), and whether the data mixes suites at all is an
+                                # empirical question about the rollout/shuffle pipeline -- so MEASURE
+                                # it instead of assuming. If this sits at 1.0 the probes are silently
+                                # inert and the routing/group_size has to change first.
+                                _ngrp = len(getattr(self, "_last_groups", {}) or {})
+                                self._last_nsuites = float(_ngrp)
+
+                                # absorbability / signal-location probe. NOT gated on multi-suite:
+                                # it asks about ONE teacher-student pair, so a single-suite micro-batch
+                                # is perfectly valid input.
+                                if getattr(self, "_sig_armed", False):
+                                    self._sig_armed = False
+                                    try:
+                                        self._last_sig = self._signal_stats(
+                                            ls.detach(), lt, kl_tok.detach(), mtok
+                                        )
+                                    except Exception as _e:
+                                        self._last_sig = {}
+                                        self.log_warning(f"[VLA-OPD] signal_stats failed: {_e}")
+
+                                # Probes run on the first MIXED micro-batch of the step. The latch is
+                                # NOT cleared on a single-suite batch: clearing it there would spend
+                                # the step's one probe on a batch that can produce nothing.
+                                if getattr(self, "_xscore_armed", False) and _ngrp >= 2:
+                                    try:
+                                        self._last_xkl = self._cross_score(
+                                            forward_inputs, kwargs, ls.detach(), loss_mask, sad
+                                        )
+                                        self._xscore_armed = False
+                                    except Exception as _e:  # never let a probe kill a training run
+                                        self._last_xkl = {}
+                                        self._xscore_armed = False
+                                        self.log_warning(f"[VLA-OPD] cross_score failed: {_e}")
+
+                                # per-suite gradient conflict probe: first mixed micro-batch of the
+                                # step. MUST run before the real backward frees the graph.
+                                if getattr(self, "_gconf_armed", False) and _ngrp >= 2:
+                                    try:
+                                        self._last_gconf = self._grad_conflict(kl_tok, mtok)
+                                        self._gconf_armed = False
+                                    except Exception as _e:
+                                        self._last_gconf = {}
+                                        self._gconf_armed = False
+                                        self.log_warning(f"[VLA-OPD] grad_conflict failed: {_e}")
+
+                            # ---- data-free BASE anchors (action-KL + visual-representation) ----
+                            # (a) action anchor = mode-covering forward-KL to base on rollout states
+                            #     (preserve task behavior); (b) visual anchor = cosine of mid-layer
+                            #     vision+prompt features to base (preserve BROAD OOD generalization).
+                            _alam = float(self.cfg.algorithm.get("anchor_lambda", 0.0))
+                            _vlam = float(self.cfg.algorithm.get("visual_anchor_lambda", 0.0))
+                            if (_alam > 0.0 or _vlam > 0.0) and getattr(
+                                self, "base_model", None
+                            ) is not None:
                                 with torch.no_grad(), self.amp_context:
-                                    _shift_base_out = self.base_model(
+                                    base_out = self.base_model(
                                         forward_inputs=forward_inputs,
                                         compute_logprobs=True,
                                         use_cache=False,
                                         **kwargs,
                                     )
-                                if "action_logits" in _shift_base_out:
-                                    _lb_s = torch.log_softmax(
-                                        _shift_base_out["action_logits"].float().detach(),
-                                        dim=-1,
+                                # (a) ACTION anchor
+                                if (
+                                    _alam > 0.0
+                                    and "action_logits" in output_dict
+                                    and "action_logits" in base_out
+                                ):
+                                    lb = torch.log_softmax(
+                                        base_out["action_logits"].float().detach(), dim=-1
                                     )
-                                    lt = torch.log_softmax(
-                                        _lb_s + (lt - _lb_s) / _sbeta, dim=-1
+                                    ls_a = torch.log_softmax(
+                                        output_dict["action_logits"].float(), dim=-1
                                     )
-                            # diagnostic: reverse KL(student||teacher) (comparable across runs)
-                            opd_kl = (ls.exp() * (ls - lt)).sum(dim=-1).detach().mean().item()
-                            # LOSS direction (distill_kl):
-                            #   forward  = KL(teacher||student), teacher-weighted, MODE-COVERING
-                            #     (student covers teacher's good actions without deleting its own ->
-                            #      FORGETS LESS; matches pi0 velocity-MSE that worked).
-                            #   reverse  = KL(student||teacher), MODE-SEEKING (zero-forces student
-                            #      onto teacher's OOD flatness -> catastrophic forgetting; what failed).
-                            _dkl = self.cfg.algorithm.get("distill_kl", "forward")
-                            if _dkl == "reverse":
-                                kl_tok = (ls.exp() * (ls - lt)).sum(dim=-1)
-                            elif _dkl == "jsd":
-                                # Generalized JSD (GKD, verified recommendation): beta->0 = forward
-                                # (mode-covering), beta->1 = reverse; bounded by log2 so NO off-support
-                                # blow-up, and closed-form so NO dropped state-visitation bias / no
-                                # REINFORCE variance. Small beta = the weak-student sweet spot.
-                                beta = float(self.cfg.algorithm.get("jsd_beta", 0.3))
-                                pt = lt.exp()
-                                ps = ls.exp()
-                                m = (beta * pt + (1.0 - beta) * ps).clamp_min(1e-8)
-                                lm = m.log()
-                                kl_tok = (
-                                    beta * (pt * (lt - lm)).sum(dim=-1)
-                                    + (1.0 - beta) * (ps * (ls - lm)).sum(dim=-1)
-                                )
-                            else:
-                                pt = lt.exp()  # teacher probs (detached)
-                                kl_tok = (pt * (lt - ls)).sum(dim=-1)  # forward KL, grad via ls
-                            # CONFIDENCE FILTER (kit): down-weight tokens where the TEACHER itself is
-                            # uncertain (high entropy = OOD / off-support state) so we don't distill the
-                            # teacher's garbage on the weak student's own drifted states.
-                            _conf_tau = float(self.cfg.algorithm.get("distill_conf_tau", 0.0))
-                            if _conf_tau > 0.0:
-                                with torch.no_grad():
-                                    pt_d = lt.exp()
-                                    t_ent = -(pt_d * lt).sum(dim=-1)  # teacher entropy per token
-                                    ent_max = torch.log(
-                                        torch.tensor(float(pt_d.shape[-1]), device=pt_d.device)
-                                    )
-                                    conf_w = (1.0 - t_ent / ent_max).clamp_min(0.0).pow(_conf_tau)
-                                kl_tok = kl_tok * conf_w
-                            # FAILURE-ONLY distillation (distill_on_failure=True): only distill where
-                            # the student's own rollout FAILED. Where it already succeeds, the
-                            # teacher's disagreement is style, not substance -- we measured that
-                            # three models which ALL solve object still disagree on 25-42% of
-                            # actions, i.e. as much as the student-teacher gap itself, so copying it
-                            # wastes the shared LoRA capacity and is what makes several per-suite
-                            # experts fight each other.
-                            # The flag is "traj_fail", precomputed in _process_received_rollout_batch
-                            # where the trajectory structure still exists (see the comment there for
-                            # why computing it from this micro-batch's rewards is WRONG).
-                            # Two ways to emphasise what the student got WRONG:
-                            #   distill_on_failure=True  -> HARD filter, successful positions are
-                            #                               dropped entirely (mtok *= fail).
-                            #   distill_fail_alpha=a>0   -> SOFT weight, failed positions count
-                            #                               (1+a)x and successful ones still count 1.
-                            # Soft is the default choice: the hard filter throws away every state the
-                            # student already handles, which is also where "don't break what works"
-                            # has to be learned. Hard wins ties (both set = hard).
-                            _fail_only = bool(
-                                self.cfg.algorithm.get("distill_on_failure", False)
-                            )
-                            _fail_alpha = float(
-                                self.cfg.algorithm.get("distill_fail_alpha", 0.0)
-                            )
-                            fail_m = None
-                            if _fail_only or _fail_alpha > 0.0:
-                                fail_m = batch.get("traj_fail", None)
-                                if fail_m is None:
-                                    raise RuntimeError(
-                                        "distill_on_failure=True but 'traj_fail' is missing from the "
-                                        "batch -- it must be built in _process_received_rollout_batch; "
-                                        "refusing to silently fall back to distilling everything."
-                                    )
-                                fail_m = fail_m.to(kl_tok.dtype)
-                            if loss_mask is not None:
-                                # loss_mask is per-chunk [B, chunks]; expand to per-token to mask kl_tok
-                                mtok = (
-                                    loss_mask.to(kl_tok.dtype)
-                                    .unsqueeze(-1)
-                                    .expand(-1, -1, sad)
-                                    .reshape(kl_tok.shape[0], -1)
-                                )
-                            else:
-                                mtok = torch.ones_like(kl_tok)
-                            if fail_m is not None:
-                                # traj_fail is per-chunk [B, chunks] like loss_mask -> expand the same way
-                                fm = (
-                                    fail_m.unsqueeze(-1)
-                                    .expand(-1, -1, sad)
-                                    .reshape(kl_tok.shape[0], -1)
-                                )
-                                if _fail_only:
-                                    mtok = mtok * fm
-                                else:
-                                    mtok = mtok * (1.0 + _fail_alpha * fm)
-                                # fraction of the VALID (loss_mask'd) positions we actually distil on.
-                                # SELF-CHECK: this must land near (1 - success_rate), NOT ~0.98.
-                                with torch.no_grad():
-                                    _base = (
-                                        loss_mask.to(kl_tok.dtype)
-                                        .unsqueeze(-1)
-                                        .expand(-1, -1, sad)
-                                        .reshape(kl_tok.shape[0], -1)
-                                        if loss_mask is not None
-                                        else torch.ones_like(kl_tok)
-                                    )
-                                    # fraction of VALID positions that are failures -- identical in
-                                    # both modes, so the "must land near (1 - success_rate)" check
-                                    # still applies when soft weighting rescales mtok.
-                                    self._last_fail_frac = (
-                                        (_base * fm).sum() / _base.sum().clamp_min(1.0)
-                                    ).item()
-                            # ---- DYNAMIC PER-SUITE DISTILL STRENGTH ----------------------
-                            # "push harder where the student is further from its teacher." The
-                            # distance is measured by the KL itself, computed on this very forward
-                            # pass -- NOT by the per-suite success rate seen during training, which
-                            # was measured wrong by +0.32 (long) and -0.33 (goal) against a post-hoc
-                            # 50-env eval and would have weighted exactly backwards.
-                            #
-                            # w_s = clip((ema_kl_s / mean_ema_kl) ** alpha, w_min, w_max), then
-                            # renormalised to mean 1 so the loss scale (and the usable lr) does not
-                            # drift. w_min > 0 on purpose: a suite the student already matches still
-                            # needs a nonzero pull or the other suites' gradients walk it back.
-                            #
-                            # TWO THINGS THIS VERSION GETS RIGHT AND THE FIRST ONE DID NOT:
-                            #  1. NO GPU->CPU SYNC IN THE HOT PATH. The first cut called .item() per
-                            #     suite per micro-batch (plus a host->device copy per suite for the
-                            #     index list) -- ~12 syncs per micro-batch, which across 6 FSDP ranks
-                            #     stalls every rank at the next collective and took the update phase
-                            #     from ~15 min to ~39 min. Everything below stays on the GPU:
-                            #     index_add_ for the per-suite means, EMA as a device tensor.
-                            #  2. A FIXED SUITE KEY SET. The metrics emitted at the bottom must not
-                            #     depend on which suites this rank's micro-batch happened to contain:
-                            #     all_reduce_dict packs the metric dict into ONE tensor sized by key
-                            #     count, so a rank that saw 3 suites and a rank that saw 4 would
-                            #     all-reduce different-sized tensors and hang forever. Same failure
-                            #     that was fixed in libero_env.py earlier; do not reintroduce it.
-                            # Per-suite distillation strength. The WEIGHTS themselves are
-                            # recomputed once per training step in _dw_refresh_weights(); this
-                            # path only gathers them and accumulates the KL that feeds the next
-                            # refresh. NOTHING here may force a device sync -- `.any()`, `.item()`
-                            # and boolean-mask indexing all do, and 32 micro-batches x ~6 syncs
-                            # measured run_training at 80.0 min against a 14.3 min baseline on an
-                            # otherwise identical config (2026-08-20). Keep it gather-only.
-                            _dynw = float(self.cfg.algorithm.get("distill_dyn_weight", 0.0))
-                            _wrow = None
-                            if _dynw > 0.0 and getattr(self, "_last_groups", None):
-                                with torch.no_grad():
-                                    if not hasattr(self, "_dw_paths"):
-                                        _s2p = getattr(self, "teacher_suite_to_path", {}) or {}
-                                        self._dw_paths = sorted(set(_s2p.values()))
-                                        self._dw_w = None
-                                    _paths = self._dw_paths
-                                    _np = len(_paths)
-                                    if _np > 1:
-                                        _dev, _dt = kl_tok.device, kl_tok.dtype
-                                        if getattr(self, "_dw_w", None) is None:
-                                            self._dw_w = torch.ones(_np, device=_dev, dtype=_dt)
-                                            self._dw_ema = torch.zeros(_np, device=_dev, dtype=_dt)
-                                            self._dw_n = torch.zeros(_np, device=_dev, dtype=_dt)
-                                            self._dw_d = torch.zeros(_np, device=_dev, dtype=_dt)
-                                            self._dw_w_list = None
-                                            self._dw_kl_list = None
-                                        _pi = {p: i for i, p in enumerate(_paths)}
-                                        _B = kl_tok.shape[0]
-                                        _g = [-1] * _B
-                                        for _p, _idxs in self._last_groups.items():
-                                            _k = _pi.get(_p)
-                                            if _k is not None:
-                                                for _i in _idxs:
-                                                    if 0 <= _i < _B:
-                                                        _g[_i] = _k
-                                        # pinned staging buffer -> the H2D copy is async and does
-                                        # NOT drain the compute stream the way a pageable copy does
-                                        _hb = getattr(self, "_dw_hostbuf", None)
-                                        if _hb is None or _hb.numel() < _B:
-                                            self._dw_hostbuf = torch.empty(
-                                                _B, dtype=torch.long, pin_memory=True
+                                    pb = lb.exp()
+                                    a_tok = (pb * (lb - ls_a)).sum(dim=-1)  # forward-KL, mode-covering
+                                    _agate = self.cfg.algorithm.get("anchor_gate", "none")
+                                    _atau = float(self.cfg.algorithm.get("anchor_gate_tau", 1.0))
+                                    if _agate in ("low_ent", "high_ent"):
+                                        with torch.no_grad():
+                                            b_ent = -(pb * lb).sum(dim=-1)
+                                            _emax = torch.log(
+                                                torch.tensor(float(pb.shape[-1]), device=pb.device)
                                             )
-                                            _hb = self._dw_hostbuf
-                                        _hb = _hb[:_B]
-                                        _hb.copy_(torch.as_tensor(_g, dtype=torch.long))
-                                        _gidx = _hb.to(_dev, non_blocking=True)
-                                        _valid = (_gidx >= 0).to(_dt)
-                                        _safe = _gidx.clamp_min(0)
-                                        # feed the NEXT refresh (index_add_ never syncs); rows with
-                                        # no routed teacher contribute exactly 0 via _valid
-                                        self._dw_n.index_add_(
-                                            0, _safe, (kl_tok * mtok).sum(-1) * _valid
+                                            conf = (1.0 - b_ent / _emax).clamp(0.0, 1.0)
+                                            gate = (
+                                                conf.pow(_atau)
+                                                if _agate == "low_ent"
+                                                else (1.0 - conf).pow(_atau)
+                                            )
+                                        a_tok = a_tok * gate
+                                    if loss_mask is not None:
+                                        _amt = (
+                                            loss_mask.to(a_tok.dtype)
+                                            .unsqueeze(-1)
+                                            .expand(-1, -1, sad)
+                                            .reshape(a_tok.shape[0], -1)
                                         )
-                                        self._dw_d.index_add_(0, _safe, mtok.sum(-1) * _valid)
-                                        # weights from the last refresh; unrouted rows get 1.0
-                                        _wrow = self._dw_w[_safe] * _valid + (1.0 - _valid)
-                            if _wrow is not None:
-                                _wt = _wrow.unsqueeze(-1)
-                                opd_distill_loss = (kl_tok * mtok * _wt).sum() / (mtok * _wt).sum().clamp_min(1.0)
-                            else:
-                                opd_distill_loss = (kl_tok * mtok).sum() / mtok.sum().clamp_min(1.0)
+                                        anchor_loss = (a_tok * _amt).sum() / _amt.sum().clamp_min(1.0)
+                                    else:
+                                        anchor_loss = a_tok.mean()
+                                # (b) VISUAL anchor: patch-wise cosine of mid-layer features to base
+                                if (
+                                    _vlam > 0.0
+                                    and "mid_features" in output_dict
+                                    and "mid_features" in base_out
+                                ):
+                                    fs = output_dict["mid_features"].float()
+                                    fb = base_out["mid_features"].float().detach()
+                                    cos = torch.nn.functional.cosine_similarity(fs, fb, dim=-1)
+                                    visual_loss = (1.0 - cos).mean()
 
-                            # How many suites this micro-batch actually contains. Both probes are
-                            # meaningless on a single-suite micro-batch (there is no other expert
-                            # to compare against), and whether the data mixes suites at all is an
-                            # empirical question about the rollout/shuffle pipeline -- so MEASURE
-                            # it instead of assuming. If this sits at 1.0 the probes are silently
-                            # inert and the routing/group_size has to change first.
-                            _ngrp = len(getattr(self, "_last_groups", {}) or {})
-                            self._last_nsuites = float(_ngrp)
-
-                            # absorbability / signal-location probe. NOT gated on multi-suite:
-                            # it asks about ONE teacher-student pair, so a single-suite micro-batch
-                            # is perfectly valid input.
-                            if getattr(self, "_sig_armed", False):
-                                self._sig_armed = False
-                                try:
-                                    self._last_sig = self._signal_stats(
-                                        ls.detach(), lt, kl_tok.detach(), mtok
-                                    )
-                                except Exception as _e:
-                                    self._last_sig = {}
-                                    self.log_warning(f"[VLA-OPD] signal_stats failed: {_e}")
-
-                            # Probes run on the first MIXED micro-batch of the step. The latch is
-                            # NOT cleared on a single-suite batch: clearing it there would spend
-                            # the step's one probe on a batch that can produce nothing.
-                            if getattr(self, "_xscore_armed", False) and _ngrp >= 2:
-                                try:
-                                    self._last_xkl = self._cross_score(
-                                        forward_inputs, kwargs, ls.detach(), loss_mask, sad
-                                    )
-                                    self._xscore_armed = False
-                                except Exception as _e:  # never let a probe kill a training run
-                                    self._last_xkl = {}
-                                    self._xscore_armed = False
-                                    self.log_warning(f"[VLA-OPD] cross_score failed: {_e}")
-
-                            # per-suite gradient conflict probe: first mixed micro-batch of the
-                            # step. MUST run before the real backward frees the graph.
-                            if getattr(self, "_gconf_armed", False) and _ngrp >= 2:
-                                try:
-                                    self._last_gconf = self._grad_conflict(kl_tok, mtok)
-                                    self._gconf_armed = False
-                                except Exception as _e:
-                                    self._last_gconf = {}
-                                    self._gconf_armed = False
-                                    self.log_warning(f"[VLA-OPD] grad_conflict failed: {_e}")
-
-                        # ---- data-free BASE anchors (action-KL + visual-representation) ----
-                        # (a) action anchor = mode-covering forward-KL to base on rollout states
-                        #     (preserve task behavior); (b) visual anchor = cosine of mid-layer
-                        #     vision+prompt features to base (preserve BROAD OOD generalization).
-                        _alam = float(self.cfg.algorithm.get("anchor_lambda", 0.0))
-                        _vlam = float(self.cfg.algorithm.get("visual_anchor_lambda", 0.0))
-                        if (_alam > 0.0 or _vlam > 0.0) and getattr(
-                            self, "base_model", None
-                        ) is not None:
-                            with torch.no_grad(), self.amp_context:
-                                base_out = self.base_model(
-                                    forward_inputs=forward_inputs,
-                                    compute_logprobs=True,
-                                    use_cache=False,
-                                    **kwargs,
-                                )
-                            # (a) ACTION anchor
-                            if (
-                                _alam > 0.0
-                                and "action_logits" in output_dict
-                                and "action_logits" in base_out
-                            ):
-                                lb = torch.log_softmax(
-                                    base_out["action_logits"].float().detach(), dim=-1
-                                )
-                                ls_a = torch.log_softmax(
-                                    output_dict["action_logits"].float(), dim=-1
-                                )
-                                pb = lb.exp()
-                                a_tok = (pb * (lb - ls_a)).sum(dim=-1)  # forward-KL, mode-covering
-                                _agate = self.cfg.algorithm.get("anchor_gate", "none")
-                                _atau = float(self.cfg.algorithm.get("anchor_gate_tau", 1.0))
-                                if _agate in ("low_ent", "high_ent"):
-                                    with torch.no_grad():
-                                        b_ent = -(pb * lb).sum(dim=-1)
-                                        _emax = torch.log(
-                                            torch.tensor(float(pb.shape[-1]), device=pb.device)
-                                        )
-                                        conf = (1.0 - b_ent / _emax).clamp(0.0, 1.0)
-                                        gate = (
-                                            conf.pow(_atau)
-                                            if _agate == "low_ent"
-                                            else (1.0 - conf).pow(_atau)
-                                        )
-                                    a_tok = a_tok * gate
-                                if loss_mask is not None:
-                                    _amt = (
-                                        loss_mask.to(a_tok.dtype)
-                                        .unsqueeze(-1)
-                                        .expand(-1, -1, sad)
-                                        .reshape(a_tok.shape[0], -1)
-                                    )
-                                    anchor_loss = (a_tok * _amt).sum() / _amt.sum().clamp_min(1.0)
-                                else:
-                                    anchor_loss = a_tok.mean()
-                            # (b) VISUAL anchor: patch-wise cosine of mid-layer features to base
-                            if (
-                                _vlam > 0.0
-                                and "mid_features" in output_dict
-                                and "mid_features" in base_out
-                            ):
-                                fs = output_dict["mid_features"].float()
-                                fb = base_out["mid_features"].float().detach()
-                                cos = torch.nn.functional.cosine_similarity(fs, fb, dim=-1)
-                                visual_loss = (1.0 - cos).mean()
-
-                    kwargs = {
-                        "loss_type": self.cfg.algorithm.loss_type,
-                        "logprob_type": self.cfg.algorithm.logprob_type,
-                        "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
-                        "logprobs": output_dict["logprobs"],
-                        "values": output_dict.get("values", None),
-                        "old_logprobs": prev_logprobs,
-                        "advantages": advantages,
-                        "returns": returns,
-                        "prev_values": prev_values,
-                        "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
-                        "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
-                        "value_clip": self.cfg.algorithm.get("value_clip", None),
-                        "huber_delta": self.cfg.algorithm.get("huber_delta", None),
-                        "loss_mask": loss_mask,
-                        "loss_mask_sum": loss_mask_sum,
-                        "max_episode_steps": self.cfg.env.train.max_episode_steps,
-                        "task_type": self.cfg.runner.task_type,
-                        "critic_warmup": self.optimizer_steps
-                        < self.critic_warmup_steps,
-                    }
-                    if (
-                        self.cfg.algorithm.adv_type == "opd"
-                        and self.cfg.algorithm.get("opd_mode", "distill") == "distill"
-                        and opd_distill_loss is not None
-                    ):
-                        # differentiable KL-distillation: minimize KL(student||teacher) directly,
-                        # skip the PPO/REINFORCE loss entirely (pi0 op_distill style).
-                        loss = opd_distill_loss
-                        if anchor_loss is not None:
-                            loss = loss + float(
-                                self.cfg.algorithm.get("anchor_lambda", 0.0)
-                            ) * anchor_loss
-                        if visual_loss is not None:
-                            loss = loss + float(
-                                self.cfg.algorithm.get("visual_anchor_lambda", 0.0)
-                            ) * visual_loss
-                        metrics_data = {
-                            "actor/distill_loss": opd_distill_loss.detach().item()
+                        kwargs = {
+                            "loss_type": self.cfg.algorithm.loss_type,
+                            "logprob_type": self.cfg.algorithm.logprob_type,
+                            "reward_type": self.cfg.algorithm.reward_type,
+                            "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+                            "logprobs": output_dict["logprobs"],
+                            "values": output_dict.get("values", None),
+                            "old_logprobs": prev_logprobs,
+                            "advantages": advantages,
+                            "returns": returns,
+                            "prev_values": prev_values,
+                            "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                            "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                            "value_clip": self.cfg.algorithm.get("value_clip", None),
+                            "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+                            "loss_mask": loss_mask,
+                            "loss_mask_sum": loss_mask_sum,
+                            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                            "task_type": self.cfg.runner.task_type,
+                            "critic_warmup": self.optimizer_steps
+                            < self.critic_warmup_steps,
                         }
-                        # Surface the dynamic weights and the per-suite KL they came from --
-                        # without them an adaptive run is indistinguishable from a uniform one and
-                        # the mechanism is unfalsifiable.
-                        # EMIT A FIXED KEY SET: one entry per ROUTED SUITE, always, defaulting to
-                        # 1.0/0.0 for suites this rank's micro-batch did not contain. all_reduce_dict
-                        # sizes its packed tensor by the key count, so rank-dependent keys deadlock
-                        # the collective (the bug already fixed once in libero_env.py). One .tolist()
-                        # here is the ONLY host sync in this path.
-                        _s2p = getattr(self, "teacher_suite_to_path", {}) or {}
-                        if _s2p and float(self.cfg.algorithm.get("distill_dyn_weight", 0.0)) > 0.0:
-                            _paths = getattr(self, "_dw_paths", None) or sorted(set(_s2p.values()))
-                            _wl = getattr(self, "_dw_w_list", None) or [1.0] * len(_paths)
-                            _kl_ = getattr(self, "_dw_kl_list", None) or [0.0] * len(_paths)
-                            _idx = {p: i for i, p in enumerate(_paths)}
-                            for _s in sorted(_s2p):
-                                _i = _idx.get(_s2p[_s])
-                                metrics_data[f"actor/dynw_{_s}"] = (
-                                    float(_wl[_i]) if _i is not None and _i < len(_wl) else 1.0
-                                )
-                                metrics_data[f"actor/suitekl_{_s}"] = (
-                                    float(_kl_[_i]) if _i is not None and _i < len(_kl_) else 0.0
-                                )
-                        if getattr(self, "_last_fail_frac", None) is not None:
-                            # share of rollout samples that never succeeded = what we distill on
-                            metrics_data["actor/fail_frac"] = self._last_fail_frac
-                        if anchor_loss is not None:
-                            metrics_data["actor/anchor_loss"] = anchor_loss.detach().item()
-                        if visual_loss is not None:
-                            metrics_data["actor/visual_loss"] = visual_loss.detach().item()
-                        # cross-suite KL probe (diagonal = what training minimises, off-diagonal =
-                        # what nobody optimises); emitted on the probe micro-batch only, so it is
-                        # carried on self and re-emitted for the rest of the step's micro-batches.
-                        # ALWAYS emit, ALWAYS the same keys -- see _probe_key_list for why a
-                        # rank-dependent key set deadlocks the metric all_reduce.
-                        # 1.0 => micro-batches are single-suite => the cross-suite probes are inert
-                        metrics_data["actor/n_suites_in_batch"] = float(
-                            getattr(self, "_last_nsuites", 0.0) or 0.0
+                        if (
+                            self.cfg.algorithm.adv_type == "opd"
+                            and self.cfg.algorithm.get("opd_mode", "distill") == "distill"
+                            and opd_distill_loss is not None
+                        ):
+                            # differentiable KL-distillation: minimize KL(student||teacher) directly,
+                            # skip the PPO/REINFORCE loss entirely (pi0 op_distill style).
+                            loss = opd_distill_loss
+                            if anchor_loss is not None:
+                                loss = loss + float(
+                                    self.cfg.algorithm.get("anchor_lambda", 0.0)
+                                ) * anchor_loss
+                            if visual_loss is not None:
+                                loss = loss + float(
+                                    self.cfg.algorithm.get("visual_anchor_lambda", 0.0)
+                                ) * visual_loss
+                            metrics_data = {
+                                "actor/distill_loss": opd_distill_loss.detach().item()
+                            }
+                            # Surface the dynamic weights and the per-suite KL they came from --
+                            # without them an adaptive run is indistinguishable from a uniform one and
+                            # the mechanism is unfalsifiable.
+                            # EMIT A FIXED KEY SET: one entry per ROUTED SUITE, always, defaulting to
+                            # 1.0/0.0 for suites this rank's micro-batch did not contain. all_reduce_dict
+                            # sizes its packed tensor by the key count, so rank-dependent keys deadlock
+                            # the collective (the bug already fixed once in libero_env.py). One .tolist()
+                            # here is the ONLY host sync in this path.
+                            _s2p = getattr(self, "teacher_suite_to_path", {}) or {}
+                            if _s2p and float(self.cfg.algorithm.get("distill_dyn_weight", 0.0)) > 0.0:
+                                _paths = getattr(self, "_dw_paths", None) or sorted(set(_s2p.values()))
+                                _wl = getattr(self, "_dw_w_list", None) or [1.0] * len(_paths)
+                                _kl_ = getattr(self, "_dw_kl_list", None) or [0.0] * len(_paths)
+                                _idx = {p: i for i, p in enumerate(_paths)}
+                                for _s in sorted(_s2p):
+                                    _i = _idx.get(_s2p[_s])
+                                    metrics_data[f"actor/dynw_{_s}"] = (
+                                        float(_wl[_i]) if _i is not None and _i < len(_wl) else 1.0
+                                    )
+                                    metrics_data[f"actor/suitekl_{_s}"] = (
+                                        float(_kl_[_i]) if _i is not None and _i < len(_kl_) else 0.0
+                                    )
+                            if getattr(self, "_last_fail_frac", None) is not None:
+                                # share of rollout samples that never succeeded = what we distill on
+                                metrics_data["actor/fail_frac"] = self._last_fail_frac
+                            if anchor_loss is not None:
+                                metrics_data["actor/anchor_loss"] = anchor_loss.detach().item()
+                            if visual_loss is not None:
+                                metrics_data["actor/visual_loss"] = visual_loss.detach().item()
+                            # cross-suite KL probe (diagonal = what training minimises, off-diagonal =
+                            # what nobody optimises); emitted on the probe micro-batch only, so it is
+                            # carried on self and re-emitted for the rest of the step's micro-batches.
+                            # ALWAYS emit, ALWAYS the same keys -- see _probe_key_list for why a
+                            # rank-dependent key set deadlocks the metric all_reduce.
+                            # 1.0 => micro-batches are single-suite => the cross-suite probes are inert
+                            metrics_data["actor/n_suites_in_batch"] = float(
+                                getattr(self, "_last_nsuites", 0.0) or 0.0
+                            )
+                            metrics_data.update(self._probe_emit())
+                        else:
+                            loss, metrics_data = policy_loss(**kwargs)
+
+                        if opd_kl is not None:
+                            metrics_data["actor/opd_kl_stu_tea"] = opd_kl
+                        if opd_gap is not None:
+                            metrics_data["actor/opd_gap_raw"] = opd_gap
+                        if self._slot_enabled:
+                            # Share of this micro-batch that matched no suite, so it
+                            # was scored by an arbitrary expert and folded into the
+                            # loss while its gradient reached no slot. EXPECTED EXACTLY
+                            # 0 -- every task prompt of this experiment is in the
+                            # routing table -- and _route_prepare raises above
+                            # algorithm.slot_route_fallback_tol (default 0.0), so a
+                            # non-zero reading here only happens on a run that
+                            # deliberately tolerates it. The key is config-derived and
+                            # therefore identical on every rank, which all_reduce_dict
+                            # requires.
+                            metrics_data["slot/route_fallback_frac"] = float(
+                                self._slot_fallback
+                            )
+
+                        entropy_loss = torch.tensor(
+                            0.0, device=Worker.torch_platform.current_device()
                         )
-                        metrics_data.update(self._probe_emit())
-                    else:
-                        loss, metrics_data = policy_loss(**kwargs)
+                        if (
+                            self.cfg.algorithm.entropy_bonus > 0
+                            and not kwargs["critic_warmup"]
+                        ):
+                            entropy = output_dict["entropy"]
+                            entropy = reshape_entropy(
+                                entropy,
+                                entropy_type=self.cfg.algorithm.entropy_type,
+                                action_dim=self.cfg.actor.model.get("action_dim", 7),
+                                batch_size=output_dict["logprobs"].shape[0],
+                            )
+                            entropy_loss = masked_mean(entropy, mask=loss_mask)
+                            loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+                        metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 
-                    if opd_kl is not None:
-                        metrics_data["actor/opd_kl_stu_tea"] = opd_kl
-                    if opd_gap is not None:
-                        metrics_data["actor/opd_gap_raw"] = opd_gap
+                        if self.enable_sft_co_train:
+                            self._train_sft_epoch(metrics_data, loss)
 
-                    entropy_loss = torch.tensor(
-                        0.0, device=Worker.torch_platform.current_device()
-                    )
-                    if (
-                        self.cfg.algorithm.entropy_bonus > 0
-                        and not kwargs["critic_warmup"]
-                    ):
-                        entropy = output_dict["entropy"]
-                        entropy = reshape_entropy(
-                            entropy,
-                            entropy_type=self.cfg.algorithm.entropy_type,
-                            action_dim=self.cfg.actor.model.get("action_dim", 7),
-                            batch_size=output_dict["logprobs"].shape[0],
-                        )
-                        entropy_loss = masked_mean(entropy, mask=loss_mask)
-                        loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
-                    metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
-
-                    if self.enable_sft_co_train:
-                        self._train_sft_epoch(metrics_data, loss)
-
-                    loss /= self.gradient_accumulation
-                    with backward_ctx:
-                        self.grad_scaler.scale(loss).backward()
+                        loss /= self.gradient_accumulation
+                        with backward_ctx:
+                            self.grad_scaler.scale(loss).backward()
 
                     metrics_data["actor/total_loss"] = loss.detach().item()
                     append_to_dict(metrics, metrics_data)

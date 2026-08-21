@@ -14,6 +14,7 @@
 
 import copy
 import gc
+from contextlib import ExitStack
 from typing import Any, Literal
 
 import numpy as np
@@ -26,7 +27,7 @@ from rlinf.data.embodied_io_struct import (
     RolloutResult,
 )
 from rlinf.hybrid_engines.weight_syncer import WeightSyncer
-from rlinf.models import get_model
+from rlinf.models import find_slot_gate, get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, CollectiveGroupOptions, Worker
 from rlinf.utils.comm_mapping import CommMapper
@@ -53,6 +54,9 @@ class MultiStepRolloutWorker(Worker):
         self.rollout_epoch = cfg.algorithm.get("rollout_epoch", 1)
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.expert_model = None
+        # slot-LoRI gates of the models this worker runs; filled in init_worker. See
+        # _ungated for why generation must open a window on every one of them.
+        self._slot_gates = []
 
         # Sync weight comm options
         max_ctas = cfg.rollout.get("sync_weight_nccl_max_ctas", None)
@@ -127,16 +131,38 @@ class MultiStepRolloutWorker(Worker):
         if self.expert_model is not None:
             self.expert_model.eval()
 
+        # slot-LoRI: this worker builds its models from a deepcopy of cfg.actor.model
+        # through the same get_model, so on a slot run they are injected too and carry
+        # their own STRICT SlotGate. Resolve the gates ONCE -- find_slot_gate walks the
+        # whole module tree when a model has no slots, and predict() runs every
+        # environment step.
+        self._slot_gates = [
+            gate
+            for gate in (
+                find_slot_gate(m)
+                for m in (self.hf_model, self.expert_model)
+                if m is not None
+            )
+            if gate is not None
+        ]
+        if self._slot_gates:
+            self.log_info(
+                f"[slot-lora] rollout runs {len(self._slot_gates)} slot model(s) "
+                "ungated: generation is the fully merged policy, all slots active."
+            )
+
         if self.cfg.rollout.get("enable_torch_compile", False):
             mode = self.cfg.rollout.get(
                 "torch_compile_mode", "max-autotune-no-cudagraphs"
             )
             self.hf_model.enable_torch_compile(mode=mode)
         if self.enable_cuda_graph and not self.enable_offload:
-            self.hf_model.capture_cuda_graph(
-                train_batch_size=self.train_batch_size,
-                eval_batch_size=self.eval_batch_size,
-            )
+            # Capturing a CUDA graph RUNS the model, so it needs the window too.
+            with self._ungated():
+                self.hf_model.capture_cuda_graph(
+                    train_batch_size=self.train_batch_size,
+                    eval_batch_size=self.eval_batch_size,
+                )
 
         self.dst_ranks = {}
         self.src_ranks = {}
@@ -164,6 +190,29 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+
+    def _ungated(self) -> ExitStack:
+        """Run one block with every slot-LoRI gate of this worker turned off.
+
+        Rollout has nothing to route: there is no per-sample suite assignment to make
+        and no gradient to keep inside a slot. What it must run is the FULLY MERGED
+        policy -- all slots active, no routing -- which is exactly the model that gets
+        evaluated after merging, and exactly what an ungated forward computes (the
+        forward VALUE is always the full sum over slots; the gate only decides which
+        slot may LEARN from a sample).
+
+        The gates are strict, so this is not optional: ``gate.current()`` RAISES on the
+        first gated linear when no routing is installed. That is the gate doing its job
+        -- an ungated forward inside a run that meant to be gated is a silent
+        degradation -- and this is the sanctioned way to say "this one is on purpose".
+
+        Returns:
+            A context manager; a no-op on a non-slot run (empty stack).
+        """
+        stack = ExitStack()
+        for gate in self._slot_gates:
+            stack.enter_context(gate.ungated())
+        return stack
 
     def setup_sample_params(self):
         # length parameters for rollout
@@ -295,7 +344,7 @@ class MultiStepRolloutWorker(Worker):
         else:
             use_expert = False
 
-        with torch.no_grad():
+        with self._ungated(), torch.no_grad():
             expert_label_flag = False
             # Decide which model to act via use_expert
             if use_expert:
