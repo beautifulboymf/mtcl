@@ -1541,8 +1541,8 @@ git commit -m "feat(slot-lora): B,B,A alternating schedule with forced B ending 
 
 | 指标 | 期望 | 不符合说明 |
 |---|---|---|
-| `slot/orth_err` | < 1e-5 | 正交化实现有问题，结果全部无效 |
-| `slot/cos_s_t`（6 个） | \|·\| < 1e-5 | 同上 |
+| `slot/orth_err` | **< 0.05**（不是 1e-6！） | > 0.2 = 正交性真的塌了。诊断读的是 cast 回 bf16 的 Ā，实测 R=256 的舍入地板就是 0.019 (d=1024) / 0.0094 (d=4096)；fp32 下才 ~4e-5 |
+| `slot/cos_s_t`（6 个） | \|·\| < 0.05 | > 0.2 = 塌。与 orth_err 同源同标定 |
 | `slot/route_fallback_frac` | 0 | 路由表有洞，先修再跑 |
 | `slot/phase_is_A` | 约 1/3 | 交替调度没生效 |
 | `actor/dynw_*` | 随步数变化 | 恒为 1.000 = 动态权重仍是死的 |
@@ -1810,7 +1810,7 @@ bash /share/fanruochen-local/dev/scripts/safe_run.sh \
 - [ ] **Step 3: 前三步必须人工核对（不对就停，别等跑完）**
 
 1. 启动日志里 `[slot-lora] injected N SlotLoRALinear ... R=256`，N 与 mt4 的 LoRA 层数一致；
-2. `slot/orth_err` < 1e-5、6 个 `slot/cos_*` 全 < 1e-5 —— 否则正交化坏了，整个 run 无意义；
+2. `slot/orth_err` < 0.05、6 个 `slot/cos_*` 全 < 0.05 —— 超过 0.2 就是正交性塌了，整个 run 无意义。**不要按 1e-6 卡**：bf16 的舍入地板在 R=256 下就是 0.019/0.0094，按 1e-6 会把正确的 run 误判成 bug；
 3. `slot/route_fallback_frac` == 0；
 4. `actor/dynw_*` 从第 2 步起不再是 1.000；
 5. **步 1-2 慢 5-6 倍是 inductor 预热，不是 bug**，第 3 步之前不要判断性能、也不要给 ETA。
