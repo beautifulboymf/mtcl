@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
 
@@ -28,6 +30,32 @@ def _orthonormal_rows(rows=16, cols=64, seed=0):
     g = torch.Generator().manual_seed(seed)
     q, _ = torch.linalg.qr(torch.randn(cols, rows, generator=g, dtype=torch.float64))
     return q.transpose(-2, -1).contiguous()
+
+
+def _z_with_cond(cond, rows=256, cols=1024, seed=0, dtype=torch.float32):
+    """Z with log-spaced singular values, so ``cond(Z)`` is exactly ``cond``.
+
+    Built in float64 and cast down, so the spectrum -- the only thing the
+    Newton-Schulz truncation error depends on -- is set exactly and does not
+    drift with the platform's QR.
+    """
+    g = torch.Generator().manual_seed(seed)
+    u, _ = torch.linalg.qr(torch.randn(rows, rows, generator=g, dtype=torch.float64))
+    v, _ = torch.linalg.qr(torch.randn(cols, rows, generator=g, dtype=torch.float64))
+    s = torch.logspace(0.0, -math.log10(cond), rows, dtype=torch.float64)
+    return ((u * s) @ v.transpose(-2, -1)).to(dtype)
+
+
+class _RecordTF32(torch.overrides.TorchFunctionMode):
+    """Records the ambient TF32 setting that each intercepted matmul ran under."""
+
+    def __init__(self):
+        self.seen = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if "matmul" in getattr(func, "__name__", ""):
+            self.seen.append(torch.backends.cuda.matmul.allow_tf32)
+        return func(*args, **(kwargs or {}))
 
 
 class TestOrthogonalize:
@@ -75,6 +103,14 @@ class TestOrthogonalize:
         orthogonalize(z).sum().backward()
         assert torch.isfinite(z.grad).all()
 
+    def test_degenerate_spectrum_gradient_matches_numerical(self):
+        # Strictly stronger than finiteness at the same point and for the same
+        # runtime: a gradient that is finite but wrong (a detached Gram, or a
+        # checkpointed iteration that recomputes something different) is still
+        # finite here, and only gradcheck catches it.
+        z = _orthonormal_rows(rows=6, cols=16).requires_grad_(True)
+        assert torch.autograd.gradcheck(orthogonalize, (z,), atol=1e-5)
+
     def test_eigh_backend_still_available(self):
         z = _z()
         a_ns = orthogonalize(z, method="ns")
@@ -90,6 +126,19 @@ class TestOrthogonalize:
         a = orthogonalize(_z(rows=256, cols=1024, dtype=torch.float32))
         assert orth_error(a).item() < 1e-3
 
+    def test_ns_holds_at_moderate_conditioning(self):
+        # iters=12 is only validated INSIDE an envelope, and past it the error is
+        # a cliff rather than a slope. Measured fp32 at this shape (R=256,
+        # d_in=1024, log-spaced spectrum): cond(Z) 10 -> 6.7e-5, 15 -> 1.1e-4,
+        # 20 -> 1.07e-3, 30 -> 5.1e-2, 50 -> 0.64.
+        #
+        # Pinning the edge of that envelope is what stops a future reduction of
+        # `iters` from passing silently: at cond(Z)=20 the ladder is iters 11 ->
+        # 6.8e-2, 12 -> 1.07e-3, 13 -> 1.6e-4 (the fp32 floor), so the threshold
+        # below sits 60x under iters=11 and 2x over iters=12.
+        z = _z_with_cond(20.0)
+        assert orth_error(orthogonalize(z)).item() < 2e-3
+
     def test_fp32_floor_survives_autocast(self):
         # autocast intercepts matmul per-op, so an explicit .to(float32) is not
         # enough on its own -- the computation must disable autocast.
@@ -97,9 +146,11 @@ class TestOrthogonalize:
         a_outside = orthogonalize(z)
         with torch.autocast("cpu", dtype=torch.bfloat16):
             a_inside = orthogonalize(z)
-        err_outside = orth_error(a_outside).item()
-        err_inside = orth_error(a_inside).item()
-        assert err_inside < 10.0 * err_outside
+        # BITWISE equality, not "close enough": the guard either covers the whole
+        # computation or it does not, and a tolerance would pass a guard that had
+        # been applied to only some of the matmuls.
+        assert torch.equal(a_inside, a_outside)
+        assert torch.equal(orth_error(a_inside), orth_error(a_outside))
 
     def test_preserves_input_dtype(self):
         a = orthogonalize(_z().to(torch.bfloat16))
@@ -138,6 +189,82 @@ class TestOrthError:
         # unbatched input still reduces to a 0-dim tensor
         assert orth_error(z[0]).shape == ()
 
+    def test_orth_error_rejects_non_matrix(self):
+        # Without the guard this is an IndexError from deep inside the reduction,
+        # while orthogonalize raises a clean ValueError for the same input.
+        with pytest.raises(ValueError, match="needs a matrix"):
+            orth_error(torch.randn(8))
+
     def test_orth_error_builds_no_graph(self):
         z = _z().requires_grad_(True)
         assert orth_error(z).requires_grad is False
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="the TF32 guard is a deliberate no-op when CUDA is unavailable",
+)
+class TestTF32Guard:
+    """TF32 is a second, independent way to lose the fp32 guarantee.
+
+    It is a process-global backend setting that other parts of this repo turn ON
+    (``set_float32_matmul_precision("high")`` in the FSDP IQL policy worker, and
+    ``allow_tf32 = True`` in the OpenSora world-model env), so this file cannot
+    assume it is off. Measured on A100 with ``allow_tf32=True``: the bf16
+    orth_error floor rises 0.0189 -> 0.02922 at d_in=1024 and 0.0094 -> 0.02475
+    at d_in=4096, and an fp32 input goes 7.9e-6 -> 2.03e-2 -- which puts a
+    healthy run on top of a collapsed one (0.054 at cond(Z)=30), destroying the
+    only sentinel the training loop has.
+
+    These run on CPU tensors: they check the GUARD (that the matmuls see TF32
+    off, and that the ambient setting is put back), not the arithmetic, which
+    only differs on a TF32-capable device.
+    """
+
+    def test_matmuls_run_with_tf32_off(self):
+        z = _z(rows=64, cols=256, dtype=torch.float32)
+        prev = torch.get_float32_matmul_precision()
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            for fn in (orthogonalize, orth_error):
+                recorder = _RecordTF32()
+                with recorder:
+                    fn(z)
+                assert recorder.seen, f"{fn.__name__} ran no matmul to observe"
+                assert not any(recorder.seen)
+        finally:
+            torch.set_float32_matmul_precision(prev)
+
+    def test_result_is_unchanged_by_ambient_tf32(self):
+        # Same style as test_fp32_floor_survives_autocast: with the guard the two
+        # results are BITWISE equal, which also catches a partially applied guard.
+        z = _z(rows=64, cols=256, dtype=torch.float32)
+        prev = torch.get_float32_matmul_precision()
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            a_off, err_off = orthogonalize(z), orth_error(orthogonalize(z))
+            torch.backends.cuda.matmul.allow_tf32 = True
+            a_on, err_on = orthogonalize(z), orth_error(orthogonalize(z))
+        finally:
+            torch.set_float32_matmul_precision(prev)
+        assert torch.equal(a_on, a_off)
+        assert torch.equal(err_on, err_off)
+
+    def test_ambient_tf32_state_is_restored(self):
+        # The guard must put back exactly what it found. "medium" is the case a
+        # bare allow_tf32 bool cannot round-trip: it reads back as True, and
+        # writing True restores "high", silently upgrading the caller's setting.
+        z = _z(rows=8, cols=32, dtype=torch.float32)
+        prev = torch.get_float32_matmul_precision()
+        prev_cudnn = torch.backends.cudnn.allow_tf32
+        try:
+            for precision in ("highest", "high", "medium"):
+                torch.set_float32_matmul_precision(precision)
+                torch.backends.cudnn.allow_tf32 = True
+                orthogonalize(z)
+                orth_error(z)
+                assert torch.get_float32_matmul_precision() == precision
+                assert torch.backends.cudnn.allow_tf32
+        finally:
+            torch.set_float32_matmul_precision(prev)
+            torch.backends.cudnn.allow_tf32 = prev_cudnn
