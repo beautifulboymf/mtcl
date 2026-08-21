@@ -14,57 +14,207 @@
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from rlinf.models.slot_lora.orth import orthogonalize
-
-# Per-sample slot ownership for the CURRENT student forward: LongTensor[B] holding the
-# slot index each sample belongs to, or -1 for "no slot owns this sample".
-# A ContextVar rather than a plain global because the actor worker is an asyncio actor.
-_SLOT_GATE: ContextVar[Optional[torch.Tensor]] = ContextVar(
-    "rlinf_slot_gate", default=None
-)
-
-
-def get_slot_gate() -> Optional[torch.Tensor]:
-    """The per-sample slot routing in effect for the current student forward.
-
-    Returns:
-        The ``LongTensor[B]`` most recently installed by :func:`slot_gate`, or
-        ``None`` when no forward has scoped one (the ungated default: every slot
-        sees every sample).
-    """
-    return _SLOT_GATE.get()
+# ``_pinned_precision`` is imported across modules WITHIN this package on purpose. The
+# diagnostic Gram below must be formed under the same "no autocast, no TF32" guard that
+# :func:`orthogonalize` computes under, and a second copy of that guard living here
+# could drift from the one it has to agree with. It stays underscored because it is
+# package-internal precision plumbing, not something the rest of the repo should reach
+# for -- and promoting it would mean editing ``orth.py`` to widen an API that has
+# exactly one other caller.
+from rlinf.models.slot_lora.orth import _pinned_precision, orthogonalize
 
 
-@contextmanager
-def slot_gate(gate_ids: Optional[torch.Tensor]) -> Iterator[None]:
-    """Scope the per-sample slot routing to one student forward.
+def _check_gate_ids(ids: Optional[torch.Tensor]) -> None:
+    """Validate a routing tensor against the contract in :class:`SlotGate`.
 
-    The routing has to reach hundreds of LoRA'd linears that the caller never
-    touches directly, so it travels out of band rather than through the module
-    signatures. Scoping it to a context manager is what keeps that safe: the
-    previous value is restored on the way out, including on an exception, so a
-    crashed forward cannot leak its routing into the next one.
+    Checked once per installation (i.e. once per micro-batch), never in the read
+    path, which runs 200-400 times per forward.
 
     Args:
-        gate_ids: ``LongTensor[B]`` giving the slot index that owns each sample
-            in the batch, ``-1`` for samples no slot owns, or ``None`` for
-            ungated.
+        ids: The candidate routing, or ``None`` for ungated.
 
-    Yields:
-        Nothing; the routing is read through :func:`get_slot_gate`.
+    Raises:
+        ValueError: if ``ids`` is neither ``None`` nor a 1-D ``torch.long`` tensor.
     """
-    token = _SLOT_GATE.set(gate_ids)
-    try:
-        yield
-    finally:
-        _SLOT_GATE.reset(token)
+    if ids is None:
+        return
+    if not isinstance(ids, torch.Tensor):
+        raise ValueError(
+            f"slot gate ids must be a LongTensor[B] or None; got "
+            f"{type(ids).__name__}. Build it with torch.as_tensor(..., "
+            "dtype=torch.long) on the device the activations live on."
+        )
+    if ids.dtype != torch.long:
+        raise ValueError(
+            f"slot gate ids must have dtype torch.long; got {ids.dtype}. Slot "
+            "indices are compared for equality against integer slot numbers and "
+            "-1 means 'unrouted', so a float or bool tensor cannot express the "
+            "contract."
+        )
+    if ids.ndim != 1:
+        raise ValueError(
+            f"slot gate ids must be 1-D, one entry per sample in the micro-batch; "
+            f"got shape {tuple(ids.shape)}."
+        )
+
+
+class SlotGate:
+    """Shared, mutable holder for the per-sample slot routing of one student model.
+
+    WHAT IT CARRIES. ``ids`` is a ``LongTensor[B]`` giving the slot index that owns
+    each sample. ``B`` is the MICRO-batch that reaches the gated forward -- the first
+    dimension of the activation the module is handed -- NOT the global batch: with
+    gradient accumulation the global batch is split, and each micro-batch has to
+    install its own routing. ``-1`` marks a sample no slot owns: it still contributes
+    to the forward VALUE (the acting policy is the fully merged model, so the value is
+    always the full sum over slots) but sends gradient to no slot. dtype must be
+    ``torch.long`` and the tensor must be 1-D; both are checked when the routing is
+    installed. Putting ``ids`` on the same device as the activations is the CALLER's
+    job -- this class never moves it, because a ``.to(device)`` in the read path would
+    fire once per gated linear (200-400 times per forward) and each one is a fresh
+    host-to-device copy.
+
+    WHY AN OBJECT AND NOT A ContextVar. The routing has to reach hundreds of LoRA'd
+    linears the caller never touches directly, so it travels out of band. It used to
+    travel in a ``ContextVar``, and that is broken here: a fresh thread starts with an
+    empty contextvars context and reads the DEFAULT (measured: ``None``), not the value
+    the caller installed. The autograd engine runs backward nodes for CUDA tensors on
+    per-device worker threads, and this repo enables gradient checkpointing
+    (``fsdp_model_manager.py:253``), which RE-EXECUTES the wrapped forward during
+    backward -- on one of those threads. The recomputed forward would therefore see no
+    gate, every slot would take gradient from every sample, the isolation mechanism
+    would be entirely off, and nothing would say so: no error, no NaN, normal-looking
+    loss curves. Attribute access on an object the modules already hold a reference to
+    crosses thread boundaries and recomputation unchanged.
+
+    ONE INSTANCE PER MODEL. Injection creates a single :class:`SlotGate` and hands the
+    SAME object to every gated module, so installing a routing is one attribute write
+    rather than a walk over 200-400 modules.
+
+    STRICT MODE. ``strict=True`` (the default) makes :meth:`current` RAISE when no
+    routing is installed, instead of quietly returning ``None`` and running ungated.
+    That is the whole point: an ungated forward in a run that meant to be gated is a
+    silent degradation, and this project has already lost a multi-hour run to a
+    mechanism that was dead while its metric read a healthy-looking constant. A run
+    that legitimately has no routing (single-suite distillation) constructs the gate
+    with ``strict=False``; a run that needs one ungated forward inside an otherwise
+    gated model uses :meth:`ungated`.
+
+    THE SCOPE MUST COVER THE BACKWARD. Under gradient checkpointing the forward runs
+    again during ``backward()``, so the routing has to still be installed then::
+
+        with gate.scoped(ids):
+            loss = student(**batch)
+            loss.backward()
+
+    Closing the scope before the backward leaves the recomputed forward with no
+    routing. Under ``strict`` that raises; it is not silently ungated.
+    """
+
+    __slots__ = ("_ids", "strict")
+
+    def __init__(self, strict: bool = True) -> None:
+        """Create the holder for one model.
+
+        Args:
+            strict: When true, reading through :meth:`current` with no routing
+                installed raises instead of returning ``None``. Turn it off only for
+                runs that genuinely have no routing.
+        """
+        self._ids: Optional[torch.Tensor] = None
+        self.strict = bool(strict)
+
+    def current(self) -> Optional[torch.Tensor]:
+        """The routing for the forward running right now. THE accessor gated code uses.
+
+        Returns:
+            The installed ``LongTensor[B]``, or ``None`` when the gate is not strict
+            and nothing is installed (the ungated case).
+
+        Raises:
+            RuntimeError: if the gate is strict and no routing is installed.
+        """
+        ids = self._ids
+        if ids is None and self.strict:
+            raise RuntimeError(
+                "slot gate read with no slot routing installed. This gate is strict, "
+                "so an unset read is an error rather than a silently UNGATED forward "
+                "in which every slot takes gradient from every sample -- a failure "
+                "that produces no error, no NaN and a normal-looking loss curve. "
+                "Either keep the routing installed across the forward AND its "
+                "backward (`with gate.scoped(ids): loss = model(...); "
+                "loss.backward()`) -- gradient checkpointing re-runs the forward "
+                "during backward -- or say the run is ungated on purpose, with "
+                "`SlotGate(strict=False)` or a `gate.ungated()` window."
+            )
+        return ids
+
+    def current_unchecked(self) -> Optional[torch.Tensor]:
+        """The installed routing, or ``None``, never raising.
+
+        The deliberate escape hatch, named so that reading ungated is a visible
+        decision in a diff. Gated modules must call :meth:`current` instead; this is
+        for code that only reports on the gate (metrics, logging, assertions) and must
+        not blow up when there is nothing to report.
+
+        Returns:
+            The installed ``LongTensor[B]``, or ``None``.
+        """
+        return self._ids
+
+    @contextmanager
+    def scoped(self, ids: Optional[torch.Tensor]) -> Iterator["SlotGate"]:
+        """Install a routing for the duration of the block, then restore the previous one.
+
+        Restoring on the way out -- including on an exception -- is what stops a
+        crashed forward from leaking its routing into the next one.
+
+        Args:
+            ids: ``LongTensor[B]`` naming the slot that owns each sample of THIS
+                micro-batch, with ``-1`` for unrouted samples; or ``None``. Note that
+                ``None`` does not mean "ungated" on a strict gate: reads still raise,
+                because a router that produced nothing is a bug, not a decision. Use
+                :meth:`ungated` to actually run ungated.
+
+        Yields:
+            This gate, for convenience.
+
+        Raises:
+            ValueError: if ``ids`` violates the contract (see :class:`SlotGate`). The
+                previously installed routing is left untouched in that case.
+        """
+        _check_gate_ids(ids)
+        previous = self._ids
+        self._ids = ids
+        try:
+            yield self
+        finally:
+            self._ids = previous
+
+    @contextmanager
+    def ungated(self) -> Iterator["SlotGate"]:
+        """Run one block with no routing, even on a strict gate.
+
+        For forwards that legitimately have nothing to route -- an eval or rollout
+        pass, a warm-up -- inside a model whose training forwards are gated. Both the
+        routing and the strict flag are restored on the way out, including on an
+        exception.
+
+        Yields:
+            This gate, for convenience.
+        """
+        previous_ids, previous_strict = self._ids, self.strict
+        self._ids, self.strict = None, False
+        try:
+            yield self
+        finally:
+            self._ids, self.strict = previous_ids, previous_strict
 
 
 class SlotProj(nn.Module):
@@ -103,10 +253,26 @@ class SlotProj(nn.Module):
                 Frobenius norm of ``Z Zᵀ``.
             dtype: Parameter dtype; ``None`` uses the torch default.
             device: Parameter device; ``None`` uses the torch default.
+
+        Raises:
+            ValueError: if ``0 < total_rank <= in_features`` does not hold.
         """
         super().__init__()
         self.in_features = int(in_features)
         self.total_rank = int(total_rank)
+        # Checked HERE, not at the first forward. orthogonalize enforces rows <= cols
+        # too, but that fires inside the forward of one of the 200-400 instances of a
+        # 7B model -- after every instance has been built, FSDP-wrapped and moved to
+        # device -- for a fact that was already decided at construction. A bad rank is
+        # a config error and has to cost a construction, not a model build.
+        if not 0 < self.total_rank <= self.in_features:
+            raise ValueError(
+                f"SlotProj needs 0 < total_rank <= in_features; got "
+                f"total_rank={self.total_rank}, in_features={self.in_features}. "
+                "Ā = (Z Zᵀ)^(-1/2) Z has ORTHONORMAL ROWS, and with more rows than "
+                "columns Z Zᵀ is rank-deficient, so no such Ā exists; a non-positive "
+                "rank leaves no subspace for any slot at all."
+            )
         # A plain float, not a buffer: it must stay assignable (``p.scale = 2.5``)
         # and must not acquire tensor semantics or be sharded/synchronized by FSDP.
         # It IS persisted, via get_extra_state/set_extra_state -- see there for why
@@ -134,7 +300,15 @@ class SlotProj(nn.Module):
         """
         a = orthogonalize(self.weight, eps=self.eps)
         if self._collect_diag:
-            with torch.no_grad():
+            # The precision guard has to wrap the GRAM as well, not just the
+            # orthogonalization. orthogonalize pins autocast and TF32 off internally,
+            # but autocast intercepts per op, so an ambient bf16 autocast demotes the
+            # bare matmul that FORMS the Gram right back down: measured on
+            # SlotProj(64, 16, 1.0, dtype=bfloat16), ‖G - I‖_F 1.46e-6 (fp32) outside
+            # autocast versus 4.61e-3 (bf16) inside it, ~3000x worse. TF32 leaks the
+            # same way and is process-global. Both would land in the one number whose
+            # entire job is to resolve a 6.8e-5 -> 1.07e-3 slide.
+            with torch.no_grad(), _pinned_precision(self.weight.device.type):
                 # The Gram MUST come from an fp32 recomputation, not from `a` cast down
                 # to the forward dtype. Measured: as cond(Z) goes 10 -> 20 the fp32
                 # orthogonality error degrades 16x (6.8e-5 -> 1.07e-3) while a bf16

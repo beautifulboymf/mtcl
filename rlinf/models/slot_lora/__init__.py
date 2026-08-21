@@ -14,7 +14,7 @@
 
 """slot-LoRI: per-suite LoRA slots on mutually orthogonal input subspaces."""
 
-from rlinf.models.slot_lora.modules import SlotProj, get_slot_gate, slot_gate
+from rlinf.models.slot_lora.modules import SlotGate, SlotProj
 from rlinf.models.slot_lora.orth import orth_error, orthogonalize
 
-__all__ = ["orthogonalize", "orth_error", "SlotProj", "get_slot_gate", "slot_gate"]
+__all__ = ["orthogonalize", "orth_error", "SlotProj", "SlotGate"]
