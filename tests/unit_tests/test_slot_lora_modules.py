@@ -561,89 +561,6 @@ class TestSlotProjOrthWeightCollect:
         assert proj._collect_diag is False and proj._diag is None
 
 
-class TestSlotProjExtraState:
-    """scale is config, not a tensor -- but the checkpoint still has to record it.
-
-    Nothing else in the checkpoint pins ``s``: Ā is invariant to the scale of Z, so
-    a converter that re-derives ``s`` from CLI flags disagreeing with the training
-    config emits a delta-W off by a constant factor, with no error anywhere.
-    """
-
-    def _proj(self, scale):
-        torch.manual_seed(0)
-        return SlotProj(32, 8, scale, dtype=torch.float64)
-
-    def test_state_dict_carries_the_scale(self):
-        sd = self._proj(2.5).state_dict()
-        assert sd["_extra_state"] == {"scale": 2.5}
-
-    def test_state_dict_reads_the_live_attribute(self):
-        # scale stays a plain assignable float (that is why it is extra state and
-        # not a buffer), so the recorded value must follow a direct assignment.
-        p = self._proj(1.0)
-        p.scale = 3.0
-        assert p.state_dict()["_extra_state"] == {"scale": 3.0}
-
-    def test_round_trips_through_load_state_dict(self):
-        src = self._proj(2.5)
-        src.weight.data.add_(0.1)
-        dst = SlotProj(32, 8, 2.5, dtype=torch.float64)
-        dst.load_state_dict(src.state_dict())
-        assert dst.scale == 2.5
-        assert torch.equal(dst.weight, src.weight)
-
-    def test_round_trips_through_a_torch_save_file(self):
-        # extra state has to survive real serialization, not just an in-memory dict.
-        buf = io.BytesIO()
-        torch.save(self._proj(2.5).state_dict(), buf)
-        buf.seek(0)
-        dst = SlotProj(32, 8, 2.5, dtype=torch.float64)
-        dst.load_state_dict(torch.load(buf, weights_only=False))
-        assert dst.scale == 2.5
-
-    def test_mismatched_scale_raises_naming_both_values(self):
-        sd = self._proj(2.5).state_dict()
-        dst = SlotProj(32, 8, 1.0, dtype=torch.float64)
-        with pytest.raises(ValueError, match=r"scale=2\.5.*scale=1\.0"):
-            dst.load_state_dict(sd)
-        # and it must NOT have been reconciled in either direction
-        assert dst.scale == 1.0
-        assert sd["_extra_state"] == {"scale": 2.5}
-
-    def test_malformed_extra_state_raises(self):
-        p = self._proj(1.0)
-        for bad in (2.5, {}, {"eps": 1e-6}, None):
-            with pytest.raises(ValueError, match="must be a dict carrying 'scale'"):
-                p.set_extra_state(bad)
-
-    def test_pre_change_checkpoint_loads_and_keeps_the_configured_scale(self):
-        # A state dict written before scale was persisted makes NO claim about the
-        # scale, so there is nothing to contradict: the weight loads and the module
-        # keeps the scale it was constructed with (the pre-fix status quo).
-        legacy = {"weight": torch.zeros(8, 32, dtype=torch.float64)}
-        p = self._proj(2.5)
-        missing, unexpected = p.load_state_dict(legacy, strict=False)
-        assert p.scale == 2.5
-        assert torch.equal(p.weight, legacy["weight"])
-        assert missing == ["_extra_state"] and unexpected == []
-
-    def test_pre_change_checkpoint_is_a_missing_key_under_strict(self):
-        # Deliberately left as PyTorch's default rather than silently tolerated:
-        # "this state dict does not record its scale" is exactly what a converter
-        # that must VERIFY needs to hear, and strict= is the caller's knob for it.
-        legacy = {"weight": torch.zeros(8, 32, dtype=torch.float64)}
-        with pytest.raises(RuntimeError, match="_extra_state"):
-            self._proj(2.5).load_state_dict(legacy, strict=True)
-
-    def test_extra_state_does_not_break_the_fsdp_leaf_predicate(self):
-        # get/set_extra_state must not add children or parameters: the leaf-wrap
-        # test at rlinf/hybrid_engines/fsdp/utils.py:306 still has to fire.
-        p = self._proj(1.0)
-        assert list(p.named_children()) == []
-        assert len(list(p.parameters())) == 1
-        assert p.weight.requires_grad
-
-
 class TestSlotOut:
     RANKS = (3, 5)  # slot0 -> columns 0:3, slot1 -> columns 3:8
 
@@ -1748,8 +1665,10 @@ class TestSlotLoRALinear:
             "base.weight",
             "base.bias",
             "slot_A.weight",
-            "slot_A._extra_state",
             "slot_B.weight",
+            # on the WRAPPER, not on slot_A: SlotProj is individually FSDP-wrapped and
+            # torch 2.6 cannot walk to an _extra_state key through an FSDP unit.
+            "_extra_state",
         }
         fresh, _ = self._layer(scale=0.7)
         report = fresh.load_state_dict(state, strict=True)
@@ -1929,6 +1848,129 @@ class TestSlotLoRALinear:
         with pytest.raises(ValueError, match="scale"):
             SlotLoRALinear(base, self.RANKS, 0.0, SlotGate(num_slots=2))
         assert base.weight.requires_grad is True
+
+
+class TestSlotLoRALinearExtraState:
+    """scale is config, not a tensor -- but the checkpoint still has to record it.
+
+    Nothing else in the checkpoint pins ``s``: Ā is invariant to the scale of Z, so a
+    converter that re-derives ``s`` from CLI flags disagreeing with the training config
+    emits a delta-W off by a constant factor, with no error anywhere.
+
+    THE RECORD LIVES ON THE WRAPPER, not on the ``SlotProj`` that owns the number.
+    ``SlotProj`` is individually FSDP-wrapped (that is what all-gathers the full Z for
+    its own forward), and torch 2.6's ``checkpoint.state_dict._get_fqns`` cannot walk to
+    an ``_extra_state`` key through an FSDP unit at all -- its FSDP branch, unlike its
+    ``else`` branch, has no special case and ends on an unconditional getattr. See
+    ``SlotLoRALinear.get_extra_state`` and ``tests/unit_tests/test_slot_lora_fsdp.py``,
+    which holds that shape in place under a real FullyShardedDataParallel.
+    """
+
+    RANKS = (3, 5)
+
+    def _layer(self, scale, in_features=32, out_features=6):
+        torch.manual_seed(0)
+        base = nn.Linear(in_features, out_features, bias=False, dtype=torch.float64)
+        gate = SlotGate(num_slots=len(self.RANKS))
+        return SlotLoRALinear(base, self.RANKS, scale, gate)
+
+    def test_state_dict_carries_the_scale(self):
+        assert self._layer(2.5).state_dict()["_extra_state"] == {"scale": 2.5}
+
+    def test_the_record_is_not_on_the_fsdp_wrapped_leaf(self):
+        # The whole point of the move. `_iterate_valid_model_state` decides a module
+        # has extra state by comparing its class's get_extra_state against
+        # nn.Module's, so this is the exact predicate that must NOT hold for SlotProj:
+        # if it does, every weight sync dies with "'SlotProj' object has no attribute
+        # '_extra_state'".
+        layer = self._layer(2.5)
+        for half in (layer.slot_A, layer.slot_B):
+            assert type(half).get_extra_state is nn.Module.get_extra_state
+            assert type(half).set_extra_state is nn.Module.set_extra_state
+            assert set(half.state_dict()) == {"weight"}
+        assert set(layer.state_dict()) == {
+            "base.weight",
+            "slot_A.weight",
+            "slot_B.weight",
+            "_extra_state",
+        }
+
+    def test_state_dict_reads_the_live_attribute(self):
+        # scale stays a plain assignable float on SlotProj (that is why it is extra
+        # state and not a buffer), so the recorded value must follow a direct
+        # assignment even though the recorder is one level up.
+        layer = self._layer(1.0)
+        layer.slot_A.scale = 3.0
+        assert layer.state_dict()["_extra_state"] == {"scale": 3.0}
+
+    def test_round_trips_through_load_state_dict(self):
+        src = self._layer(2.5)
+        src.slot_A.weight.data.add_(0.1)
+        dst = self._layer(2.5)
+        dst.load_state_dict(src.state_dict())
+        assert dst.slot_A.scale == 2.5
+        assert torch.equal(dst.slot_A.weight, src.slot_A.weight)
+
+    def test_round_trips_through_a_torch_save_file(self):
+        # extra state has to survive real serialization, not just an in-memory dict.
+        buf = io.BytesIO()
+        torch.save(self._layer(2.5).state_dict(), buf)
+        buf.seek(0)
+        dst = self._layer(2.5)
+        dst.load_state_dict(torch.load(buf, weights_only=False))
+        assert dst.slot_A.scale == 2.5
+
+    def test_mismatched_scale_raises_naming_both_values(self):
+        sd = self._layer(2.5).state_dict()
+        dst = self._layer(1.0)
+        with pytest.raises(ValueError, match=r"scale=2\.5.*scale=1\.0"):
+            dst.load_state_dict(sd)
+        # and it must NOT have been reconciled in either direction
+        assert dst.slot_A.scale == 1.0
+        assert sd["_extra_state"] == {"scale": 2.5}
+
+    def test_malformed_extra_state_raises(self):
+        layer = self._layer(1.0)
+        for bad in (2.5, {}, {"eps": 1e-6}, None):
+            with pytest.raises(ValueError, match="must be a dict carrying 'scale'"):
+                layer.set_extra_state(bad)
+
+    def test_a_state_dict_that_makes_no_claim_keeps_the_configured_scale(self):
+        # A state dict with no record says NOTHING about the scale, so there is nothing
+        # to contradict: the weights load and the layer keeps the scale it was built
+        # with. That is also the shape a pre-move checkpoint arrives in -- its record
+        # sits under `slot_A._extra_state`, which is one missing key AND one unexpected
+        # key, and the converter's key diff refuses it by name rather than merging a
+        # scale nobody checked.
+        src = self._layer(2.5)
+        silent = {k: v for k, v in src.state_dict().items() if k != "_extra_state"}
+        dst = self._layer(2.5)
+        missing, unexpected = dst.load_state_dict(silent, strict=False)
+        assert dst.slot_A.scale == 2.5
+        assert missing == ["_extra_state"] and unexpected == []
+
+    def test_a_state_dict_that_makes_no_claim_is_a_missing_key_under_strict(self):
+        # Deliberately left as PyTorch's default rather than silently tolerated:
+        # "this state dict does not record its scale" is exactly what a converter that
+        # must VERIFY needs to hear, and strict= is the caller's knob for it.
+        src = self._layer(2.5)
+        silent = {k: v for k, v in src.state_dict().items() if k != "_extra_state"}
+        with pytest.raises(RuntimeError, match="_extra_state"):
+            self._layer(2.5).load_state_dict(silent, strict=True)
+
+    def test_extra_state_does_not_change_the_fsdp_wrap_shape(self):
+        # The per-leaf test at rlinf/hybrid_engines/fsdp/utils.py:306 must keep firing
+        # on both halves (that is what all-gathers the full Z) and must keep NOT firing
+        # on the wrapper (that is what keeps this extra state off the FSDP branch of
+        # _get_fqns). test_slot_lora_fsdp.py asserts the same thing against real FSDP;
+        # this is the cheap CPU copy that runs everywhere.
+        layer = self._layer(1.0)
+        for half in (layer.slot_A, layer.slot_B):
+            assert list(half.named_children()) == []
+            assert len(list(half.parameters())) == 1
+            assert half.weight.requires_grad
+        assert [n for n, _ in layer.named_children()] == ["base", "slot_A", "slot_B"]
+        assert getattr(layer, "weight", None) is None
 
 
 class TestSlotLoRALinearSlotCounts:

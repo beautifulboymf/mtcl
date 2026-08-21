@@ -8,9 +8,12 @@
 # converter wraps with PEFT and calls `merge_and_unload()`, this one calls
 # `inject_slot_lora` and adds each `SlotLoRALinear.delta_weight()` into its base.
 #
-# THE SCALE IS VERIFIED, NOT RE-DERIVED. `SlotProj` persists the LoRA scaling `s` it was
-# trained with through `get_extra_state`, and its `set_extra_state` RAISES when the
-# module it is loading into is configured with a different one. This converter derives
+# THE SCALE IS VERIFIED, NOT RE-DERIVED. `SlotLoRALinear` persists the LoRA scaling `s`
+# it was trained with through `get_extra_state`, and its `set_extra_state` RAISES when
+# the module it is loading into is configured with a different one. (It sits on the
+# wrapper rather than on the `SlotProj` that owns the number because `SlotProj` is
+# individually FSDP-wrapped and torch 2.6 cannot walk to an `_extra_state` key through
+# an FSDP unit; see `SlotLoRALinear.get_extra_state`.) This converter derives
 # `s` from the CLI flags (`--slot-scale-mode` / `--slot-ref-rank`, exactly as the
 # training path derives it from `actor.model.slot_lora`), builds the modules with it,
 # and then loads the checkpoint THROUGH those modules -- so the cross-check runs on
@@ -57,7 +60,9 @@ DEFAULT_SLOT_EPS = 1e-6
 # Substrings that mark a state-dict key as belonging to the slot structure this
 # converter built, as opposed to the base model's own weights. Used only to make the
 # key-mismatch report readable; the CHECK itself is on the full key sets.
-_SLOT_MARKERS = (".slot_A.", ".slot_B.", ".base.")
+# `._extra_state` is in the list because the scale record hangs off the WRAPPER
+# (`q_proj._extra_state`), not off `slot_A`, so it matches none of the other three.
+_SLOT_MARKERS = (".slot_A.", ".slot_B.", ".base.", "._extra_state")
 
 
 class SlotCheckpointMismatch(RuntimeError):
@@ -306,7 +311,7 @@ def load_slot_checkpoint(model, state_dict, slot_ranks, verbose=False):
     Raises:
         SlotCheckpointMismatch: on any missing or unexpected key, or a total rank that
             disagrees with the checkpoint.
-        ValueError: from ``SlotProj.set_extra_state``, if the scale the CLI derived
+        ValueError: from ``SlotLoRALinear.set_extra_state``, if the scale the CLI derived
             disagrees with the one the checkpoint was trained with.
     """
     _check_total_rank(state_dict, slot_ranks)
@@ -342,7 +347,7 @@ def load_slot_checkpoint(model, state_dict, slot_ranks, verbose=False):
 
     # Only now, with the keys proven to line up, does the load run -- and with them
     # lined up its own report is redundant, so `strict=False` here costs nothing. This
-    # is the call that reaches SlotProj.set_extra_state and cross-checks the scale.
+    # is the call that reaches SlotLoRALinear.set_extra_state and cross-checks the scale.
     report = model.load_state_dict(state_dict, strict=False)
     if report.missing_keys or report.unexpected_keys:
         raise SlotCheckpointMismatch(
@@ -475,7 +480,7 @@ def main():
     ap.add_argument("--ckpt", required=True, help="slot full_weights.pt state dict")
     ap.add_argument("--base", required=True, help="base student HF model dir")
     ap.add_argument("--out", required=True, help="output dir for merged HF model")
-    # `scale` is persisted in the checkpoint via SlotProj.get_extra_state, so these
+    # `scale` is persisted in the checkpoint via SlotLoRALinear.get_extra_state, so these
     # flags are VERIFIED against the trained value rather than merely applied: see the
     # module header. They still have to be right -- the check reports a disagreement,
     # it does not reconcile it.
@@ -576,7 +581,7 @@ def main():
         print(f"FATAL: {exc}", flush=True)
         sys.exit(2)
     except ValueError as exc:
-        # SlotProj.set_extra_state, i.e. the scale cross-check this converter exists to
+        # SlotLoRALinear.set_extra_state, i.e. the scale cross-check this converter exists to
         # perform. Nothing else in this path raises a bare ValueError.
         print(
             f"FATAL: {exc}\n"
