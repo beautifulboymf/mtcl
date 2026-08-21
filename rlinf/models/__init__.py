@@ -22,6 +22,31 @@ from rlinf.scheduler import Worker
 ModelBuilder = Callable[[DictConfig, Optional[object]], object]
 _MODEL_REGISTRY: dict[str, ModelBuilder] = {}
 
+# The LoRA target list, hoisted OUT of the `LoraConfig` in `get_model` so the PEFT
+# baseline and the slot-LoRI path cannot drift apart. The whole slot-LoRI experiment is
+# a comparison against that baseline; if the two arms adapt different modules the
+# comparison measures the module list as much as it measures the method, and nothing
+# anywhere would say so. One list, two readers -- pass a `list(...)` copy to anything
+# that might keep it, never the constant itself.
+SLOT_LORA_TARGET_MODULES = [
+    "proj",
+    "qkv",
+    "fc1",
+    "fc2",  # vision
+    "q",
+    "kv",
+    "fc3",
+    "out_proj",  # project
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "lm_head",  # llm
+]
+
 
 def register_model(
     model_type: str,
@@ -222,6 +247,23 @@ def get_model(cfg: DictConfig):
         model = model.to(Worker.torch_device_type)
 
     if cfg.is_lora:
+        # `cfg.is_lora` MUST stay True on the slot path, which is why this lives INSIDE
+        # this branch instead of replacing it. The per-leaf FSDP wrap policy that gives
+        # slot_A/slot_B their own flat params is only registered when is_lora is set
+        # (rlinf/hybrid_engines/fsdp/strategy/fsdp.py:163, policy at
+        # rlinf/hybrid_engines/fsdp/utils.py:303-311). Without it the trainable slot
+        # params land in the enclosing transformer layer's flat param together with the
+        # FROZEN base, and FSDP refuses to flatten mixed requires_grad under
+        # use_orig_params=False (_flat_param.py:800-808). That failure is loud, but it
+        # is avoidable, and it is avoided here.
+        _slot_cfg = cfg.get("slot_lora", None)
+        if _slot_cfg is not None and _slot_cfg.get("enabled", False):
+            # Returns EARLY, replacing the PEFT wrapping below entirely. The only thing
+            # skipped past this point is the pi0-only RLINF_MODEL_FP32 tail, which casts
+            # "the whole pi0 model" and has no meaning for a slot-LoRI student -- whose
+            # dtype policy is the base weights' (the slots inherit it at injection).
+            return _apply_slot_lora(model, cfg, _slot_cfg)
+
         from peft import LoraConfig, PeftModel, get_peft_model
 
         if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
@@ -229,24 +271,8 @@ def get_model(cfg: DictConfig):
                 r=cfg.lora_rank,
                 lora_alpha=cfg.lora_rank,
                 lora_dropout=0.0,
-                target_modules=[
-                    "proj",
-                    "qkv",
-                    "fc1",
-                    "fc2",  # vision
-                    "q",
-                    "kv",
-                    "fc3",
-                    "out_proj",  # project
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                    "lm_head",  # llm
-                ],
+                # A copy, so nothing downstream can mutate the shared constant.
+                target_modules=list(SLOT_LORA_TARGET_MODULES),
                 init_lora_weights="gaussian",
             )
             if SupportedModel(model_type) in (
@@ -354,6 +380,272 @@ def get_model(cfg: DictConfig):
 
         _sysfp.stderr.write("[lora] RLINF_MODEL_FP32=1 -> whole pi0 model cast to fp32 (uniform)\n")
 
+    return model
+
+
+def _assert_slot_leaves_fsdp_wrappable(model) -> int:
+    """Assert nothing stamped ``_to_lora=False`` on a slot leaf; return how many it checked.
+
+    The per-leaf FSDP wrap policy that gives ``slot_A`` / ``slot_B`` their own flat
+    params (``rlinf/hybrid_engines/fsdp/utils.py:303-311``) has a fourth condition that
+    is easy to miss: ``getattr(module, "_to_lora", True) is True``. And
+    :func:`tag_vlm_subtree` ``(model, False)`` stamps ``_to_lora=False`` on EVERY module
+    it walks. Only the pi0 branch of :func:`get_model` calls it today, so the slot path
+    is clean -- this check passes trivially, which is the point of running it every
+    time rather than reasoning about it once.
+
+    If it ever does change, the failure lands a long way from its cause. Under
+    ``use_orig_params=False`` (this repo's default) the slot parameters fold into the
+    enclosing transformer layer's flat parameter next to the FROZEN base, and FSDP
+    refuses to flatten mixed ``requires_grad`` -- loud, but raised from inside FSDP
+    initialization with no mention of the tag that caused it. Under
+    ``use_orig_params=True`` nothing is raised at all, and what is lost is quieter
+    still: the guarantee :class:`SlotProj` is built on (its own flat parameter, hence
+    the FULL ``Z`` unsharded whenever the module is touched --
+    ``rlinf/models/slot_lora/modules.py:307-314``) degrades to "whatever the enclosing
+    unit happens to have gathered", so any read of ``Z`` from outside that unit's own
+    forward -- a merge, a diagnostic, a checkpoint conversion -- sees a SHARD and builds
+    ``Ā`` from a fraction of its rows, with no exception and no NaN. One assert at
+    model-build time names the cause instead.
+
+    Args:
+        model: The freshly injected student (not yet FSDP-wrapped).
+
+    Returns:
+        How many slot leaves were checked. Zero means the model has no slots.
+
+    Raises:
+        AssertionError: if any :class:`SlotProj` or :class:`SlotOut` carries
+            ``_to_lora=False``.
+    """
+    from rlinf.models.slot_lora import SlotOut, SlotProj
+
+    checked = 0
+    for name, module in model.named_modules():
+        if isinstance(module, (SlotProj, SlotOut)):
+            checked += 1
+            assert getattr(module, "_to_lora", True) is True, (
+                f"{name} ({type(module).__name__}) is tagged _to_lora=False, so the "
+                "per-leaf FSDP wrap policy (rlinf/hybrid_engines/fsdp/utils.py:303-311) "
+                "skips it and Z/B fold into the enclosing layer's flat parameter: with "
+                "use_orig_params=False FSDP then refuses to flatten that unit's mixed "
+                "requires_grad, from deep inside its own initialization, and with "
+                "use_orig_params=True nothing is raised while Z is no longer guaranteed "
+                "unsharded outside that unit's forward, so a merge or a diagnostic "
+                "builds Ā from a fraction of its rows. tag_vlm_subtree(model, False) "
+                "stamps every module it walks; only the pi0 branch calls it today."
+            )
+    return checked
+
+
+def find_slot_gate(model):
+    """The model's single :class:`~rlinf.models.slot_lora.modules.SlotGate`, or ``None``.
+
+    THE accessor for the training loop, which installs one routing per MICRO-batch
+    through it (``with find_slot_gate(self.model).scoped(ids):``) and runs rollout /
+    eval forwards inside ``gate.ungated()``.
+
+    Reads the explicit handle :func:`_apply_slot_lora` stashed on the model, and falls
+    back to walking for a :class:`SlotOut` (every layer shares the one instance, so any
+    of them answers). The explicit handle is stored rather than only re-derived because
+    the walk is O(#modules) -- 200-400 gated linears inside a few thousand modules on a
+    7B student -- and this is read once per micro-batch, not once per run. It cannot go
+    stale under a ``deepcopy`` of the model either: one ``deepcopy`` call shares one
+    memo, so the copied handle and the copied layers' ``gate`` are the same object. The
+    walk stays as the fallback for a model that arrived some other way (a checkpoint
+    reload that rebuilt modules without re-stashing, a partially copied subtree).
+
+    ``getattr`` resolves through an FSDP root as well: ``FullyShardedDataParallel``
+    forwards unknown attributes to ``_fsdp_wrapped_module``, so this works on both the
+    raw module and the wrapped one.
+
+    Args:
+        model: The student, FSDP-wrapped or not.
+
+    Returns:
+        The gate, or ``None`` if this model has no slot-LoRI adapters at all. ``None``
+        is not an error here: :func:`get_model` is shared with every non-slot run. A
+        caller that REQUIRES a gate must say so itself -- routing through a ``None``
+        gate is exactly the ungated forward the strict gate exists to prevent.
+    """
+    gate = getattr(model, "_slot_gate", None)
+    if gate is not None:
+        return gate
+
+    from rlinf.models.slot_lora import SlotOut
+
+    for module in model.modules():
+        if isinstance(module, SlotOut):
+            return module.gate
+    return None
+
+
+def _apply_slot_lora(model, cfg: DictConfig, slot_cfg: DictConfig):
+    """Give the student K per-suite LoRA slots on orthogonal input subspaces.
+
+    Replaces PEFT ENTIRELY for this model: K distillation teachers writing into one
+    shared LoRA block overwrite each other, and no rank makes that block route. Only the
+    STUDENT is built this way -- the teachers and the dual-KL anchor keep using PEFT and
+    are untouched, because they are separate models built by separate calls.
+
+    Config, under ``actor.model.slot_lora`` (the rollout worker deep-copies
+    ``cfg.actor.model`` and calls this same :func:`get_model`, so putting it there is
+    what makes the rollout model structurally identical and keeps weight sync a plain
+    state-dict match):
+
+    * ``enabled`` (required to be true to get here) -- the switch.
+    * ``slot_ranks`` (REQUIRED) -- ``{suite_name: rank}``.
+    * ``slot_order`` (REQUIRED) -- the list that fixes slot INDEX order. The rank list is
+      built by indexing ``slot_ranks`` with THIS, never by iterating the mapping: the
+      slot index is what routing produces (``match_suite_ids`` returns
+      ``suite_order.index(suite)``), so an index order that came from dict iteration
+      would silently send suite A's gradient into suite B's slot the moment someone
+      reordered the YAML mapping.
+    * ``a_scale_mode`` (optional, ``"match_mt4"``) -- see
+      :func:`~rlinf.models.slot_lora.inject._module_scale`.
+    * ``a_scale_ref_rank`` (optional, ``128``) -- the PEFT baseline rank ``match_mt4``
+      matches ``ΔW``'s step-1 magnitude against.
+    * ``orth_eps`` (optional, ``1e-6``) -- floor on ``‖Z Zᵀ‖_F``.
+
+    Both required keys fail loudly when absent, and so does every disagreement between
+    the two (a name in one and not the other, a repeated name): each of those produces a
+    model with the wrong NUMBER of slots or the wrong slot for a suite, and both train
+    perfectly happily while learning the wrong thing.
+
+    Args:
+        model: The student, already built and moved to its device.
+        cfg: The full model config, for the ``lora_path`` conflict check.
+        slot_cfg: ``cfg.slot_lora``.
+
+    Returns:
+        The same model, edited in place, with the slots injected, everything else
+        frozen, and the gate reachable through :func:`find_slot_gate`.
+
+    Raises:
+        ValueError: on any config error described above, or if ``lora_path`` is set.
+    """
+    import sys as _sys
+
+    from rlinf.models.slot_lora import inject_slot_lora
+
+    if cfg.get("lora_path", None) is not None:
+        raise ValueError(
+            f"actor.model.slot_lora.enabled=true together with lora_path="
+            f"{cfg.lora_path!r}. The slot path replaces PEFT entirely, so that adapter "
+            "would never be loaded: the run would silently start from the BASE weights "
+            "with fresh zero-initialized slots and look completely normal. Resume a "
+            "slot run from a slot checkpoint (runner.resume_dir) instead, or drop one "
+            "of the two keys."
+        )
+
+    missing = [k for k in ("slot_ranks", "slot_order") if slot_cfg.get(k, None) is None]
+    if missing:
+        raise ValueError(
+            f"actor.model.slot_lora is enabled but required key(s) {missing} are "
+            "missing or null. `slot_ranks` is {suite: rank}, `slot_order` is the list "
+            "that fixes slot INDEX order; both are required, and neither has a "
+            "defensible default -- a guessed order silently routes one suite's "
+            "gradient into another suite's slot."
+        )
+
+    raw_ranks, raw_order = slot_cfg["slot_ranks"], slot_cfg["slot_order"]
+    # Shape guards, so a YAML mistake reads as a YAML mistake. Without the second one a
+    # bare string (`slot_order: libero_spatial`, no list) iterates into ONE SLOT PER
+    # CHARACTER, and the model builds as far as complaining about a suite named "l".
+    if not hasattr(raw_ranks, "keys"):
+        raise ValueError(
+            f"actor.model.slot_lora.slot_ranks must be a {{suite: rank}} mapping; got "
+            f"{type(raw_ranks).__name__}. A bare list of ranks cannot say WHICH suite "
+            "each one belongs to, and slot_order is matched against it by name."
+        )
+    if isinstance(raw_order, str) or hasattr(raw_order, "keys"):
+        raise ValueError(
+            f"actor.model.slot_lora.slot_order must be a LIST of suite names; got "
+            f"{type(raw_order).__name__} ({raw_order!r})."
+        )
+
+    ranks_map = {str(k): int(v) for k, v in dict(raw_ranks).items()}
+    order = [str(s) for s in raw_order]
+
+    repeated = sorted({s for s in order if order.count(s) > 1})
+    if repeated:
+        raise ValueError(
+            f"actor.model.slot_lora.slot_order repeats {repeated}. Routing resolves a "
+            "suite to the FIRST matching index (`suite_order.index`), so every later "
+            "copy is a slot no sample can ever reach: it would stay at its zero "
+            "initialization for the whole run while the layer still carries its rank."
+        )
+    unranked = [s for s in order if s not in ranks_map]
+    if unranked:
+        raise ValueError(
+            f"actor.model.slot_lora.slot_order names {unranked}, which slot_ranks "
+            f"{sorted(ranks_map)} does not. Every slot needs a rank; there is no "
+            "default width to fall back to."
+        )
+    unordered = sorted(set(ranks_map) - set(order))
+    if unordered:
+        raise ValueError(
+            f"actor.model.slot_lora.slot_ranks gives a rank to {unordered}, which "
+            f"slot_order {order} does not list. slot_order alone decides how many slots "
+            "the model has, so those suites would get NO slot -- a typo in one of the "
+            "two keys produces exactly this, and the run would otherwise train a "
+            "model with fewer slots than the config asks for without a word."
+        )
+
+    ranks = [ranks_map[s] for s in order]
+    scale_mode = str(slot_cfg.get("a_scale_mode", "match_mt4"))
+    ref_rank = int(slot_cfg.get("a_scale_ref_rank", 128))
+    eps = float(slot_cfg.get("orth_eps", 1e-6))
+
+    injection = inject_slot_lora(
+        model,
+        ranks,
+        list(SLOT_LORA_TARGET_MODULES),
+        scale_mode=scale_mode,
+        ref_rank=ref_rank,
+        eps=eps,
+    )
+    _assert_slot_leaves_fsdp_wrappable(model)
+
+    # THE GATE HAS TO SURVIVE THIS CALL: the actor installs per-micro-batch routing
+    # through it and nothing else in the model exposes it. Plain attributes, not
+    # buffers or submodules -- a SlotGate is not an nn.Module and a tuple of strings is
+    # not a tensor, so neither reaches the state dict, FSDP or the optimizer. Read them
+    # back with find_slot_gate(model) / model._slot_order.
+    #
+    # `_slot_order` rides along because the actor's router needs the SAME order this
+    # built the slots from (`match_suite_ids(texts, prompt_to_suite, suite_order)`
+    # returns an index into it). Reading it off the model instead of re-reading config
+    # makes "the router's order" and "the slots' order" one value rather than two that
+    # must agree.
+    model._slot_gate = injection.gate
+    model._slot_order = tuple(order)
+
+    # Mirrors the PEFT branch, deliberately. inject_slot_lora freezes EVERYTHING that is
+    # not a slot parameter (it has to: FSDP cannot flatten mixed requires_grad under
+    # use_orig_params=False, and only the slot leaves get their own flat param), and a
+    # value head is the one thing a caller legitimately meant to keep training. The
+    # attribute only exists when actor.model.add_value_head is set, and OPD runs leave
+    # it off (adv_type: opd, no critic; RLINF_CONVERT_VALUE_HEAD=False on conversion),
+    # so for them this is a no-op -- but get_model is shared with runs that DO use a
+    # value head, and a slot path that froze the critic while
+    # the PEFT baseline trained it would differ from the baseline in a second dimension
+    # on top of the one being measured. FSDP-safe for the same reason it is on the PEFT
+    # path: every ValueHead leaf is a childless nn.Linear, so the per-leaf policy gives
+    # each its own uniformly-trainable flat param.
+    value_head = "absent"
+    if hasattr(model, "value_head"):
+        for param in model.value_head.parameters():
+            param.requires_grad = True
+        value_head = "trainable"
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    _sys.stderr.write(
+        f"[slot-lora] injected {len(injection.paths)} SlotLoRALinear "
+        f"(targets=SLOT_LORA_TARGET_MODULES); order={order} ranks={ranks} "
+        f"R={sum(ranks)}; scale_mode={scale_mode} ref_rank={ref_rank} orth_eps={eps}; "
+        f"value_head={value_head}; trainable params={trainable}\n"
+    )
     return model
 
 
