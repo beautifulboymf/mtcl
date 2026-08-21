@@ -30,7 +30,7 @@
 # business -- this script does not know or care whether it is a smoke test or the real run.
 set -uo pipefail
 
-NEED_ALL="${NEED_ALL:-5,6,7}"
+NEED_ALL="${NEED_ALL-5,6,7}"   # no colon: an explicit empty string means "nothing is mandatory"
 PICK_FROM="${PICK_FROM:-0,1,2,3,4}"
 PICK_N="${PICK_N:-1}"
 MEM_MAX_MIB="${MEM_MAX_MIB:-5000}"
@@ -42,6 +42,7 @@ POLL_S="${POLL_S:-120}"
 MAX_WAIT_H="${MAX_WAIT_H:-12}"
 NEED_GB="${NEED_GB:-175}"
 ANON_MAX_G="${ANON_MAX_G:-200}"
+RETRY_IF_FAST_S="${RETRY_IF_FAST_S:-180}"  # a target that dies faster than this never started real work
 LOG="${WAIT_LOG:-/share/fanruochen-local/outputs/wait_for_gpus.log}"
 LOCK="${WAIT_LOCK:-/tmp/wait_for_gpus.lock}"
 
@@ -84,7 +85,11 @@ while :; do
 
   status=""; all_ok=1
   for g in ${NEED_ALL//,/ }; do
-    read -r mem umean busy < <(probe_gpu "$g"); rc=$?
+    # COMMAND substitution, not process substitution: `read < <(f); rc=$?` captures READ's
+    # status, not f's, so the idle verdict was silently discarded and every card counted as
+    # idle -- observed firing on cards at 100% utilization.
+    out=$(probe_gpu "$g"); rc=$?
+    read -r mem umean busy <<< "$out"
     status+="$g:${mem}MiB/${umean}% "
     (( rc == 0 )) || all_ok=0
   done
@@ -95,7 +100,8 @@ while :; do
     cands=""
     for g in ${PICK_FROM//,/ }; do
       case ",$NEED_ALL," in *",$g,"*) continue ;; esac
-      read -r mem umean busy < <(probe_gpu "$g"); rc=$?
+      out=$(probe_gpu "$g"); rc=$?
+      read -r mem umean busy <<< "$out"
       status+="($g:${mem}MiB/${umean}%)"
       # Bucket the memory before ranking. On this box every candidate carries the same ~1960 MiB
       # tenant footprint, so raw memory order is decided by a few MiB of noise and would happily
@@ -110,7 +116,7 @@ while :; do
   fi
 
   if [ -n "$chosen" ]; then
-    GPUS_SEL=$(printf '%s\n%s\n' "${NEED_ALL//,/$'\n'}" "${chosen//,/$'\n'}" | sort -n | paste -sd, -)
+    GPUS_SEL=$(printf '%s\n%s\n' "${NEED_ALL//,/$'\n'}" "${chosen//,/$'\n'}" | grep -E '^[0-9]+$' | sort -n | uniq | paste -sd, -)
     say "WINDOW OPEN round=$ROUND -> GPUS=$GPUS_SEL   [$status]"
 
     # Re-check the red lines HERE, not at the top. The wait may have been hours; the volume and
@@ -127,8 +133,21 @@ while :; do
     fi
 
     say "LAUNCH  disk=${free}G anon=${anon}G  GPUS=$GPUS_SEL  cmd: $*"
-    export GPUS="$GPUS_SEL"
-    exec "$@"
+    # Run as a CHILD, not exec. The target re-checks the cards itself (it must -- this waiter is
+    # not the only thing that can be wrong), and load can spike in the seconds between the two
+    # checks. With exec, one such spike ended a twelve-hour wait. A target that dies faster than
+    # RETRY_IF_FAST_S did not get as far as real work, so resume waiting instead of giving up;
+    # anything slower than that started for real and its exit code is the run's, not ours.
+    t0=$(date +%s)
+    GPUS="$GPUS_SEL" "$@"
+    rc=$?
+    dt=$(( $(date +%s) - t0 ))
+    if (( rc != 0 && dt < RETRY_IF_FAST_S )); then
+      say "target refused after ${dt}s (rc=$rc) -- treating as a lost window, resuming the wait"
+      sleep "$POLL_S"; continue
+    fi
+    say "target finished rc=$rc after ${dt}s"
+    exit "$rc"
   fi
 
   say "round=$ROUND not ready  [$status]"
