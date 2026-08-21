@@ -204,7 +204,7 @@ algorithm:
 
 ## 10. 实验
 
-底座：**`inc_sft_opd/lwf_long_e1000_merged`** —— 与 mt4 的起点逐字节相同（已核 `opd_mt4_driver.log` 的 `model_path`），因此 mt4（0.745）与 mt4w2（0.750）**直接作为对照，零额外算力**。选它而不是更强的 `lwf_long_e2000_merged`（0.835）的原因就是这个：e2000 上没有任何匹配的 joint-OPD 对照，要自己再跑一次 15 步才有守恒带。
+底座：**`inc_sft_opd/lwf_long_e1000_merged`** —— 与 mt4 的起点逐字节相同。**注意 mt4 真正的 run 日志是 `opd_mt4i_driver.log`**（tag `mt4`、15 步、GPU 0-5），`opd_mt4_driver.log` 是更早一次单卡中止尝试、批大小不同，不要拿它作参照。已把 R1 解析后的配置树与 mt4 日志里的树逐键 diff：**全部差异只有 9 个 slot 键、4 个 dyn-weight 键、4 个带 tag 的输出路径**，因此 mt4（0.745）与 mt4w2（0.750）**直接作为对照，零额外算力**。选它而不是更强的 `lwf_long_e2000_merged`（0.835）的原因就是这个：e2000 上没有任何匹配的 joint-OPD 对照，要自己再跑一次 15 步才有守恒带。
 
 teacher / 步数 / env / batch 全部沿用 mt4：4 个按 prompt 路由的 per-suite expert，long 的 teacher 是 `lwf_long_e1000_merged::long_opd130`（与学生同血统，其 base 就是学生起点），另外三个是 `base_stats130::<per-suite adapter>`；15 步、6 GPU、envs 48、group_size 4、rollout_epoch 3、micro 8、global_batch 192。`anchor_lambda=0`、`distill_fail_alpha` 不设 —— mt4 / mt4w2 的配置里就没有这两项，保持一致。
 

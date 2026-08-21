@@ -23,6 +23,30 @@ cd /home/fanruochen/CL/RLinf
 
 ---
 
+## ⚠️ 实施中发现的硬阻塞与决定（Task 9/12/13）
+
+**teacher 会继承 slot 配置，必须显式清掉。** teacher 的 config 是 `deepcopy(cfg.actor.model)`，于是每个 teacher 都带着 `slot_lora.enabled=true`；teacher 是 `base::adapter` 形式（`is_lora=True` + `lora_path`），而 slot 路径明确拒绝 `lora_path` —— 四个 teacher 会全部在加载时死掉，R1 根本起不来。修法：`_load_teacher_model._load_one` 里设 `tcfg.slot_lora = None`（teacher 永远不是 slot 学生）。dual-KL anchor 走 `is_lora=False`，不受影响。
+
+**未匹配样本默认致命。** `_route_prepare` 在 fallback 比例超过 `algorithm.slot_route_fallback_tol`（默认 `0.0`）时 `RuntimeError` 并点名最多 3 条 prompt，在前向之前就停。停一次的代价是一轮 rollout；不停的代价是一个多天后没法信的结果。
+
+**转换器对 `--slot-ranks` 的顺序不敏感，且这是良性的。** `Z` 是 `(R, d_in)`、`B` 是 `(d_out, R)`，形状只取决于 `sum(slot_ranks)`；`ΔW = Σ_k B_k Ā_k = B Ā` 对所有 slot 求和，与切分位置无关，所以 128/64/48/16 的 24 种排列全都能加载且合出**同一个** ΔW。被抓的是**总和不同**。训练侧同样是构造上一致的：rank 按 `[slot_ranks[s] for s in slot_order]` 取名，路由用同一个 `model._slot_order`。
+
+**mt4 的真日志是 `opd_mt4i_driver.log`**，不是 `opd_mt4_driver.log`（后者是更早的单卡中止尝试，批大小不同）。
+
+**启动命令**（人工执行，见 Task 14）：
+
+```bash
+cd /home/fanruochen/CL/RLinf && \
+GPUS=<空闲卡> SR_PROC_MAX=1000 \
+bash /share/fanruochen-local/dev/scripts/safe_run.sh \
+  /share/fanruochen-local/outputs/opd_mt4slot_driver.log \
+  bash examples/embodiment/incremental_sft/opd_mt4slot.sh
+```
+
+`SR_PROC_MAX=1000` 是必须的：48 envs × 6 rank 会超过 safe_run 默认 700 的进程上限（mt4w2 也需要）。
+
+---
+
 ## ⚠️ 接线契约（Task 7 落地后，Task 9/13 以此为准）
 
 **actor 取 gate**：
