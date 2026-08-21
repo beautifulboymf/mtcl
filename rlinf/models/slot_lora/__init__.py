@@ -21,6 +21,7 @@ from rlinf.models.slot_lora.modules import (
     SlotProj,
 )
 from rlinf.models.slot_lora.orth import orth_error, orthogonalize
+from rlinf.models.slot_lora.routing import match_suite_ids
 
 __all__ = [
     "orthogonalize",
@@ -29,4 +30,5 @@ __all__ = [
     "SlotGate",
     "SlotOut",
     "SlotLoRALinear",
+    "match_suite_ids",
 ]
