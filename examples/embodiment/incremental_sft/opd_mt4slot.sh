@@ -224,9 +224,23 @@ fi
 #                    ContextVar reads its default and the gate would have silently vanished.
 #   MICRO=<n>        micro_batch_size. Halving it halves the activation peak and doubles the
 #                    number of grad-accumulation steps.
+#   PROFILE=1        turn on in-step progress lines and the per-phase breakdown. WITHOUT this a
+#                    training step prints NOTHING between step boundaries -- a step that takes
+#                    hours is indistinguishable from a hung one, which is exactly how four hours
+#                    were once spent watching a silent log. The timing itself is close to free:
+#                    the CUDA events are read right after an `.item()` that already drains the
+#                    stream every micro-batch, so no new synchronization is introduced.
+#   PROFILE_EVERY=N  micro-batches between progress lines (0 = auto, ~10 lines per optimizer
+#                    update). Set it explicitly when a step has thousands of micro-batches.
 EXTRA=()
 [ -n "${GRAD_CKPT:-}" ] && EXTRA+=("++actor.fsdp_config.gradient_checkpointing=$GRAD_CKPT")
 [ -n "${MICRO:-}" ]     && EXTRA+=("actor.micro_batch_size=$MICRO")
+[ -n "${PROFILE:-}" ]   && EXTRA+=("++algorithm.profile_train_phases=true" "++algorithm.profile_log_every=${PROFILE_EVERY:-50}")
+#   RESUME_DIR=<dir>  continue from a checkpoint instead of starting over. Must point at a
+#                     `.../checkpoints/global_step_N` directory; the runner parses the step number
+#                     out of the name. The DCP shards inside reshard across a different world
+#                     size, which is what lets a run that started on 2 cards continue on 4.
+[ -n "${RESUME_DIR:-}" ] && EXTRA+=("++runner.resume_dir=$RESUME_DIR")
 (( ${#EXTRA[@]} )) && echo "         memory overrides: ${EXTRA[*]}"
 
 MT4SLOT_GPUS="$GPUS" MT4SLOT_TAG="$TAG" MT4SLOT_STUDENT_PATH="$STUDENT" \
