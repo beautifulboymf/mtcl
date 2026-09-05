@@ -25,7 +25,7 @@ import numpy as np
 from toolkits.eval_scripts_openpi import setup_logger, setup_policy
 
 metaworld.register_mw_envs()
-os.environ["MUJOCO_GL"] = "egl"
+os.environ["MUJOCO_GL"] = "osmesa"  # EGL banned on this machine (host crashes 2026-08-27/29)
 
 
 def load_prompt_from_json(json_path, env_name):

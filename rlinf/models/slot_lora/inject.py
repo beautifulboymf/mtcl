@@ -93,6 +93,7 @@ def inject_slot_lora(
     eps: float = 1e-6,
     iters: int = _DEFAULT_NS_ITERS,
     strict_gate: bool = True,
+    frozen_orth: bool = False,
 ) -> SlotInjection:
     """Replace every targeted ``nn.Linear`` with a :class:`SlotLoRALinear`; freeze the rest.
 
@@ -212,7 +213,9 @@ def inject_slot_lora(
     paths = []
     for parent, child_name, child, path in candidates:
         scale = _module_scale(child.in_features, scale_mode, ref_rank)
-        wrapper = SlotLoRALinear(child, ranks, scale, gate, eps=eps, iters=iters)
+        wrapper = SlotLoRALinear(
+            child, ranks, scale, gate, eps=eps, iters=iters, frozen_orth=frozen_orth
+        )
         setattr(parent, child_name, wrapper)
         adapted_bases.update(id(p) for p in wrapper.base.parameters())
         paths.append(path)

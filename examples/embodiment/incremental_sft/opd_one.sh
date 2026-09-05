@@ -16,10 +16,10 @@ LOGP="/share/fanruochen-local/outputs/seqcl_${TAG}"
 set +u   # venv activate references unbound PYTHONPATH under set -u
 source /home/fanruochen/.rlinf-env.sh 2>/dev/null
 source /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/activate
-source /share/fanruochen-local/dev/gpu_render_env.sh   # OPD env rollout renders via egl
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa  # EGL banned 2026-09-03 (two host crashes); CPU render only   # OPD env rollout renders via egl
 set -u
 export EMBODIED_PATH="$REPO/examples/embodiment" REPO_PATH="$REPO"
-export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH="$REPO:${PYTHONPATH:-}"
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export RLINF_CONVERT_VALUE_HEAD=False
 
 echo "== df =="; df -h /share/fanruochen-local | tail -1

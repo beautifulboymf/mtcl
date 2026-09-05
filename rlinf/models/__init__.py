@@ -610,6 +610,12 @@ def _apply_slot_lora(model, cfg: DictConfig, slot_cfg: DictConfig):
     # this file could drift away from them without anything noticing.
     iters = int(slot_cfg.get("orth_iters", _DEFAULT_NS_ITERS))
 
+    # frozen_orth: orthonormalize every Z once at construction and skip the
+    # per-forward Newton-Schulz (measured 779 ms / 3.94% of an mt4slotA step spent
+    # recomputing a constant). Only valid when A never trains; the actor checks that
+    # against alt_schedule/alt_anneal at init and refuses the combination otherwise.
+    frozen_orth = bool(slot_cfg.get("frozen_orth", False))
+
     injection = inject_slot_lora(
         model,
         ranks,
@@ -618,6 +624,7 @@ def _apply_slot_lora(model, cfg: DictConfig, slot_cfg: DictConfig):
         ref_rank=ref_rank,
         eps=eps,
         iters=iters,
+        frozen_orth=frozen_orth,
     )
     _assert_slot_leaves_fsdp_wrappable(model)
 

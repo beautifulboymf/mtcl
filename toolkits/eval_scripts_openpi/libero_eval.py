@@ -25,7 +25,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 from toolkits.eval_scripts_openpi import setup_logger, setup_policy
 
-os.environ["MUJOCO_GL"] = "egl"
+os.environ["MUJOCO_GL"] = "osmesa"  # EGL banned on this machine (host crashes 2026-08-27/29)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]

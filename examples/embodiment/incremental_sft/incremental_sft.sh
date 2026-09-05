@@ -23,7 +23,31 @@ STATS130=/share/fanruochen-local/checkpoints/RLinf-OpenVLAOFT-LIBERO-130-Base-Lo
 DROOT=/share/fanruochen-local/datasets/rlds
 FINE_ALIGNED="$REPO/examples/embodiment/incremental_sft/sft_aligned.py"
 
-[ -d "$DROOT/$DSET" ] || { echo "ABORT: RLDS data missing: $DROOT/$DSET"; exit 1; }
+# A single-suite DSET is a real RLDS directory; a mixture name (e.g. libero_4suite_no_noops)
+# is a logical entry in OXE_NAMED_MIXTURES with NO directory of its own -- its sub-datasets
+# are the real dirs. Check the directory only when it is not a known mixture.
+if [ -d "$DROOT/$DSET" ]; then
+  :  # single-suite dir present
+elif /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/python - "$DSET" 2>/dev/null <<'PYEOF'
+import sys
+from prismatic.vla.datasets.rlds.oxe.mixtures import OXE_NAMED_MIXTURES as M  # the venv copy training imports
+sys.exit(0 if sys.argv[1] in M else 1)
+PYEOF
+then
+  echo "[inc-sft] '$DSET' is a named mixture -> checking its sub-datasets exist under $DROOT"
+  /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/python - "$DSET" "$DROOT" <<'PYEOF'
+import os, sys
+from prismatic.vla.datasets.rlds.oxe.mixtures import OXE_NAMED_MIXTURES as M  # the venv copy training imports
+name, droot = sys.argv[1], sys.argv[2]
+missing = [d for d, _ in M[name] if not os.path.isdir(os.path.join(droot, d))]
+if missing:
+    print("ABORT: mixture sub-datasets missing:", missing); sys.exit(1)
+print("  sub-datasets OK:", [d for d, _ in M[name]])
+PYEOF
+  [ $? -eq 0 ] || exit 1
+else
+  echo "ABORT: RLDS data missing: $DROOT/$DSET (not a directory and not a named mixture)"; exit 1
+fi
 [ -f "$NORM130" ]     || { echo "ABORT: norm override missing: $NORM130"; exit 1; }
 
 source /home/fanruochen/.rlinf-env.sh 2>/dev/null

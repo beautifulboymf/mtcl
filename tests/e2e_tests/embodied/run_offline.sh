@@ -8,7 +8,7 @@ REPO_PATH=${REPO_PATH:-$(cd "$(dirname "$0")/../../.." && pwd)}
 export REPO_PATH
 
 CONFIG=$1
-BACKEND=${2:-"egl"}
+BACKEND=${2:-"osmesa"}  # EGL banned on this machine (host crashes 2026-08-27/29)
 shift 2 2>/dev/null || shift 1 2>/dev/null || true
 
 export MUJOCO_GL=${BACKEND}

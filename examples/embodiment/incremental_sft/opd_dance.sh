@@ -1,36 +1,24 @@
 #!/bin/bash
-# opd_mt4slot.sh — R1 of the slot-LoRI study: mt4's 4-teacher routed OPD, with the student's ONE
-# shared rank-128 LoRA replaced by FOUR per-suite LoRA slots on orthogonal input subspaces.
+# opd_dance.sh -- the DanceOPD transfer: joint 4-teacher routed OPD, ONE shared LoRA r=128,
+# conflict handled purely by gradient scheduling (single-suite updates + trajectory thinning).
+# All mechanism knobs pinned in libero_dance_2gpu.yaml; this launcher adds none.
+# Derived from opd_seqslot.sh: same guard rails (disk floor, GPU preflight, reaper, run_iso).
 #
-#   student  = inc_sft_opd/lwf_long_e1000_merged      (byte-for-byte mt4's starting point)
-#   teachers = spatial | object | goal | long, routed per suite (mt4's exact set)
-#   slots    = read from the config's actor.model.slot_lora (never restated here)
-#   config   = examples/embodiment/config/libero_mt4slot_6gpu.yaml
-#
-# WHY THE CONTROLS COST NOTHING. mt4 (4-suite mean 0.745) and mt4w2 (0.750) already ran this
-# setup with the shared LoRA from this same student, and both said the joint routed form only
-# REDISTRIBUTES capability -- mt4 bought long +0.28 with goal -0.20, mt4w2 bought goal +0.12 with
-# long -0.10, spatial and object never moved. So R1 needs no baseline run of its own, PROVIDED
-# nothing but the student's LoRA structure changes. Everything else is pinned in the YAML at
-# mt4's resolved values, and this script adds no hydra overrides on top of it -- on purpose. If
-# you need to change a knob, change it in the config where it is visible next to the comment
-# explaining what it is pinned to, not as an invisible override here.
-#
-# Run it under the watchdog, never bare:
+# Run under the watchdog:
 #   SR_PROC_MAX=1000 bash /share/fanruochen-local/dev/scripts/safe_run.sh \
-#     /share/fanruochen-local/outputs/opd_mt4slot_driver.log \
-#     bash examples/embodiment/incremental_sft/opd_mt4slot.sh
+#     /share/fanruochen-local/outputs/opd_dance_driver.log \
+#     bash examples/embodiment/incremental_sft/opd_dance.sh
 set -uo pipefail
 
-TAG="${TAG:-mt4slot}"
-STEPS="${STEPS:-15}"                       # mt4 ran 15
-GPUS="${GPUS:-0,1,2,3,4,5}"                # six, as mt4
+TAG="${TAG:-dance}"
+STEPS="${STEPS:-15}"                       # mt4-comparable
+GPUS="${GPUS:-0,1}"
 PORT="${PORT:-58000}"                      # isolated ray head; keep >=1000 from any other job
-SAVE_INTERVAL="${SAVE_INTERVAL:-5}"        # mt4 ran 5
+SAVE_INTERVAL="${SAVE_INTERVAL:-5}"
 O=/share/fanruochen-local/outputs
 STUDENT="${STUDENT:-$O/inc_sft_opd/lwf_long_e1000_merged}"
 REPO=/home/fanruochen/CL/RLinf
-CFG=libero_mt4slot_6gpu
+CFG=libero_dance_2gpu
 SCRIPTS=/share/fanruochen-local/dev/scripts
 PY=/share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/python
 LOGP="$O/seqcl_${TAG}"
@@ -177,7 +165,7 @@ echo "[preflight] disk=${free}G  gpus=$GPUS  student=$(basename "$STUDENT")  ste
 echo "== df =="; df -h /share/fanruochen-local | tail -1
 echo "======== SLOT-LORI R1 [$TAG] config=$CFG init=$(basename "$STUDENT") gpus=$GPUS steps=$STEPS  $(date '+%F %T') ========"
 echo "         slots: $SLOT_ORDER_CSV = $SLOT_RANKS_CSV  (R=$SLOT_R)"
-echo "         controls: mt4 0.745 (opd_mt4i_driver.log) / mt4w2 0.750 (opd_mt4w2_driver.log)"
+echo "         controls: mt4w2 0.750 / slot-LoRI joint 0.775 (both final@temp1.0); LwF seq target > those"
 
 # ---- checkpoint reaper -------------------------------------------------------------------------
 # The runner never deletes a global_step_* directory, so a 15-step run at save_interval 5 ends
@@ -196,6 +184,9 @@ echo "         controls: mt4 0.745 (opd_mt4i_driver.log) / mt4w2 0.750 (opd_mt4w
 #     so the loop also checks that the launcher's PID is still alive and exits within one tick --
 #     an orphan reaper would otherwise eat the checkpoints of the NEXT run with the same TAG.
 KEEP_CKPTS="${KEEP_CKPTS:-2}"
+# Comma-separated step numbers the reaper must NEVER delete: the round ends. Derived from
+# SAVE_INTERVAL so a changed round length moves the whitelist with it.
+KEEP_STEPS="${KEEP_STEPS:-$(seq -s, "$SAVE_INTERVAL" "$SAVE_INTERVAL" "$STEPS")}"
 CKPT_DIR="$LOGP/seqcl_${TAG}/checkpoints"
 REAP_PID=""
 case "$CKPT_DIR" in
@@ -215,6 +206,12 @@ if (( KEEP_CKPTS > 0 )); then
       n=${#steps[@]}
       (( n > KEEP_CKPTS )) || continue
       for (( i = 0; i < n - KEEP_CKPTS; i++ )); do
+        # Round-end checkpoints are M_1..M_4 -- the per-round artefacts this whole
+        # experiment exists to produce -- and cost 4 x 36G the disk floor above
+        # already budgets for. Everything between round ends is superseded normally.
+        case ",${KEEP_STEPS}," in
+          *",${steps[i]},"*) continue ;;
+        esac
         victim="$CKPT_DIR/global_step_${steps[i]}"
         [ -d "$victim" ] || continue
         echo "[reap] removing superseded $victim ($(du -sh "$victim" 2>/dev/null | cut -f1))"
@@ -266,37 +263,21 @@ EXTRA=()
 #                     out of the name. The DCP shards inside reshard across a different world
 #                     size, which is what lets a run that started on 2 cards continue on 4.
 [ -n "${RESUME_DIR:-}" ] && EXTRA+=("++runner.resume_dir=$RESUME_DIR")
-#   ANNEAL=<table>    two-timescale schedule for the A factor, overriding alt_schedule
-#                     per step. R1's constant "BBA" put A on a third of every step's
-#                     updates at B's own lr for the whole run, and measured over four
-#                     steps that gave monotone dw_norm growth with a FLAT opd_kl
-#                     (1.1325 -> 1.1158) while the mt4 control moved eleven times
-#                     further. Each A update re-orthogonalizes the whole frame, so B
-#                     keeps getting re-projected onto a rotated coordinate system.
-#                     ANNEAL=r1 is the prepared table: A on 1/8 of updates through step
-#                     8, 1/16 through step 11, then pure B. That last stage is LoRI's
-#                     PARAMETERIZATION (a frozen orthogonal frame) but NOT LoRI: the
-#                     B's are still fitted jointly with every slot in the forward,
-#                     whereas LoRI fits each adapter alone and merges afterwards.
-#   ENVS=<n>          override env.train.total_num_envs. The config pins mt4's 48, and on TWO
-#                     cards that is 99% of an 80 GB card: the run that completed five steps
-#                     peaked at 81050 of 81920 MiB, i.e. 870 MiB of headroom, and on 2026-08-23
-#                     three consecutive launches died -- the last inside
-#                     MultiStepRolloutWorker.generate at predict_action_batch, which
-#                     micro_batch_size cannot help because it only governs TRAINING. rollout
-#                     forwards every env at once and has no batching knob (pipeline_stage_num 1,
-#                     both enable_offload already true), so total_num_envs is the only lever on
-#                     its peak. Divisibility to check before setting it: envs/ranks must be a
-#                     multiple of group_size, and envs*rollout_epoch*(max_episode_steps/
-#                     num_action_chunks) must divide global_batch_size. 32 on 2 ranks: 16 per
-#                     rank (group_size 4 ok), 6144 samples, 32 updates per step. Setting this
-#                     BREAKS comparability with the mt4 controls, which ran 48.
+#   ROUND_TABLE=<t>   override the config's round plan (smoke only; see below)
+
 [ -n "${ENVS:-}" ] && EXTRA+=("env.train.total_num_envs=$ENVS")
-case "${ANNEAL:-}" in
-  "")   ;;
-  r1)   EXTRA+=("++actor.model.slot_lora.alt_anneal=[[0,BBBBBBBA],[9,BBBBBBBBBBBBBBBA],[12,B]]") ;;
-  *)    EXTRA+=("++actor.model.slot_lora.alt_anneal=$ANNEAL") ;;
-esac
+# ROUND_TABLE: smoke-test knob. A 2-step smoke must still cross a ROUND BOUNDARY (the switch
+# is where the owner slot, the active expert and the anchor exclusion all change at once), so
+# it overrides the config's 6-step rounds with e.g. [[0,libero_object],[1,libero_spatial]].
+[ -n "${ROUND_TABLE:-}" ] && EXTRA+=("++actor.model.slot_lora.round_table=$ROUND_TABLE")
+# ANCHOR_LAMBDA: the LoRI-independent control sets 0 -- no LwF term, each slot trained blind
+# to the other suites, exactly the original-LoRI training regime.
+[ -n "${ANCHOR_LAMBDA:-}" ] && EXTRA+=("++algorithm.anchor_lambda=$ANCHOR_LAMBDA")
+# ACTIVE_SUITES: restrict BOTH the env's rollout tasks AND the teacher_map to these suites
+# (comma-separated). The LoRI-independent runs set exactly one: original LoRI trains each
+# adapter on its own task's data only -- and dropping the other teacher lineages is what
+# makes the run fit next to this box's tenants (the 4-teacher set cost ~29G; one lineage ~15G).
+[ -n "${ACTIVE_SUITES:-}" ] && EXTRA+=("++env.train.active_suites=[$ACTIVE_SUITES]")
 (( ${#EXTRA[@]} )) && echo "         memory overrides: ${EXTRA[*]}"
 
 MT4SLOT_GPUS="$GPUS" MT4SLOT_TAG="$TAG" MT4SLOT_STUDENT_PATH="$STUDENT" \
@@ -328,6 +309,7 @@ if [ ! -x "$CONVERTER" ]; then
 fi
 echo "======== CONVERT $CKPT -> $CONV (base=$(basename "$STUDENT")) ========"
 SLOT_RANKS="$SLOT_RANKS_CSV" SLOT_SCALE_MODE=match_mt4 SLOT_REF_RANK=128 SLOT_EPS=1e-6 \
+  SLOT_FROZEN_ORTH=1 \
   bash "$CONVERTER" "$CKPT" "$CONV" "$STUDENT" libero_130_no_noops_trajall \
   || { echo "WARN: slot conversion failed; the training checkpoint is intact at $CKPT"; exit 0; }
 [ -f "$CONV/model.safetensors.index.json" ] || {

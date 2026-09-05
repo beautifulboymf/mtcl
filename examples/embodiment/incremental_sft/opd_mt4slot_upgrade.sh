@@ -71,7 +71,14 @@ PROC_ROOT="${PROC_ROOT:-/proc}"
 NVIDIA_SMI="${NVIDIA_SMI:-nvidia-smi}"
 NEED_GPUS="${NEED_GPUS:-4}"
 PICK_FROM="${PICK_FROM:-0,1,2,3,4,5,6,7}"
-MEM_MAX_MIB="${MEM_MAX_MIB:-5000}"
+# FREE memory, not USED. "used < 5000" asks "has anyone touched this card", which on this box
+# is true of every card (each carries a 25-30 GB tenant) and is the WRONG question anyway. The
+# right one is "is there room for a rank", and the answer was measured the hard way on
+# 2026-08-23: a 4-GPU attempt on cards with 55.4 and 54.6 GB FREE died of CUDA OOM inside
+# MultiStepRolloutWorker.generate at `hf_model.to(device)` -- before a single training step, so
+# micro_batch_size could not have saved it. Each card carries an FSDP actor shard AND a full
+# rollout model copy AND the routed teachers. 70 GB is what the two cards that DO work have.
+FREE_MIN_MIB="${FREE_MIN_MIB:-70000}"
 UTIL_MAX_PCT="${UTIL_MAX_PCT:-20}"
 UTIL_N="${UTIL_N:-5}"
 UTIL_OK_N="${UTIL_OK_N:-4}"
@@ -102,7 +109,7 @@ DISK_PATH="${DISK_PATH:-/share/fanruochen-local}"
 STABLE_S="${STABLE_S:-5}"            # full_weights.pt must not change size across this gap
 KILL_WAIT_S="${KILL_WAIT_S:-60}"     # per stage of the kill, before escalating to SIGKILL
 REL_WAIT_S="${REL_WAIT_S:-180}"      # how long to wait for the cards to actually come free
-REL_MAX_MIB="${REL_MAX_MIB:-$MEM_MAX_MIB}"
+REL_MIN_FREE_MIB="${REL_MIN_FREE_MIB:-$FREE_MIN_MIB}"
 VERIFY_S="${VERIFY_S:-2400}"         # the resumed run loads two 7B teacher bases first
 LOG="${UPGRADE_LOG:-$O/opd_mt4slot_upgrade.log}"
 LOCK="${UPGRADE_LOCK:-/tmp/opd_mt4slot_upgrade.lock}"
@@ -317,7 +324,7 @@ max_step() {  # highest step directory on disk, complete or not; "" if none
 # and every card counts as idle -- that bug was observed opening a window on cards at 100%.
 probe_gpu() {
   local g="$1" mem util busy=0 sum=0 i
-  mem=$("$NVIDIA_SMI" -i "$g" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null) || return 2
+  mem=$("$NVIDIA_SMI" -i "$g" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null) || return 2
   [[ "$mem" =~ ^[0-9]+$ ]] || return 2   # "[N/A]" is not a card we understand
   for (( i = 0; i < UTIL_N; i++ )); do
     util=$("$NVIDIA_SMI" -i "$g" --query-gpu=utilization.gpu --format=csv,noheader,nounits 2>/dev/null)
@@ -327,7 +334,7 @@ probe_gpu() {
     sleep "$UTIL_SLEEP_S"
   done
   echo "$mem $(( sum / UTIL_N )) $busy"
-  (( mem < MEM_MAX_MIB )) || return 1
+  (( mem >= FREE_MIN_MIB )) || return 1
   (( UTIL_N - busy >= UTIL_OK_N )) || return 1
   return 0
 }
@@ -336,6 +343,14 @@ gpu_mem() {
   local m
   m=$("$NVIDIA_SMI" -i "$1" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null)
   [[ "$m" =~ ^[0-9]+$ ]] || { echo 999999; return 1; }
+  echo "$m"
+}
+
+gpu_free() {
+  # Unreadable reports 0, i.e. "no room" -- the safe direction, the mirror of gpu_mem's 999999.
+  local m
+  m=$("$NVIDIA_SMI" -i "$1" --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null)
+  [[ "$m" =~ ^[0-9]+$ ]] || { echo 0; return 1; }
   echo "$m"
 }
 
@@ -455,13 +470,16 @@ stop_the_run() {
   return 0
 }
 
-cards_released() {  # every target card back under REL_MAX_MIB within REL_WAIT_S
+cards_released() {  # every target card back to >=REL_MIN_FREE_MIB FREE within REL_WAIT_S
+  # FREE, matching probe_gpu: on this box every card carries a 25-30 GB tenant that never goes
+  # away, so "used dropped below a threshold" can never become true and this would always time
+  # out -- stranding the upgrade after the kill, with the run down and nothing relaunched.
   local gpus="$1" deadline=$(( $(date +%s) + REL_WAIT_S )) g m busy
   while :; do
     busy=""
     for g in ${gpus//,/ }; do
-      m=$(gpu_mem "$g")
-      (( m < REL_MAX_MIB )) || busy+="$g:${m}MiB "
+      m=$(gpu_free "$g")
+      (( m >= REL_MIN_FREE_MIB )) || busy+="$g:${m}MiB_free "
     done
     [ -z "$busy" ] && return 0
     (( $(date +%s) < deadline )) || { say "  cards still held: $busy"; return 1; }
@@ -562,7 +580,7 @@ fi
 # ==================================================================================================
 
 say "watching for a ${NEED_GPUS}-card window for the run under $CKPT_DIR"
-say "  idle test: mem<${MEM_MAX_MIB}MiB AND >=${UTIL_OK_N}/${UTIL_N} samples under ${UTIL_MAX_PCT}%"
+say "  idle test: FREE mem>=${FREE_MIN_MIB}MiB AND >=${UTIL_OK_N}/${UTIL_N} samples under ${UTIL_MAX_PCT}%"
 say "  on switch: micro walks '$MICROS_4G', gradient_checkpointing=$GRAD_CKPT_4G, ray port $NEW_PORT"
 say "  poll ${POLL_S}s, give up after ${MAX_WAIT_H}h; log $LOG"
 

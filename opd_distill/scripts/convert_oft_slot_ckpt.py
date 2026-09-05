@@ -192,6 +192,7 @@ def wrap_with_slots(
     eps=DEFAULT_SLOT_EPS,
     target_modules=None,
     verbose=False,
+    frozen_orth=False,
 ):
     """Rebuild the EXACT training-time structure, so the checkpoint's keys line up.
 
@@ -430,6 +431,7 @@ def merge_slot_checkpoint(
     eps=DEFAULT_SLOT_EPS,
     target_modules=None,
     verbose=False,
+    frozen_orth=False,
 ):
     """Inject, load, merge -- the whole conversion core, on any ``nn.Module``.
 
@@ -464,6 +466,7 @@ def merge_slot_checkpoint(
         eps=eps,
         target_modules=target_modules,
         verbose=verbose,
+        frozen_orth=frozen_orth,
     )
     load_slot_checkpoint(model, state_dict, slot_ranks, verbose=verbose)
     merged = merge_slots(model, verbose=verbose)
@@ -512,6 +515,17 @@ def main():
         type=float,
         default=DEFAULT_SLOT_EPS,
         help="training config's actor.model.slot_lora.orth_eps",
+    )
+    ap.add_argument(
+        "--slot-frozen-orth",
+        action="store_true",
+        help=(
+            "training config's actor.model.slot_lora.frozen_orth. MUST match "
+            "training: with it, the stored Z IS the A-bar the forward used, and the "
+            "merge uses it verbatim; without it the merge re-runs Newton-Schulz on Z. "
+            "The two differ by the polar correction of a bf16-rounded orthonormal "
+            "matrix -- small, but a silently different model than the one trained."
+        ),
     )
     ap.add_argument("--action-dim", type=int, default=7)
     ap.add_argument("--num-action-chunks", type=int, default=8)
@@ -576,6 +590,7 @@ def main():
             ref_rank=args.slot_ref_rank,
             eps=args.slot_eps,
             verbose=True,
+            frozen_orth=bool(getattr(args, "slot_frozen_orth", False)),
         )
     except SlotCheckpointMismatch as exc:
         print(f"FATAL: {exc}", flush=True)

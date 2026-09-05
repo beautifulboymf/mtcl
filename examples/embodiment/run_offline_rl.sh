@@ -4,8 +4,8 @@ export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}")" && pwd )"
 export REPO_PATH=$(dirname "$(dirname "$EMBODIED_PATH")")
 export SRC_FILE="${EMBODIED_PATH}/train_offline_rl.py"
 
-export MUJOCO_GL="egl"
-export PYOPENGL_PLATFORM="egl"
+export MUJOCO_GL="osmesa"
+export PYOPENGL_PLATFORM="osmesa"
 export PYTHONPATH="${REPO_PATH}:${PYTHONPATH:-}"
 
 if [ -z "$1" ]; then

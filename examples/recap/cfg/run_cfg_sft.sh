@@ -12,8 +12,8 @@ export HF_HOME="${HF_HOME:-${HOME}/.cache/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HOME}/.cache/huggingface/datasets}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HOME}/.cache/transformers}"
 
-export MUJOCO_GL="${MUJOCO_GL:-egl}"
-export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
+export MUJOCO_GL=osmesa  # EGL banned on this machine (host crashes 2026-08-27/29)
+export PYOPENGL_PLATFORM=osmesa
 
 # Suppress libdav1d/ffmpeg verbose logging
 export AV_LOG_FORCE_NOCOLOR=1

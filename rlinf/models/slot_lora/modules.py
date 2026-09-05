@@ -255,7 +255,7 @@ class SlotGate:
     routing. Under ``strict`` that raises; it is not silently ungated.
     """
 
-    __slots__ = ("_ids", "num_slots", "strict")
+    __slots__ = ("_ids", "num_slots", "strict", "exclude_slot")
 
     def __init__(self, num_slots: Optional[int] = None, strict: bool = True) -> None:
         """Create the holder for one model.
@@ -296,6 +296,13 @@ class SlotGate:
         self._ids: Optional[torch.Tensor] = None
         self.num_slots = num_slots
         self.strict = bool(strict)
+        # Which slot's contribution to REMOVE from the forward VALUE, or None. Only
+        # :meth:`excluding` writes it, only the UNGATED branch of
+        # :meth:`SlotOut.forward` reads it, and the combination "routed AND excluding"
+        # is refused there: gating decides who LEARNS from the full-sum value, while
+        # exclusion CHANGES the value -- a forward doing both at once has no defined
+        # meaning in this package.
+        self.exclude_slot: Optional[int] = None
 
     def current(self) -> Optional[torch.Tensor]:
         """The routing for the forward running right now. THE accessor gated code uses.
@@ -389,6 +396,64 @@ class SlotGate:
         finally:
             self._ids, self.strict = previous_ids, previous_strict
 
+    @contextmanager
+    def excluding(self, slot: int) -> Iterator["SlotGate"]:
+        """Run one block ungated, with slot ``slot`` REMOVED from the forward value.
+
+        This is the anchor teacher of the sequential-round runs: with the base, every
+        A and every other slot's B frozen, the student minus slot ``k``'s contribution
+        IS ``M_{k-1}`` -- the model as it stood before round ``k`` -- so the previous
+        round's merged checkpoint never has to be materialized, written or loaded.
+        The block also runs UNGATED (a value-changing forward must not be a training
+        forward; see ``exclude_slot`` in ``__init__``) and restores everything on the
+        way out, exception included.
+
+        Args:
+            slot: The slot index to remove. Range-checked here against ``num_slots``,
+                because an out-of-range index would silently remove NOTHING downstream
+                (``offsets[slot]`` would raise only if past the end, and a negative
+                index would silently pick from the tail -- both wrong in a way the
+                loss would never surface).
+
+        Yields:
+            This gate, for convenience.
+
+        Raises:
+            ValueError: if ``slot`` is not an int in ``[0, num_slots)``, or if the
+                gate was built without ``num_slots`` (nothing to validate against).
+        """
+        if isinstance(slot, bool) or not isinstance(slot, int):
+            raise ValueError(
+                f"excluding() needs a plain int slot index; got "
+                f"{type(slot).__name__} ({slot!r})."
+            )
+        if self.num_slots is None:
+            raise ValueError(
+                "excluding() on a gate built without num_slots: the index cannot be "
+                "validated, and an invalid one removes nothing, silently."
+            )
+        if not 0 <= slot < self.num_slots:
+            raise ValueError(
+                f"excluding() got slot {slot}, outside [0, {self.num_slots}). A "
+                "negative index would silently exclude from the tail and a too-large "
+                "one would exclude nothing; both produce an anchor teacher that is "
+                "NOT M_(k-1) with no error anywhere."
+            )
+        previous_ids, previous_strict, previous_ex = (
+            self._ids,
+            self.strict,
+            self.exclude_slot,
+        )
+        self._ids, self.strict, self.exclude_slot = None, False, slot
+        try:
+            yield self
+        finally:
+            self._ids, self.strict, self.exclude_slot = (
+                previous_ids,
+                previous_strict,
+                previous_ex,
+            )
+
 
 class SlotProj(nn.Module):
     """Holds Z; produces the row-orthonormal Ā = (Z Zᵀ)^(-1/2) Z shared by every slot.
@@ -420,6 +485,7 @@ class SlotProj(nn.Module):
         iters: int = _DEFAULT_NS_ITERS,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
+        frozen_orth: bool = False,
     ):
         """Build the Z parameter for one LoRA'd linear.
 
@@ -525,6 +591,22 @@ class SlotProj(nn.Module):
         # 1/sqrt(d_in) gives unit-ish row norms and a well-conditioned Z Zᵀ. The actual
         # scale is irrelevant to Ā (orthogonalize is scale-invariant).
         nn.init.normal_(self.weight, mean=0.0, std=self.in_features**-0.5)
+        # frozen_orth: A never trains this run (the caller promises alt_schedule "B"
+        # for the whole run and is checked there), so Ā is a CONSTANT -- orthonormalize
+        # ONCE here, in fp32, and let orth_weight return the stored weight directly.
+        # What that buys: the full-model Newton-Schulz pass measured 779 ms per
+        # training forward (3.94% of a step) on mt4slotA, times every forward of every
+        # update, all spent recomputing a matrix that never changes. What it costs:
+        # nothing at load time either -- a checkpoint overwrites this weight with the
+        # SAVED orthonormal Z, and orth_weight still returns it as-is.
+        self.frozen_orth = bool(frozen_orth)
+        if self.frozen_orth:
+            with torch.no_grad():
+                self.weight.copy_(
+                    orthogonalize(
+                        self.weight.detach().float(), iters=self.iters, eps=self.eps
+                    ).to(self.weight.dtype)
+                )
         # Armed externally (by the training loop, on ONE module, once per step); the
         # forward disarms it again so a single arm costs a single extra NS call.
         self._collect_diag = False
@@ -578,7 +660,16 @@ class SlotProj(nn.Module):
         Returns:
             The row-orthonormal ``(R, d_in)`` matrix.
         """
-        a = orthogonalize(self.weight, iters=self.iters, eps=self.eps)
+        # frozen_orth returns the STORED weight: it was orthonormalized once at
+        # construction and nothing trains it, so the per-forward Newton-Schulz would
+        # recompute the same matrix (to bf16 rounding) 437 times per forward for
+        # nothing. The diagnostic below still runs its own fp32 NS when armed, so
+        # slot/orth_err keeps measuring drift on the same scale as a trainable run.
+        a = (
+            self.weight
+            if getattr(self, "frozen_orth", False)
+            else orthogonalize(self.weight, iters=self.iters, eps=self.eps)
+        )
         if collect and self._collect_diag:
             # The precision guard has to wrap the GRAM as well, not just the
             # orthogonalization. orthogonalize pins autocast and TF32 off internally,
@@ -851,10 +942,34 @@ class SlotOut(nn.Module):
         ids = self.gate.current()
         if self._collect_diag:
             self._stash_diag()
+        ex = getattr(self.gate, "exclude_slot", None)
         if ids is None:
+            if ex is not None:
+                # Anchor-teacher forward of a sequential round: the full sum MINUS
+                # slot ``ex``'s contribution. With base, A and the other slots' B all
+                # frozen, this IS M_(k-1) -- computed as full-matmul-minus-one-block
+                # (two matmuls) rather than a K-1 term loop, so the K-1 kept slots
+                # are summed in the SAME single-matmul order as the ungated forward
+                # they are being compared against.
+                start = self.offsets[ex]
+                stop = start + self.slot_ranks[ex]
+                return F.linear(h, self.weight) - F.linear(
+                    h[..., start:stop], self.weight[:, start:stop]
+                )
             # Ungated (eval, rollout, or a single-slot run): one matmul, no masks,
             # no graph surgery -- and bit-identical to the merged adapter.
             return F.linear(h, self.weight)
+        if ex is not None:
+            # Routed AND excluding has no defined meaning: gating chooses who LEARNS
+            # from the full-sum value, exclusion CHANGES the value. Reaching this line
+            # means a training forward ran inside an ``excluding()`` block -- an
+            # anchor forward that leaked its context, which would silently train the
+            # student against a wrong value.
+            raise RuntimeError(
+                f"SlotOut got a routed forward while gate.exclude_slot={ex}. "
+                "excluding() is for the ungated no-grad anchor forward only; a gated "
+                "training forward must never run inside it."
+            )
         # A raise, not an assert: `python -O` / PYTHONOPTIMIZE=1 STRIPS asserts, and
         # measured with them stripped, a length-1 routing against a batch of 4 assigned
         # all four samples to slot 0 while a length-4 routing against a batch of 1
@@ -934,6 +1049,7 @@ class SlotLoRALinear(nn.Module):
         gate: SlotGate,
         eps: float = 1e-6,
         iters: int = _DEFAULT_NS_ITERS,
+        frozen_orth: bool = False,
     ):
         """Wrap one linear, freeze it, and give it its slots.
 
@@ -1034,6 +1150,7 @@ class SlotLoRALinear(nn.Module):
             iters,
             dtype=ref.dtype,
             device=ref.device,
+            frozen_orth=frozen_orth,
         )
         self.slot_B = SlotOut(
             base.out_features, ranks, gate, dtype=ref.dtype, device=ref.device

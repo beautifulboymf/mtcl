@@ -500,7 +500,12 @@ def test_joint_ablation_trains_both_factors_every_update():
 
 
 def _expected_keys(n_slots):
-    keys = {"slot/orth_err", "slot/phase_is_A"}
+    # slot/alt_a_frac_cfg is the CONFIGURED A share for the step. It is here for the
+    # same reason every other key is: the set must be identical on every rank, and this
+    # one is derived from the schedule string, which comes from config. It is also what
+    # makes a phase_is_A of 0.0 readable -- healthy under a pure-"B" anneal stage, dead
+    # mechanism under anything else.
+    keys = {"slot/orth_err", "slot/phase_is_A", "slot/alt_a_frac_cfg"}
     keys |= {f"slot/dw_norm_{k}" for k in range(n_slots)}
     keys |= {f"slot/cos_{s}_{t}" for s in range(n_slots) for t in range(s + 1, n_slots)}
     return keys

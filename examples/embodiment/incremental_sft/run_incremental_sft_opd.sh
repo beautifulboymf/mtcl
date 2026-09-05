@@ -54,7 +54,7 @@ opd_stage(){ # $1=suite $2=student_init $3=tag  -> sets OPD_OUT
   # the seqcl OPD config resolves ${oc.env:EMBODIED_PATH} in its hydra searchpath; run_iso does
   # not set these, so export them here (train_embodied_agent.py, unlike eval_embodiment.sh, does not).
   export EMBODIED_PATH="$REPO/examples/embodiment" REPO_PATH="$REPO"
-  export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH="$REPO:${PYTHONPATH:-}"
+  export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa PYTHONPATH="$REPO:${PYTHONPATH:-}"
   guard_df
   banner "[OPD $SUITE] init=$(basename "$INIT") teacher=130"
   SEQCL_GPUS="$OPD_GPUS" SEQCL_STUDENT_PATH="$INIT" \

@@ -69,10 +69,10 @@ oom0=$(awk '/^oom_kill /{print $2}' /sys/fs/cgroup/memory.events)
 set +u
 source /home/fanruochen/.rlinf-env.sh 2>/dev/null
 source /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/activate
-source /share/fanruochen-local/dev/gpu_render_env.sh     # GPU-EGL render; CPU render makes rollout 4x slower
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa  # EGL banned 2026-09-03 (two host crashes); CPU render only     # GPU-EGL render; CPU render makes rollout 4x slower
 set -u
 export EMBODIED_PATH="$REPO/examples/embodiment" REPO_PATH="$REPO"
-export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH="$REPO:${PYTHONPATH:-}"
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export ROBOT_PLATFORM=LIBERO
 # Ray's memory monitor reads cgroup memory.current, which INCLUDES reclaimable page cache -- it
 # false-fired at 98.5% while true MemAvailable was 235G and killed a worker mid-collective. safe_run

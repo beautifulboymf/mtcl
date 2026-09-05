@@ -15,9 +15,9 @@ mkdir -p "$OUT"
 set +u   # venv activate references unbound PYTHONPATH under set -u
 source /home/fanruochen/.rlinf-env.sh 2>/dev/null
 source /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/activate
-source /share/fanruochen-local/dev/gpu_render_env.sh
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa  # EGL banned 2026-09-03 (two host crashes); CPU render only
 set -u
-export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export RLINF_CONVERT_VALUE_HEAD=False
 

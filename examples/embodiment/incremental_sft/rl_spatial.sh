@@ -27,10 +27,10 @@ LOGP="/share/fanruochen-local/outputs/rl_spatial_${TAG}"
 set +u   # venv activate references unbound vars
 source /home/fanruochen/.rlinf-env.sh 2>/dev/null
 source /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/activate
-source /share/fanruochen-local/dev/gpu_render_env.sh    # EGL GPU render for LIBERO rollout
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa  # EGL banned 2026-09-03 (two host crashes); CPU render only    # EGL GPU render for LIBERO rollout
 set -u
 export EMBODIED_PATH="$REPO/examples/embodiment" REPO_PATH="$REPO"
-export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH="$REPO:${PYTHONPATH:-}"
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export ROBOT_PLATFORM=LIBERO
 # ROOT-CAUSE FIX for the sync crash: at sync_model_to_rollout the FSDP actor reloads its offloaded
 # 7B weights from CPU + reads ckpt shards -> page cache fills the LXC cgroup. Ray's memory monitor

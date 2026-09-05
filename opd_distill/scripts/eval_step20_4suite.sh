@@ -5,7 +5,7 @@
 cd /home/fanruochen/CL/RLinf
 source /home/fanruochen/.rlinf-env.sh                                   # render-libs + proxy
 source /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/activate   # conda env -> python on PATH
-source /share/fanruochen-local/dev/gpu_render_env.sh                    # 535.179 GL + MUJOCO_GL=egl (AFTER rlinf-env)
+source /share/fanruochen-local/dev/gpu_render_env.sh   # osmesa shim (EGL quarantined)
 
 CONV=/share/fanruochen-local/outputs/opd_130full_big/converted/step_20
 UNNORM=libero_130_no_noops_trajall

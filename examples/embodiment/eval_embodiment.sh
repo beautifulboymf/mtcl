@@ -4,9 +4,9 @@ export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
 
-# respect a pre-set MUJOCO_GL (e.g. egl for GPU render via gpu_render_env.sh); default osmesa (CPU)
-export MUJOCO_GL="${MUJOCO_GL:-osmesa}"
-export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-osmesa}"
+# osmesa unconditionally: EGL banned on this machine (host crashes 2026-08-27/29)
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
 export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
 
 # Base path to the BEHAVIOR dataset, which is the BEHAVIOR-1k repo's dataset folder

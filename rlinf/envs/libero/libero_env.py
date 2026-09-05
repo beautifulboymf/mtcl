@@ -19,6 +19,29 @@ import os
 import sys
 from typing import Optional, Union
 
+# EGL is DEFAULT-DENIED on this machine: two whole-host crashes (2026-08-27/29) via
+# NVIDIA Bug 4905391 (host driver 535.179 < fixed 535.216.01; admin will not upgrade).
+# 2026-09-04 the user re-approved EGL as an EXPLICIT PER-JOB OPT-IN, keyed by
+# RLINF_ALLOW_EGL=1 (set only by dev/gpu_render_env.sh after its own gates), and only
+# for fully-idle self-occupied cards -- the pattern that ran hundreds of hours clean.
+# This fuse MUST run before ANY import below: `rlinf.envs.libero.venv` imports
+# `libero.libero.envs` -> `robosuite`, whose binding_utils.py reads MUJOCO_GL at
+# import time and FREEZES its GLContext class choice -- fixing the env var after that
+# import is too late. Keep this block above every rlinf/libero import.
+if (
+    os.environ.get("RLINF_ALLOW_EGL") == "1"
+    and os.environ.get("MUJOCO_GL", "").lower() == "egl"
+):
+    pass  # keyed opt-in: gpu_render_env.sh armed EGL deliberately for this job
+else:
+    if os.environ.get("MUJOCO_GL", "").lower() == "egl":
+        sys.stderr.write(
+            "[libero_env] MUJOCO_GL=egl OVERRIDDEN to osmesa: no RLINF_ALLOW_EGL key "
+            "(EGL is opt-in only on this machine; host crashes 2026-08-27/29).\n"
+        )
+    os.environ["MUJOCO_GL"] = "osmesa"
+    os.environ["PYOPENGL_PLATFORM"] = "osmesa"
+
 import gym
 import numpy as np
 import torch

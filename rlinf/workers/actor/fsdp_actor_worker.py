@@ -563,6 +563,480 @@ def parse_slot_alt_schedule(value) -> Optional[str]:
     return schedule
 
 
+def parse_slot_alt_anneal(value) -> Optional[list[tuple[int, Optional[str]]]]:
+    """Normalize ``actor.model.slot_lora.alt_anneal`` into sorted ``(from_step, schedule)``.
+
+    WHY THIS EXISTS. ``alt_schedule`` is one cycle for the whole run, and R1 ran it at
+    ``BBA`` -- A free on a third of every step's updates, at the SAME lr as B, from the
+    first step to the last. Measured consequence (2026-08-22, four steps): ``dw_norm``
+    grew monotonically on all four slots while ``opd_kl`` moved 1.1325 -> 1.1158, i.e.
+    the weights moved and the function did not. mt4, the control, moved its KL eleven
+    times further over the same four steps AND bounced twenty times harder step to
+    step. The mechanism that fits: every A update re-orthogonalizes the WHOLE frame
+    (measured: moving one slot's Z rotates the other slots' subspaces by as much as, and
+    sometimes more than, its own), so a B fitted to the previous frame is repeatedly
+    re-projected onto a rotated one.
+
+    The fix is a two-timescale schedule: let the frame find its allocation early, then
+    hand the whole budget to B and stop moving the coordinate system underneath it. At
+    the ``"B"`` end this degenerates EXACTLY to LoRI (a frozen orthogonal frame), which
+    makes the anneal the natural ablation axis for "are learned orthogonal subspaces
+    better than random frozen ones".
+
+    Args:
+        value: ``None`` to keep ``alt_schedule`` constant for the whole run (the old
+            behaviour, unchanged). Otherwise a list of ``[from_step, schedule]`` pairs;
+            the entry with the largest ``from_step`` that is ``<= version`` wins, so
+            ``[[0, "BBBBBBBA"], [9, "B"]]`` reads "A on one update in eight until step
+            9, then never again". ``schedule`` follows :func:`parse_slot_alt_schedule`,
+            so ``null`` there means the joint ablation for that stretch.
+
+    Returns:
+        The stages sorted by ``from_step``, or ``None`` when annealing is off.
+
+    Raises:
+        ValueError: on a malformed entry, a negative step, or a duplicate ``from_step``
+            -- loudly, at construction. A stage table with two entries claiming the
+            same step has no defined winner, and picking one silently would run a
+            different experiment than the config describes.
+    """
+    if value is None:
+        return None
+    stages: list[tuple[int, Optional[str]]] = []
+    seen: set[int] = set()
+    try:
+        items = list(value)
+    except TypeError as exc:
+        raise ValueError(
+            "actor.model.slot_lora.alt_anneal must be a list of [from_step, schedule] "
+            f"pairs or null; got {type(value).__name__} ({value!r})."
+        ) from exc
+    if not items:
+        raise ValueError(
+            "actor.model.slot_lora.alt_anneal is an empty list. Write null to keep "
+            "alt_schedule constant; an empty list is a typo, and the two must not look "
+            "alike in a config that decides which experiment ran."
+        )
+    for entry in items:
+        pair = list(entry) if not isinstance(entry, str) else None
+        if pair is None or len(pair) != 2:
+            raise ValueError(
+                "each actor.model.slot_lora.alt_anneal entry must be "
+                f"[from_step, schedule]; got {entry!r}."
+            )
+        step_raw, sched_raw = pair
+        try:
+            from_step = int(step_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"actor.model.slot_lora.alt_anneal from_step must be an int; got "
+                f"{step_raw!r}."
+            ) from exc
+        if from_step < 0:
+            raise ValueError(
+                f"actor.model.slot_lora.alt_anneal from_step must be >= 0; got "
+                f"{from_step}."
+            )
+        if from_step in seen:
+            raise ValueError(
+                f"actor.model.slot_lora.alt_anneal has two entries at from_step "
+                f"{from_step}; which one wins is undefined."
+            )
+        seen.add(from_step)
+        stages.append((from_step, parse_slot_alt_schedule(sched_raw)))
+    stages.sort(key=lambda item: item[0])
+    if stages[0][0] != 0:
+        raise ValueError(
+            "actor.model.slot_lora.alt_anneal must define a stage at from_step 0; "
+            f"the earliest given is {stages[0][0]}, which leaves steps before it "
+            "without a schedule."
+        )
+    return stages
+
+
+def slot_alt_schedule_for_step(
+    stages: Optional[list[tuple[int, Optional[str]]]],
+    default_schedule: Optional[str],
+    step,
+) -> Optional[str]:
+    """The schedule in force at ``step``: the last stage whose ``from_step <= step``.
+
+    Args:
+        stages: From :func:`parse_slot_alt_anneal`; ``None`` means no annealing.
+        default_schedule: The constant ``alt_schedule``, used when annealing is off or
+            when ``step`` is not a number (a resumed run whose counter is not wired
+            through yet would otherwise silently pick stage 0 -- the WRONG stage, and
+            the one that looks most like the old behaviour).
+        step: The training step, normally ``self.version``.
+
+    Returns:
+        The cycle string, or ``None`` for the joint ablation.
+    """
+    if not stages:
+        return default_schedule
+    try:
+        step_i = int(step)
+    except (TypeError, ValueError):
+        return default_schedule
+    chosen = stages[0][1]
+    for from_step, schedule in stages:
+        if from_step <= step_i:
+            chosen = schedule
+        else:
+            break
+    return chosen
+
+
+def slot_alt_a_fraction(schedule: Optional[str]) -> float:
+    """Share of a cycle spent on A -- the configured value the metric is checked against.
+
+    ``slot/phase_is_A`` reading 0.0 is a healthy reading under a pure-``B`` stage and a
+    dead mechanism under any other, and the two are indistinguishable without this.
+    """
+    if not schedule:
+        return float("nan")
+    return schedule.count("A") / len(schedule)
+
+
+def dance_build_order(
+    suite_ids,
+    batch_size_per_rank: int,
+    keep_frac: float,
+    num_suites: int,
+    seed: int,
+    suites_in_rotation=None,
+    rotations=None,
+):
+    """The DanceOPD-transfer sampling order: suite-blocked updates over thinned trajectories.
+
+    Two mechanisms from DanceOPD (2606.27377), adapted from flow-field distillation to
+    routed AR-token OPD:
+
+    * UPDATE-LEVEL SUITE ISOLATION. Their stress test: even with per-sample hard routing,
+      summing three capabilities' gradients in ONE optimizer step costs 22.8% (46% on the
+      most conflicting one). Here every consecutive ``batch_size_per_rank`` slice -- one
+      update's per-rank share -- holds samples of a SINGLE suite, and the suite of update
+      ``k`` is ``k % num_suites`` (a fixed global rotation, so every FSDP rank sums the
+      same suite on the same update; a per-rank choice would re-mix the gradients across
+      ranks and silently undo the whole mechanism).
+
+    * TRAJECTORY THINNING. Their finding: dense targets along one rollout overcount
+      correlated supervision (shared prompt, seed, path history); one query per rollout
+      is best. 16 envs cannot afford K=1, so this keeps a ``keep_frac`` random subset of
+      each suite's samples instead -- the honest compromise, recorded as such.
+
+    Ranks hold different suite mixtures (each rank owns its own envs' rollouts), so a
+    rank whose pool for suite ``s`` is smaller than its share WRAPS AROUND that pool
+    (reuse) rather than borrowing from another suite -- purity of the update outranks
+    sample freshness. A suite with NO samples on this rank contributes updates drawn
+    from ... nothing; it is skipped in the rotation and the schedule recorded in the
+    returned ``update_suites`` says so.
+
+    Args:
+        suite_ids: 1-D LongTensor/list, one entry per flattened rollout sample, the
+            suite index in ``[0, num_suites)``; ``-1`` = unrouted (dropped).
+        batch_size_per_rank: This rank's slice of one optimizer update.
+        keep_frac: Fraction of each suite's samples to keep, in ``(0, 1]``.
+        num_suites: How many suites rotate.
+        seed: Per-rank seed (caller passes ``cfg.actor.seed + rank``).
+
+    Returns:
+        ``(order, update_suites)`` -- ``order`` a 1-D LongTensor of sample indices whose
+        length is a multiple of ``batch_size_per_rank``, and ``update_suites`` the suite
+        index of every update, in order.
+
+    Raises:
+        ValueError: on an empty routing (every sample -1), a non-positive
+            batch_size_per_rank, or keep_frac outside (0, 1].
+    """
+    if batch_size_per_rank <= 0:
+        raise ValueError(f"batch_size_per_rank must be positive; got {batch_size_per_rank}")
+    if not 0.0 < keep_frac <= 1.0:
+        raise ValueError(f"keep_frac must be in (0, 1]; got {keep_frac}")
+    ids = torch.as_tensor(suite_ids, dtype=torch.long)
+    g = torch.Generator()
+    g.manual_seed(int(seed))
+    pools = []
+    for k in range(num_suites):
+        idx = (ids == k).nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:
+            pools.append(idx)
+            continue
+        keep = max(1, int(round(idx.numel() * keep_frac)))
+        perm = torch.randperm(idx.numel(), generator=g)[:keep]
+        pools.append(idx[perm])
+    total_kept = sum(int(p.numel()) for p in pools)
+    if total_kept == 0:
+        raise ValueError(
+            "dance_build_order: no sample matched any suite -- the routing table is "
+            "empty or every sample decoded to an unknown prompt. A silent fallback "
+            "here would train on an arbitrary mixture, which is exactly what this "
+            "order exists to prevent."
+        )
+    # one update per suite per rotation; rotations sized so the kept samples are seen
+    # roughly once (wraparound covers per-suite imbalance).
+    # suites_in_rotation / rotations: when given, they were decided by the DISTRIBUTED
+    # caller from ALL-REDUCED per-suite counts, so every rank runs the SAME schedule --
+    # the mechanism's whole point (the first smoke showed rank0 rotating goal while
+    # rank1 rotated object: a locally-derived rotation silently re-mixes gradients
+    # across ranks, and a locally-derived rotation COUNT can desync the number of
+    # optimizer updates entirely, which deadlocks FSDP).
+    if suites_in_rotation is not None:
+        empty = [k for k in suites_in_rotation if pools[k].numel() == 0]
+        if empty:
+            raise ValueError(
+                f"dance_build_order: suites {empty} are in the agreed rotation but this "
+                "rank holds ZERO of their samples. The caller must rotate only suites "
+                "whose all-rank MINIMUM kept-count is positive; anything else either "
+                "fabricates an update from nothing or desyncs the update count."
+            )
+        non_empty = list(suites_in_rotation)
+    else:
+        non_empty = [k for k in range(num_suites) if pools[k].numel() > 0]
+    if rotations is None:
+        rotations = max(1, round(total_kept / (batch_size_per_rank * len(non_empty))))
+    order_parts, update_suites = [], []
+    cursors = {k: 0 for k in non_empty}
+    for _ in range(rotations):
+        for k in non_empty:
+            pool = pools[k]
+            take, c = [], cursors[k]
+            need = batch_size_per_rank
+            while need > 0:
+                if c >= pool.numel():
+                    c = 0  # wraparound: purity of the update outranks freshness
+                n = min(need, pool.numel() - c)
+                take.append(pool[c : c + n])
+                c += n
+                need -= n
+            cursors[k] = c
+            order_parts.append(torch.cat(take))
+            update_suites.append(k)
+    return torch.cat(order_parts), update_suites
+
+
+def anchor_obs_embed(
+    pixel_values,
+    texts,
+    img_hw: int = 16,
+    txt_bins: int = 128,
+    img_weight: float = 0.5,
+):
+    """Observation-space embedding for Memory-Anchor retrieval (ANCHORER, arXiv:2608.26545).
+
+    The paper's Step 1 measures state overlap in the POLICY's latent space. Here the
+    embedding is an observation-space proxy instead -- contrast-normalized downsampled
+    image + hashed bag-of-words of the instruction -- because extracting the FSDP-wrapped
+    student's hidden states mid-training would add a forward pass and new plumbing
+    through a loss path that has bitten us twice before. The paper's own ablation
+    (Table 2, "Ours-ActionDis" .13 vs full .11 vs random .18) shows retrieval geometry
+    carries most of the effect; a policy-latent version is the v2 upgrade if this pays.
+
+    Args:
+        pixel_values: float tensor ``(N, C, H, W)`` (any C; wrist-concat 6-channel ok),
+            ``(N, K, C, H, W)`` (first image used), or ``None`` (image part skipped).
+        texts: list of N decoded instruction strings.
+        img_hw: image is average-pooled to ``img_hw x img_hw``.
+        txt_bins: hash-bucket count for the instruction bag-of-words.
+        img_weight: weight of the image part in the combined cosine (0..1). With both
+            parts L2-normalized and scaled by sqrt(w) / sqrt(1-w), the cosine of the
+            concatenation is exactly ``w*cos_img + (1-w)*cos_txt``.
+
+    Returns:
+        float32 CPU tensor ``(N, D)``, rows L2-normalized.
+    """
+    import zlib
+
+    n = len(texts)
+    parts = []
+    w_img = float(min(max(img_weight, 0.0), 1.0))
+    if pixel_values is None:
+        w_img = 0.0
+    if w_img > 0.0:
+        pv = pixel_values
+        if pv.dim() == 5:
+            pv = pv[:, 0]
+        if pv.dim() != 4 or pv.shape[0] != n:
+            raise ValueError(
+                f"anchor_obs_embed: pixel_values shape {tuple(pixel_values.shape)} "
+                f"does not flatten to (N={n}, C, H, W); refusing to guess."
+            )
+        with torch.no_grad():
+            g = pv.float().mean(dim=1, keepdim=True)  # grayscale
+            g = torch.nn.functional.adaptive_avg_pool2d(g, (img_hw, img_hw))
+            g = g.reshape(n, -1)
+            g = g - g.mean(dim=1, keepdim=True)
+            g = g / g.std(dim=1, keepdim=True).clamp_min(1e-6)  # contrast-normalize
+            g = torch.nn.functional.normalize(g, dim=1).cpu() * (w_img**0.5)
+        parts.append(g)
+    if w_img < 1.0:
+        t = torch.zeros(n, txt_bins)
+        for i, s in enumerate(texts):
+            for tok in s.lower().split():
+                t[i, zlib.crc32(tok.encode()) % txt_bins] += 1.0
+        t = torch.nn.functional.normalize(t, dim=1) * ((1.0 - w_img) ** 0.5)
+        parts.append(t)
+    return torch.cat(parts, dim=1).float()
+
+
+def dance_anchor_augment(
+    order,
+    update_suites,
+    suite_ids,
+    batch_size_per_rank: int,
+    anchor_frac: float,
+    embed,
+    suite_w=None,
+):
+    """Fill the tail of every single-suite dance update with cross-suite Memory Anchors.
+
+    ANCHORER (arXiv:2608.26545) transferred to joint routed OPD: while the paper
+    rehearses OLD-task data most similar to the NEW task's conflict region during
+    sequential training, here every single-suite update k IS the "new task" for the
+    other suites, and the fresh on-policy samples of those other suites are the "old
+    data" pool. The last ``round(bspr*anchor_frac)`` positions of each update are
+    replaced by the other-suite samples most similar (cosine in ``embed`` space) to the
+    update's own centroid -- each anchor keeps its OWN routed teacher target downstream,
+    so the anchor is a targeted rehearsal term, exactly the ER-with-anchors semantics.
+
+    This deliberately relaxes dance's pure update-level isolation by a small, targeted
+    fraction -- that is the method, not an accident (paper: 10-20%% of the buffer).
+    Ranks pick anchors locally (each holds different envs); the update COUNT and the
+    majority suite of every update stay rank-identical, so FSDP stays in sync.
+
+    Args:
+        order: flat LongTensor from :func:`dance_build_order` (len = n_updates * bspr).
+        update_suites: suite index per update, same length as ``len(order)//bspr``.
+        suite_ids: 1-D LongTensor over ALL rollout samples (-1 = unrouted). Candidates
+            are drawn from the FULL other-suite sample set, not the thinned pools:
+            thinning exists to de-correlate the majority suite's dense supervision,
+            while anchors want the best-matching states available.
+        batch_size_per_rank: per-rank samples of one update.
+        anchor_frac: fraction of each update to replace, in ``[0, 0.5]``. 0 = no-op.
+        embed: ``(N, D)`` row-normalized embeddings from :func:`anchor_obs_embed`.
+        suite_w: optional per-suite weight tensor (Step-2 proxy: e.g. normalized
+            student-teacher KL EMA ** beta) multiplied into candidate scores.
+
+    Returns:
+        ``(new_order, stats)`` -- stats holds ``mean_sim`` and per-suite anchor counts.
+    """
+    if not 0.0 <= anchor_frac <= 0.5:
+        raise ValueError(
+            f"anchor_frac must be in [0, 0.5] (majority suite must stay the majority); "
+            f"got {anchor_frac}"
+        )
+    bspr = batch_size_per_rank
+    n_a = int(round(bspr * anchor_frac))
+    if n_a == 0:
+        return order, {"mean_sim": 0.0, "anchor_counts": {}}
+    ids = torch.as_tensor(suite_ids, dtype=torch.long)
+    order = order.clone()
+    sims_all, counts = [], {}
+    for u, k in enumerate(update_suites):
+        lo, hi = u * bspr, (u + 1) * bspr
+        cand = ((ids >= 0) & (ids != k)).nonzero(as_tuple=True)[0]
+        if cand.numel() == 0:
+            continue  # single-suite rollout: nothing to anchor with
+        centroid = torch.nn.functional.normalize(
+            embed[order[lo : hi - n_a]].mean(dim=0), dim=0
+        )
+        score = embed[cand] @ centroid
+        sims = score.clone()
+        if suite_w is not None:
+            score = score * suite_w[ids[cand]]
+        top = torch.topk(score, k=min(n_a, cand.numel())).indices
+        chosen = cand[top]
+        order[hi - chosen.numel() : hi] = chosen
+        sims_all.append(sims[top])
+        for s in ids[chosen].tolist():
+            counts[s] = counts.get(s, 0) + 1
+    mean_sim = torch.cat(sims_all).mean().item() if sims_all else 0.0
+    return order, {"mean_sim": mean_sim, "anchor_counts": counts}
+
+
+def parse_slot_round_table(value) -> Optional[list[tuple[int, str]]]:
+    """Validate ``slot_lora.round_table``: the sequential-round plan, or ``None``.
+
+    The table drives the seqslot mode: ``[[0, "libero_object"], [6, "libero_10"],
+    ...]`` means "from step 0 train ONLY object's slot against object's expert while
+    anchoring every other suite to M_(k-1); from step 6 switch to libero_10's slot",
+    and so on. It shares :func:`slot_alt_schedule_for_step`'s last-stage-at-or-below
+    lookup, so a resumed run lands in the right round from its step number alone --
+    no extra state to checkpoint.
+
+    Validated with the same strictness (and for the same reason) as
+    :func:`parse_slot_alt_anneal`: every failure below would otherwise surface ~25
+    minutes into a run, after the rollout, as a wrong-round training step that LOOKS
+    fine. Suite names are checked for non-emptiness only -- whether each names a real
+    slot needs ``slot_order``, which lives on the model; the actor checks that pairing
+    at init, where both are in hand.
+
+    Args:
+        value: The raw config value. ``None``/empty -> ``None`` (mode off).
+
+    Returns:
+        ``[(from_step, suite), ...]`` sorted ascending, or ``None``.
+
+    Raises:
+        ValueError: on a malformed table -- not a sequence of pairs, a negative or
+            duplicated ``from_step``, no stage at step 0 (the steps before the first
+            stage would silently train NO round), or a non-string/empty suite.
+    """
+    if value is None:
+        return None
+    try:
+        items = list(value)
+    except TypeError:
+        raise ValueError(
+            f"slot_lora.round_table must be a sequence of [from_step, suite] pairs; "
+            f"got {type(value).__name__} ({value!r})."
+        )
+    if not items:
+        return None
+    stages: list[tuple[int, str]] = []
+    for i, item in enumerate(items):
+        try:
+            from_step, suite = item
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"slot_lora.round_table entry {i} must be a [from_step, suite] pair; "
+                f"got {item!r}."
+            )
+        if isinstance(from_step, bool) or not isinstance(from_step, int):
+            raise ValueError(
+                f"slot_lora.round_table entry {i}: from_step must be a plain int; "
+                f"got {type(from_step).__name__} ({from_step!r})."
+            )
+        if from_step < 0:
+            raise ValueError(
+                f"slot_lora.round_table entry {i}: from_step {from_step} is negative; "
+                "steps count from 0."
+            )
+        if not isinstance(suite, str) or not suite:
+            raise ValueError(
+                f"slot_lora.round_table entry {i}: suite must be a non-empty string "
+                f"naming a routed suite; got {suite!r}."
+            )
+        stages.append((from_step, suite))
+    stages.sort(key=lambda pair: pair[0])
+    steps = [f for f, _ in stages]
+    if len(set(steps)) != len(steps):
+        dup = sorted({f for f in steps if steps.count(f) > 1})
+        raise ValueError(
+            f"slot_lora.round_table repeats from_step {dup}: two rounds at the same "
+            "step -- one of them can never run, and which one wins depends on sort "
+            "stability rather than on anything the config says."
+        )
+    if stages[0][0] != 0:
+        raise ValueError(
+            f"slot_lora.round_table must define the round at step 0; the earliest "
+            f"stage starts at {stages[0][0]}. Steps before the first stage would "
+            "otherwise train NO round -- gradient nowhere, anchor nowhere -- and look "
+            "exactly like a slow warm-up."
+        )
+    return stages
+
+
 def slot_alt_phase(
     schedule: Optional[str], cycle_pos: int, is_last_update: bool
 ) -> tuple[Optional[str], int]:
@@ -1533,9 +2007,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         # broad behavior we preserve via a mode-covering forward-KL term (data-free).
         # Only loaded when the anchor is active (anchor_lambda>0), so default runs unchanged.
         self.base_model = None
-        if (
+        # anchor_mode=self_masked replaces the loaded base with the student's own
+        # slot-k-excluded forward (see the anchor block in run_training): the 15G
+        # frozen copy would sit in memory scoring nothing. shift_beta still needs the
+        # real base -- it anchors to the ORIGINAL model, which the masked self is not
+        # once any slot has trained -- so it keeps loading one.
+        _needs_base_anchor = (
             float(self.cfg.algorithm.get("anchor_lambda", 0.0)) > 0.0
             or float(self.cfg.algorithm.get("visual_anchor_lambda", 0.0)) > 0.0
+        ) and str(self.cfg.algorithm.get("anchor_mode", "base")) != "self_masked"
+        if (
+            _needs_base_anchor
             or float(self.cfg.algorithm.get("shift_beta", 0.0)) > 0.0
         ):
             self._load_base_model()
@@ -1683,7 +2165,13 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             # LOWERCASED instruction text (matching how the prompt is built) and resolve at
             # forward time by decoding input_ids once per micro-batch.
             self.teacher_prompt_to_suite = None
-            if len(self.teacher_models) > 1:
+            # >= 1, not > 1: a SINGLE-entry teacher_map is how the LoRI-independent runs
+            # train exactly one slot (active_suites restricts the env to that suite and
+            # this map to that expert). The slot machinery still needs prompt->suite to
+            # build its masks and gate ids, and "one routed suite" is a perfectly good
+            # routing -- the true single-teacher form (teacher_model_path, no map) still
+            # skips the table below, unchanged.
+            if len(self.teacher_suite_to_path) >= 1:
                 try:
                     # Build prompt->suite the SAME way get_libero130_task_id_to_suite()
                     # builds task_id->suite (iterate benchmark.libero_suites -> task_maps,
@@ -1789,11 +2277,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             raise RuntimeError(
                 f"slot-LoRI is on with slots {list(self._slot_order)}, but there is no "
                 "prompt->suite routing table, so no sample can be assigned to a slot. "
-                "The table is built in _load_teacher_model and only exists for a "
-                "MULTI-teacher run (actor.teacher_map with more than one entry); with "
-                "one teacher there is nothing to route among and slots buy nothing. "
-                "Either give the run its teacher_map, or turn "
-                "actor.model.slot_lora.enabled off."
+                "The table is built in _load_teacher_model from actor.teacher_map (any "
+                "number of entries); reaching this means the run uses the mapless "
+                "single-teacher form (actor.teacher_model_path) or the table build "
+                "failed -- see the warning above it. Either give the run a teacher_map "
+                "or turn actor.model.slot_lora.enabled off."
             )
         suite_to_path = getattr(self, "teacher_suite_to_path", None) or {}
         unslotted = sorted(set(suite_to_path) - set(self._slot_order))
@@ -1888,8 +2376,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         route = getattr(self, "teacher_prompt_to_suite", None)
         models = getattr(self, "teacher_models", None)
-        if not route or not models or len(models) <= 1:
-            return  # single teacher (or no routing table): nothing to route
+        if not route or not models:
+            return  # no routing table / no teachers: nothing to route
+        if len(models) <= 1 and not self._slot_enabled:
+            # A single teacher with no slots really has nothing to route. WITH slots the
+            # routing must still run -- the gate ids and the per-sample suites come from
+            # here, and skipping it left _slot_gate_ids None and killed the run at the
+            # first gated forward (the LoRI-independent single-expert runs, 2026-08-25).
+            return
         # The embodied actor has no self.tokenizer; the (frozen) teacher model carries
         # the OFT input_processor, whose .tokenizer decodes the rollout prompts.
         tok = getattr(self, "_route_tokenizer", None)
@@ -1925,6 +2419,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
             groups.setdefault(path, []).append(i)
         self._last_groups = groups
+        # Per-sample suite of THIS micro-batch, for the seqslot loss masks: the OPD
+        # loss keeps only the current round's suite, the anchor keeps the complement.
+        # A list of the same length the gate ids have, built from the same `suites`.
+        self._last_suites = suites
         self._slot_fallback = sum(1 for s in suites if s is None) / max(bsz, 1)
 
         if not self._slot_enabled:
@@ -1941,6 +2439,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             len(self._slot_order),
             device=ids.device,
         )
+        # getattr, not a bare read: the routing tests (and any caller composing this
+        # method onto a partial actor) run without _slot_alt_init having set the
+        # seqslot fields, and "attribute missing" must mean "mode off", not a crash.
+        if getattr(self, "_seqslot_suite", None) is not None:
+            # seqslot: EVERY sample owns the current round's slot -- the anchor
+            # samples included, deliberately. The anchor loss exists to shape what
+            # B_k does ON the other suites' states (push its contribution there to
+            # zero), and a gradient gated to each sample's own suite-slot would send
+            # that signal to the frozen B_j instead of to the one factor that is
+            # training. The per-suite routing above still ran: `suites` feeds the
+            # loss masks, and the teacher router still groups by suite.
+            _round_slot = self._slot_index_of().get(self._seqslot_suite)
+            if _round_slot is None:
+                raise RuntimeError(
+                    f"seqslot round {self._seqslot_suite!r} names no slot in "
+                    f"slot_order {sorted(self._slot_index_of())}; _slot_step_begin "
+                    "checks this at the round boundary, so reaching it here means "
+                    "the round changed without going through _slot_step_begin."
+                )
+            self._slot_gate_ids = make_slot_ids(
+                [_round_slot] * len(suites),
+                len(self._slot_order),
+                device=ids.device,
+            )
         if self._slot_fallback > 0.0:
             unmatched = [t for t, s in zip(texts, suites) if s is None]
             msg = (
@@ -2038,6 +2560,71 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             if self._slot_enabled
             else None
         )
+        # alt_anneal, when set, OVERRIDES alt_schedule per step (see
+        # parse_slot_alt_anneal). alt_schedule stays the fallback so a config without
+        # the table behaves exactly as before.
+        self._slot_alt_anneal = (
+            parse_slot_alt_anneal(
+                OmegaConf.select(
+                    self.cfg, "actor.model.slot_lora.alt_anneal", default=None
+                )
+            )
+            if self._slot_enabled
+            else None
+        )
+        self._slot_alt_base_schedule = self._slot_alt_schedule
+        # seqslot: the sequential-round plan. When set, each step trains exactly ONE
+        # suite's slot (every sample of the batch owns it) against that suite's expert,
+        # and anchors every other suite's samples to M_(k-1) = the student minus that
+        # slot -- see _route_prepare and the anchor block in run_training.
+        self._seqslot_table = (
+            parse_slot_round_table(
+                OmegaConf.select(
+                    self.cfg, "actor.model.slot_lora.round_table", default=None
+                )
+            )
+            if self._slot_enabled
+            else None
+        )
+        self._seqslot_suite: Optional[str] = None  # round in force; set per step
+        if self._seqslot_table is not None:
+            # A must be FROZEN for the whole run: the anchor identity "student minus
+            # slot k == M_(k-1)" holds only while base, A and the other slots' B are
+            # all constant, and frozen_orth (if on) additionally stops re-projecting
+            # A. Any schedule that lets A move breaks both, silently.
+            offending = None
+            if self._slot_alt_anneal is not None:
+                offending = "alt_anneal"
+            elif self._slot_alt_schedule is not None and "A" in self._slot_alt_schedule:
+                offending = f"alt_schedule={self._slot_alt_schedule!r}"
+            if offending:
+                raise ValueError(
+                    f"slot_lora.round_table (seqslot) requires A frozen for the whole "
+                    f"run, but {offending} lets A train. Set alt_schedule to 'B' and "
+                    "remove alt_anneal: a moving A silently invalidates the "
+                    "masked-self anchor (student-minus-slot-k is only M_(k-1) while "
+                    "everything but B_k is constant)."
+                )
+        if bool(
+            OmegaConf.select(
+                self.cfg, "actor.model.slot_lora.frozen_orth", default=False
+            )
+        ) and self._slot_enabled:
+            moving = None
+            if self._slot_alt_anneal is not None and any(
+                sched is None or "A" in sched for _, sched in self._slot_alt_anneal
+            ):
+                moving = "alt_anneal"
+            elif self._slot_alt_schedule is None or "A" in self._slot_alt_schedule:
+                moving = f"alt_schedule={self._slot_alt_schedule!r}"
+            if moving:
+                raise ValueError(
+                    f"slot_lora.frozen_orth=True but {moving} lets A train. "
+                    "frozen_orth skips the per-forward re-orthonormalization, so a "
+                    "trained A would drift off the orthonormal manifold with nothing "
+                    "re-projecting it -- every slot would silently start overlapping "
+                    "every other. Freeze A (alt_schedule='B') or drop frozen_orth."
+                )
         self._slot_alt_pos = 0  # cycle position, carried ACROSS training steps
         self._slot_alt_lr: dict[str, float] = {}  # THIS step's scheduler lr per group
         self._slot_alt_frozen = None  # group frozen for the update in flight
@@ -2052,6 +2639,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             return
         self._slot_alt_warned.add(key)
         self.log_warning(message)
+
+    def _emit_slot_stage(self, schedule: Optional[str]) -> None:
+        """Announce an anneal stage change on stderr.
+
+        stderr, not ``log_info``: a ray worker's ``log_info`` writes into the session
+        tmpdir that ``run_iso.sh`` deletes, so it never reaches the driver log -- which
+        is where anyone reading this run will look for "when did A stop moving".
+        """
+        import sys as _sys
+
+        frac = slot_alt_a_fraction(schedule)
+        msg = (
+            f"[slot-lora] alt stage -> {schedule!r} at step "
+            f"{getattr(self, 'version', '?')} (A on {frac:.4g} of updates)"
+        )
+        _sys.stderr.write(msg + "\n")
+        self.log_info(msg)
 
     def _slot_step_begin(self, updates_per_step: int) -> None:
         """Open a training step: snapshot the lr, reset the counters, arm the diagnostics.
@@ -2088,6 +2692,56 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self._slot_alt_a_updates = 0
         self._slot_alt_expected = int(updates_per_step)
         self._slot_alt_frozen = None
+        # Pick THIS step's schedule off the anneal table. The cycle position is carried
+        # across steps on purpose (see slot_alt_phase), but carrying it across a CHANGE
+        # of schedule is meaningless -- position 7 of "BBBBBBBA" is not position 7 of
+        # "B" -- so a stage boundary resets it.
+        if self._slot_alt_anneal:
+            picked = slot_alt_schedule_for_step(
+                self._slot_alt_anneal,
+                self._slot_alt_base_schedule,
+                getattr(self, "version", None),
+            )
+            if picked != self._slot_alt_schedule:
+                self._emit_slot_stage(picked)
+                self._slot_alt_schedule = picked
+                self._slot_alt_pos = 0
+        # seqslot: resolve THIS step's round off the table. Same last-stage-at-or-below
+        # lookup as the anneal, so a resumed run lands in the right round from its
+        # step number alone; an unresolvable step (version not wired) keeps the
+        # PREVIOUS round rather than silently snapping back to round 0.
+        if self._seqslot_table is not None:
+            picked_suite = slot_alt_schedule_for_step(
+                self._seqslot_table,
+                self._seqslot_suite,
+                getattr(self, "version", None),
+            )
+            if picked_suite is None:
+                raise RuntimeError(
+                    "seqslot: no round resolvable for this step -- self.version is "
+                    "not readable and no previous round is in force. Refusing to "
+                    "train: with no round there is no owner slot and no anchor, and "
+                    "the step would look like a normal one while training nothing."
+                )
+            if picked_suite != self._seqslot_suite:
+                slot_of = self._slot_index_of()
+                if picked_suite not in slot_of:
+                    raise RuntimeError(
+                        f"seqslot round_table names suite {picked_suite!r}, which is "
+                        f"not in slot_order {sorted(slot_of)}. The round would own "
+                        "no slot; every sample of every step of this round would "
+                        "train nothing, silently."
+                    )
+                import sys as _sys
+
+                _msg = (
+                    f"[slot-lora] seqslot round -> {picked_suite!r} "
+                    f"(slot {slot_of[picked_suite]}) at step "
+                    f"{getattr(self, 'version', '?')}"
+                )
+                _sys.stderr.write(_msg + "\n")
+                self.log_info(_msg)
+                self._seqslot_suite = picked_suite
         self._slot_alt_lr = {
             group["name"]: float(group["lr"])
             for group in self.optimizer.param_groups
@@ -2269,6 +2923,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 "two places in run_training and have drifted apart.",
             )
         metrics = {key: float(collected.get(key, float("nan"))) for key in keys}
+        metrics["slot/alt_a_frac_cfg"] = slot_alt_a_fraction(self._slot_alt_schedule)
         metrics["slot/phase_is_A"] = (
             self._slot_alt_a_updates / self._slot_alt_updates
             if self._slot_alt_updates
@@ -3105,6 +3760,149 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         g = torch.Generator()
         g.manual_seed(self.cfg.actor.seed + self._rank)
         shuffle_id = torch.randperm(rollout_size, generator=g)
+        # ---- DanceOPD-transfer sampling (algorithm.dance_updates) ------------------------
+        # Replaces the uniform shuffle with suite-blocked, trajectory-thinned updates:
+        # every optimizer update is SINGLE-suite (same suite on every rank -- the rotation
+        # is a function of the update index alone), and only dance_keep_frac of the samples
+        # survive thinning. See dance_build_order for the two mechanisms and their source.
+        self._dance_update_suites = None
+        if bool(self.cfg.algorithm.get("dance_updates", False)):
+            route = getattr(self, "teacher_prompt_to_suite", None)
+            if not route:
+                raise RuntimeError(
+                    "algorithm.dance_updates=true needs the prompt->suite table "
+                    "(actor.teacher_map); without it no sample can be assigned a suite "
+                    "and the 'single-suite update' contract cannot be honored."
+                )
+            from rlinf.models.slot_lora import match_suite_ids
+
+            proc = getattr(self.teacher_model, "input_processor", None)
+            tok = getattr(proc, "tokenizer", None) if proc is not None else None
+            if tok is None:
+                raise RuntimeError(
+                    "dance_updates: no tokenizer reachable via the teacher's "
+                    "input_processor; cannot decode prompts to suites."
+                )
+            # nested under forward_inputs -- the same sub-dict the micro-batch loss
+            # reads its prompts from, so the two decodes can never disagree.
+            _fi = self.rollout_batch.get("forward_inputs", None)
+            if _fi is None or "input_ids" not in _fi:
+                raise RuntimeError(
+                    "dance_updates: rollout_batch carries no "
+                    "forward_inputs['input_ids']; cannot decode prompts to suites."
+                )
+            flat_ids = _fi["input_ids"].reshape(
+                rollout_size, *_fi["input_ids"].shape[2:]
+            )
+            match_order = self._route_match_order()
+            texts = tok.batch_decode(flat_ids, skip_special_tokens=True)
+            suite_ids = match_suite_ids(texts, route, match_order)
+            bspr = self.cfg.actor.global_batch_size // self._world_size
+            _kf = float(self.cfg.algorithm.get("dance_keep_frac", 0.25))
+            # THE ROTATION IS A GLOBAL DECISION. Each rank holds different envs, so its
+            # per-suite pools differ; the first smoke run showed rank0 rotating goal
+            # where rank1 rotated object -- gradients re-mixed across ranks -- and a
+            # locally-computed rotation COUNT can differ too, which desyncs the number
+            # of optimizer updates and deadlocks FSDP. So: all-reduce the per-suite
+            # KEPT counts (MIN and SUM), rotate only suites every rank can fill, and
+            # size the rotation from the all-reduced totals. Deterministic given the
+            # data -- no extra seed coordination needed.
+            import torch.distributed as _dist
+
+            _ids_t = torch.as_tensor(suite_ids, dtype=torch.long)
+            _counts = torch.stack(
+                [
+                    torch.clamp(
+                        (torch.round((_ids_t == k).sum() * _kf)).long(),
+                        min=0 if (_ids_t == k).sum() == 0 else 1,
+                    )
+                    for k in range(len(match_order))
+                ]
+            )
+            _min_c = _counts.clone()
+            _sum_c = _counts.clone()
+            if _dist.is_available() and _dist.is_initialized():
+                # NCCL: the reduce must ride a CUDA tensor ("No backend type
+                # associated with device type cpu" otherwise -- smoke4, 22:52).
+                _dev_c = torch.device("cuda", torch.cuda.current_device())
+                _min_g = _min_c.to(_dev_c)
+                _sum_g = _sum_c.to(_dev_c)
+                _dist.all_reduce(_min_g, op=_dist.ReduceOp.MIN)
+                _dist.all_reduce(_sum_g, op=_dist.ReduceOp.SUM)
+                _min_c = _min_g.cpu()
+                _sum_c = _sum_g.cpu()
+            _rot_suites = [k for k in range(len(match_order)) if _min_c[k].item() > 0]
+            if not _rot_suites:
+                raise RuntimeError(
+                    "dance_updates: no suite has samples on EVERY rank this step; "
+                    "cannot build a rank-consistent rotation. With this few envs the "
+                    "batch composition is degenerate -- raise total_num_envs."
+                )
+            _rots = max(
+                1,
+                round(
+                    _sum_c[_rot_suites].sum().item()
+                    / (bspr * max(1, getattr(self, "_world_size", 1)) * len(_rot_suites))
+                ),
+            )
+            shuffle_id, self._dance_update_suites = dance_build_order(
+                suite_ids,
+                bspr,
+                _kf,
+                len(match_order),
+                self.cfg.actor.seed + self._rank,
+                suites_in_rotation=_rot_suites,
+                rotations=_rots,
+            )
+            import sys as _sys
+
+            _msg = (
+                f"[dance] step {getattr(self, 'version', '?')}: kept "
+                f"{shuffle_id.numel()}/{rollout_size} samples, "
+                f"{len(self._dance_update_suites)} single-suite updates, rotation "
+                f"{[match_order[k] for k in self._dance_update_suites[: len(match_order)]]}"
+            )
+            _sys.stderr.write(_msg + "\n")
+            # ---- Memory Anchors (algorithm.anchor_frac, ANCHORER arXiv:2608.26545) ----
+            # Fill the tail anchor_frac of every single-suite update with the other-suite
+            # samples most similar to that update's observations (the confusion region),
+            # weighted by which suite currently drifts furthest from its teacher (the
+            # per-suite KL EMA maintained in the loss path). Each anchor distills toward
+            # its OWN routed teacher downstream -- a targeted rehearsal term inside the
+            # OPD update, not a new loss.
+            _af = float(self.cfg.algorithm.get("anchor_frac", 0.0))
+            if _af > 0.0:
+                _pv = _fi.get("pixel_values", None)
+                if _pv is not None:
+                    _pv = _pv.reshape(rollout_size, *_pv.shape[2:])
+                _emb = anchor_obs_embed(
+                    _pv,
+                    texts,
+                    img_weight=float(self.cfg.algorithm.get("anchor_img_weight", 0.5)),
+                )
+                _beta = float(self.cfg.algorithm.get("anchor_beta", 0.5))
+                _ema = getattr(self, "_anchor_kl_ema", {}) or {}
+                _klv = torch.tensor(
+                    [float(_ema.get(s, 1.0)) for s in match_order], dtype=torch.float32
+                )
+                _sw = (
+                    (_klv / _klv.mean().clamp_min(1e-8)).pow(_beta).clamp(0.5, 2.0)
+                )
+                shuffle_id, _ast = dance_anchor_augment(
+                    shuffle_id,
+                    self._dance_update_suites,
+                    _ids_t,
+                    bspr,
+                    _af,
+                    _emb,
+                    suite_w=_sw,
+                )
+                _sys.stderr.write(
+                    f"[anchor] step {getattr(self, 'version', '?')}: frac={_af} "
+                    f"mean_sim={_ast['mean_sim']:.3f} per-suite "
+                    f"{ {match_order[s]: c for s, c in sorted(_ast['anchor_counts'].items())} } "
+                    f"suite_w={ {match_order[i]: round(float(_sw[i]), 3) for i in range(len(match_order))} }\n"
+                )
 
         with torch.no_grad():
             self.rollout_batch = process_nested_dict_for_train(
@@ -3356,10 +4154,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                 if _dkl == "reverse":
                                     kl_tok = (ls.exp() * (ls - lt)).sum(dim=-1)
                                 elif _dkl == "jsd":
-                                    # Generalized JSD (GKD, verified recommendation): beta->0 = forward
+                                    # Generalized JSD (GKD, arXiv:2306.13649): beta->0 = forward
                                     # (mode-covering), beta->1 = reverse; bounded by log2 so NO off-support
                                     # blow-up, and closed-form so NO dropped state-visitation bias / no
-                                    # REINFORCE variance. Small beta = the weak-student sweet spot.
+                                    # REINFORCE variance. NOTE: GKD's own finding is that for WEAK students
+                                    # mode-SEEKING (large beta / reverse) wins for CAPABILITY TRANSFER; we
+                                    # default the other way (small beta / forward) on purpose because our
+                                    # objective is PRESERVATION, where mode-covering forgets less. The
+                                    # direction rationale rests on the preservation argument, NOT on GKD.
                                     beta = float(self.cfg.algorithm.get("jsd_beta", 0.3))
                                     pt = lt.exp()
                                     ps = ls.exp()
@@ -3369,6 +4171,36 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                         beta * (pt * (lt - lm)).sum(dim=-1)
                                         + (1.0 - beta) * (ps * (ls - lm)).sum(dim=-1)
                                     )
+                                elif _dkl == "entropy_adaptive":
+                                    # ENTROPY-ADAPTIVE forward+reverse (user design 2026-09-05): switch
+                                    # the divergence by the TEACHER's per-token entropy, so each of the two
+                                    # objectives the field is split over is used where it is RIGHT:
+                                    #   teacher CONFIDENT (low entropy) -> reverse KL(student||teacher),
+                                    #     mode-seeking = precisely INHERIT the capability the teacher is
+                                    #     sure of (this is what capability-transfer labs use, and it is
+                                    #     what breaks the "mode-covering learns everything a little,
+                                    #     nothing well" conservation we keep hitting).
+                                    #   teacher UNSURE (high entropy) -> ADD forward KL(teacher||student),
+                                    #     mode-covering = do NOT zero-force the student onto the teacher's
+                                    #     flat off-support region -> preserve what the student already has.
+                                    # w = normalized teacher entropy in [0,1]; kl = reverse + w*scale*fwd.
+                                    # This FUSES the confidence filter: forward's own P(x) weighting already
+                                    # damps high-entropy teacher tokens, so distill_conf_tau is redundant
+                                    # under this mode (leave it 0).
+                                    pt = lt.exp()
+                                    ps = ls.exp()
+                                    _kl_rev = (ps * (ls - lt)).sum(dim=-1)  # grad via ls
+                                    _kl_fwd = (pt * (lt - ls)).sum(dim=-1)  # grad via ls
+                                    with torch.no_grad():
+                                        _t_ent = -(pt * lt).sum(dim=-1)  # teacher entropy per token
+                                        _ent_max = torch.log(
+                                            torch.tensor(float(pt.shape[-1]), device=pt.device)
+                                        )
+                                        _w_ent = (_t_ent / _ent_max).clamp(0.0, 1.0)
+                                    _fwd_scale = float(
+                                        self.cfg.algorithm.get("ent_adaptive_fwd_scale", 1.0)
+                                    )
+                                    kl_tok = _kl_rev + _w_ent * _fwd_scale * _kl_fwd
                                 else:
                                     pt = lt.exp()  # teacher probs (detached)
                                     kl_tok = (pt * (lt - ls)).sum(dim=-1)  # forward KL, grad via ls
@@ -3429,6 +4261,79 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                     )
                                 else:
                                     mtok = torch.ones_like(kl_tok)
+                                # ---- CHUNK IMPORTANCE (chunk_select, user design 2026-09-05) ----
+                                # Our design: UP-WEIGHT the action chunks that matter most, per the two
+                                # cases -- (a) student CONFIDENT but DISAGREES with the teacher (confidently
+                                # wrong), (b) student UNSURE. The loss stays a SOFT multiplicative weight on
+                                # mtok (mean-1, no samples dropped) so it composes with dance's single-suite
+                                # mask, the anchor bookkeeping, and the failure/dyn-weight terms.
+                                #
+                                # For the "how to combine the two signals" step ONLY, we borrow TIP's
+                                # parameter-free soft-OR (arXiv:2604.14084, Eq.5) -- it is a clean,
+                                # tuning-free way to say "important if EITHER uncertain OR divergent" and
+                                # it provably recovers the confident-but-wrong case (h~0, d>0) that a naive
+                                # sum/product would miss. TIP itself uses this score for HARD TopK token
+                                # DROPPING; we deliberately do NOT adopt that -- our design keeps every
+                                # sample and only reweights, so TIP's selection step defers to our scheme.
+                                #   h = norm student entropy  H(P_S)/log|V|      (uncertainty)
+                                #   d = KL(student||teacher)                      (disagreement)
+                                #   s = 1 - (1-h_hat)(1-d_hat)                     (soft-OR, per-batch min-max)
+                                #   weight = 1 + kappa * (s / mean(s))            (kappa scales our emphasis)
+                                # VLA note: h,d are per-token (TIP is LLM per-token); OpenVLA-OFT actions
+                                # are chunks of `sad` tokens, so both are MEAN-aggregated to per-chunk.
+                                _cs_mode = str(self.cfg.algorithm.get("chunk_select", "off")).lower()
+                                if _cs_mode in ("false", "0", "none"):
+                                    _cs_mode = "off"
+                                elif _cs_mode in ("true", "1", "soft"):
+                                    _cs_mode = "on"
+                                if _cs_mode == "on":
+                                    with torch.no_grad():
+                                        _bC = kl_tok.shape[0]
+                                        _psd = ls.exp()
+                                        _s_ent = -(_psd * ls).sum(dim=-1)  # student entropy per token
+                                        _emax_s = torch.log(
+                                            torch.tensor(float(ls.shape[-1]), device=ls.device)
+                                        )
+                                        _h = _s_ent / _emax_s  # normalized student entropy
+                                        _d = kl_tok.detach()   # KL(student||teacher) disagreement
+                                        # per-batch min-max to [0,1]; guard all-equal batch (->0 not NaN)
+                                        _h = (_h - _h.min()) / (_h.max() - _h.min()).clamp_min(1e-6)
+                                        _d = (_d - _d.min()) / (_d.max() - _d.min()).clamp_min(1e-6)
+                                        _h_c = _h.reshape(_bC, -1, sad).mean(dim=-1)  # [B, chunks]
+                                        _d_c = _d.reshape(_bC, -1, sad).mean(dim=-1)
+                                        _s = _h_c + _d_c - _h_c * _d_c  # soft-OR (TIP Eq.5), borrowed
+                                        # OUR soft reweight (not TIP's TopK drop): emphasis kappa,
+                                        # mean-1 normalized so loss scale / usable lr do not drift.
+                                        _kappa = float(
+                                            self.cfg.algorithm.get("chunk_select_kappa", 1.0)
+                                        )
+                                        _cw = 1.0 + _kappa * (_s / _s.mean().clamp_min(1e-6))
+                                        _cw = _cw / _cw.mean().clamp_min(1e-6)
+                                        _cw_tok = (
+                                            _cw.unsqueeze(-1).expand(-1, -1, sad)
+                                            .reshape(_bC, -1)
+                                        )
+                                    mtok = mtok * _cw_tok
+                                # seqslot: the expert-KL trains ONLY the current
+                                # round's suite; every other sample belongs to the
+                                # anchor term below. One (B,1) 0/1 mask from the
+                                # routing this micro-batch already ran -- a single
+                                # small H2D copy, no sync. A micro-batch with no
+                                # round-suite samples yields an OPD term of exactly 0
+                                # through the clamp_min(1.0) denominator: correct
+                                # (nothing to distill here), and the anchor term
+                                # still trains B_k on what the batch does hold.
+                                _seq_smask = None
+                                if getattr(self, "_seqslot_suite", None) is not None:
+                                    _seq_smask = torch.tensor(
+                                        [
+                                            1.0 if _s == self._seqslot_suite else 0.0
+                                            for _s in self._last_suites
+                                        ],
+                                        device=kl_tok.device,
+                                        dtype=kl_tok.dtype,
+                                    ).view(-1, 1)
+                                    mtok = mtok * _seq_smask
                                 if fail_m is not None:
                                     # traj_fail is per-chunk [B, chunks] like loss_mask -> expand the same way
                                     fm = (
@@ -3543,6 +4448,30 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                     opd_distill_loss = (kl_tok * mtok * _wt).sum() / (mtok * _wt).sum().clamp_min(1.0)
                                 else:
                                     opd_distill_loss = (kl_tok * mtok).sum() / mtok.sum().clamp_min(1.0)
+                                # Memory-Anchor Step-2 proxy (anchor_frac > 0): per-suite
+                                # student-teacher KL EMA, read NEXT step by
+                                # dance_anchor_augment as the suite weight -- "prefer
+                                # anchors from the suite currently drifting furthest from
+                                # its teacher". Suite names come from the routing this
+                                # micro-batch already ran (_last_suites); NOT from the
+                                # in-training success rate, which mis-measured by +-0.33.
+                                if (
+                                    float(self.cfg.algorithm.get("anchor_frac", 0.0)) > 0.0
+                                    and getattr(self, "_last_suites", None) is not None
+                                ):
+                                    with torch.no_grad():
+                                        _ks = (kl_tok * mtok).sum(dim=1) / mtok.sum(
+                                            dim=1
+                                        ).clamp_min(1.0)
+                                        _ema = getattr(self, "_anchor_kl_ema", None)
+                                        if _ema is None:
+                                            _ema = {}
+                                            self._anchor_kl_ema = _ema
+                                        for _ai, _as in enumerate(self._last_suites):
+                                            if _as is None:
+                                                continue
+                                            _av = float(_ks[_ai])
+                                            _ema[_as] = 0.9 * _ema.get(_as, _av) + 0.1 * _av
 
                                 # How many suites this micro-batch actually contains. Both probes are
                                 # meaningless on a single-suite micro-batch (there is no other expert
@@ -3597,7 +4526,44 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             #     vision+prompt features to base (preserve BROAD OOD generalization).
                             _alam = float(self.cfg.algorithm.get("anchor_lambda", 0.0))
                             _vlam = float(self.cfg.algorithm.get("visual_anchor_lambda", 0.0))
-                            if (_alam > 0.0 or _vlam > 0.0) and getattr(
+                            _amode = str(self.cfg.algorithm.get("anchor_mode", "base"))
+                            if (
+                                _amode == "self_masked"
+                                and _alam > 0.0
+                                and getattr(self, "_seqslot_suite", None) is not None
+                            ):
+                                # seqslot anchor teacher = the student MINUS the
+                                # current round's slot. With base, every A and the
+                                # other slots' B frozen, that forward IS M_(k-1) --
+                                # the model as it stood before this round -- so no
+                                # merged checkpoint is ever written, read or held in
+                                # memory for the anchor. no_grad: teacher side only;
+                                # the student side of the KL comes from output_dict,
+                                # which already carries gradient. excluding() also
+                                # runs ungated and restores the routing on exit, so
+                                # the gated recomputation that gradient checkpointing
+                                # performs during backward still sees this
+                                # micro-batch's routing.
+                                if _vlam > 0.0:
+                                    raise RuntimeError(
+                                        "anchor_mode=self_masked has no base model to "
+                                        "take mid-layer features from, so "
+                                        "visual_anchor_lambda>0 cannot be honored. "
+                                        "Set it to 0 or use anchor_mode=base."
+                                    )
+                                _ex_slot = self._slot_index_of()[self._seqslot_suite]
+                                with (
+                                    torch.no_grad(),
+                                    self.amp_context,
+                                    self._slot_gate.excluding(_ex_slot),
+                                ):
+                                    base_out = self.model(
+                                        forward_inputs=forward_inputs,
+                                        compute_logprobs=True,
+                                        use_cache=False,
+                                        **kwargs,
+                                    )
+                            elif (_alam > 0.0 or _vlam > 0.0) and getattr(
                                 self, "base_model", None
                             ) is not None:
                                 with torch.no_grad(), self.amp_context:
@@ -3607,6 +4573,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                         use_cache=False,
                                         **kwargs,
                                     )
+                            else:
+                                base_out = None
+                            if base_out is not None:
                                 # (a) ACTION anchor
                                 if (
                                     _alam > 0.0
@@ -3643,9 +4612,32 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                                             .expand(-1, -1, sad)
                                             .reshape(a_tok.shape[0], -1)
                                         )
-                                        anchor_loss = (a_tok * _amt).sum() / _amt.sum().clamp_min(1.0)
                                     else:
-                                        anchor_loss = a_tok.mean()
+                                        _amt = torch.ones_like(a_tok)
+                                    if getattr(self, "_seqslot_suite", None) is not None:
+                                        # seqslot: the anchor holds the COMPLEMENT of
+                                        # the expert-KL's samples -- old suites only.
+                                        # On the round suite the expert term already
+                                        # says what B_k should do; anchoring it there
+                                        # too would pull the same logits toward
+                                        # M_(k-1) and the expert at once. Rebuilt
+                                        # here rather than reusing the OPD block's
+                                        # mask: that block is behind its own
+                                        # action_logits guard, and a NameError from a
+                                        # path that skipped it would be this loss's
+                                        # only failure mode.
+                                        _seq_amask = torch.tensor(
+                                            [
+                                                0.0
+                                                if _s == self._seqslot_suite
+                                                else 1.0
+                                                for _s in self._last_suites
+                                            ],
+                                            device=a_tok.device,
+                                            dtype=a_tok.dtype,
+                                        ).view(-1, 1)
+                                        _amt = _amt * _seq_amask
+                                    anchor_loss = (a_tok * _amt).sum() / _amt.sum().clamp_min(1.0)
                                 # (b) VISUAL anchor: patch-wise cosine of mid-layer features to base
                                 if (
                                     _vlam > 0.0
@@ -3698,6 +4690,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                             metrics_data = {
                                 "actor/distill_loss": opd_distill_loss.detach().item()
                             }
+                            if anchor_loss is not None:
+                                metrics_data["actor/anchor_loss"] = (
+                                    anchor_loss.detach().item()
+                                )
+                            if getattr(self, "_seqslot_suite", None) is not None:
+                                # Which round this step trained, as the slot index --
+                                # the ONE curve that says where every round boundary
+                                # actually fell, against which dw_norm_k of the
+                                # supposedly frozen slots is read.
+                                metrics_data["slot/round_slot"] = float(
+                                    self._slot_index_of()[self._seqslot_suite]
+                                )
                             # Surface the dynamic weights and the per-suite KL they came from --
                             # without them an adaptive run is indistinguishable from a uniform one and
                             # the mechanism is unfalsifiable.

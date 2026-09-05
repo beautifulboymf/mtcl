@@ -4,7 +4,7 @@ set -x
 tabs 4
 
 CONFIG=$1
-BACKEND=${2:-"egl"}
+BACKEND=${2:-"osmesa"}  # EGL banned on this machine (host crashes 2026-08-27/29)
 
 export MUJOCO_GL=${BACKEND}
 export PYOPENGL_PLATFORM=${BACKEND}

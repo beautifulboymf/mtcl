@@ -13,9 +13,32 @@
 # limitations under the License.
 
 import multiprocessing
+import os
+import sys
 import warnings
 from multiprocessing import connection
 from typing import Any, Callable, Optional, Union
+
+# EGL is DEFAULT-DENIED, opt-in only via RLINF_ALLOW_EGL=1 (see libero_env.py for the
+# full story: Bug 4905391, host crashes 2026-08-27/29, user-approved conditional
+# re-enable 2026-09-04). This module is where robosuite actually enters the process
+# (`from libero.libero.envs import OffScreenRenderEnv` below), and robosuite's
+# binding_utils.py freezes its GL backend from MUJOCO_GL at import time -- so the
+# fuse must sit here too, in case venv.py is ever imported without going through
+# libero_env.py first.
+if (
+    os.environ.get("RLINF_ALLOW_EGL") == "1"
+    and os.environ.get("MUJOCO_GL", "").lower() == "egl"
+):
+    pass  # keyed opt-in: gpu_render_env.sh armed EGL deliberately for this job
+else:
+    if os.environ.get("MUJOCO_GL", "").lower() == "egl":
+        sys.stderr.write(
+            "[libero venv] MUJOCO_GL=egl OVERRIDDEN to osmesa: no RLINF_ALLOW_EGL key "
+            "(EGL is opt-in only on this machine; host crashes 2026-08-27/29).\n"
+        )
+    os.environ["MUJOCO_GL"] = "osmesa"
+    os.environ["PYOPENGL_PLATFORM"] = "osmesa"
 
 import gym
 import numpy as np

@@ -1944,7 +1944,7 @@ source /share/fanruochen-local/dev/envs/rlinf-openvlaoft/bin/activate
 source /share/fanruochen-local/dev/gpu_render_env.sh
 set -u
 export EMBODIED_PATH="$REPO/examples/embodiment" REPO_PATH="$REPO"
-export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONPATH="$REPO:${PYTHONPATH:-}"
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa PYTHONPATH="$REPO:${PYTHONPATH:-}"
 export RLINF_CONVERT_VALUE_HEAD=False
 
 SEQCL_GPUS="$GPUS" SEQCL_STUDENT_PATH="$START" \

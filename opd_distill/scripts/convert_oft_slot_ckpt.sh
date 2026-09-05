@@ -36,6 +36,9 @@ SLOT_RANKS="${SLOT_RANKS:-128,64,48,16}"
 SLOT_SCALE_MODE="${SLOT_SCALE_MODE:-match_mt4}"
 SLOT_REF_RANK="${SLOT_REF_RANK:-128}"
 SLOT_EPS="${SLOT_EPS:-1e-6}"
+# SLOT_FROZEN_ORTH=1: the training used frozen_orth (Z stored already orthonormal, used
+# verbatim), so the merge must use Z verbatim too -- MUST match the training config.
+SLOT_FROZEN_ORTH="${SLOT_FROZEN_ORTH:-0}"
 MIN_FREE_G="${MIN_FREE_G:-30}"
 
 REPO=/home/fanruochen/CL/RLinf
@@ -81,4 +84,5 @@ TOKENIZERS_PARALLELISM=false \
     --slot-scale-mode "$SLOT_SCALE_MODE" \
     --slot-ref-rank   "$SLOT_REF_RANK" \
     --slot-eps        "$SLOT_EPS" \
+    $( [ "$SLOT_FROZEN_ORTH" = "1" ] && echo --slot-frozen-orth ) \
     "${EXTRA[@]}"
