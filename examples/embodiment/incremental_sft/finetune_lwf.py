@@ -29,6 +29,9 @@ Run through torchrun from a NEUTRAL cwd (e.g. /tmp) in the rlinf-openvlaoft venv
 sft_aligned.py, with SFT_NORM_OVERRIDE pointing at the libero_130 stats json.
 """
 
+import itertools
+import math
+import random
 import json
 import os
 from collections import deque
@@ -210,6 +213,19 @@ def finetune(cfg: FinetuneConfig) -> None:
                 init_lora_weights="gaussian",
             )
             vla = get_peft_model(vla, lora_config)
+        # LoRI (SFT_LORI=1): freeze the DOWN-projection A (random, never trained) and train only
+        # the UP-projection B. Two independently-drawn A's are near-orthogonal in high dim, so the
+        # per-task updates land in different subspaces -> far less interference when adapters are
+        # accumulated/merged than plain LoRA (where A also drifts toward the current task).
+        # Applied AFTER both branches so it covers a fresh adapter AND an SFT_INIT_ADAPTER resume
+        # (the latter is how one LoRI adapter is iteratively carried across the task sequence).
+        if os.environ.get("SFT_LORI", "").lower() in ("1", "true", "yes"):
+            _n_frozen = 0
+            for _n, _p in vla.named_parameters():
+                if "lora_A" in _n:
+                    _p.requires_grad = False
+                    _n_frozen += 1
+            print(f"[LoRI] froze {_n_frozen} lora_A tensors -> training B only", flush=True)
         vla.print_trainable_parameters()
 
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
@@ -285,12 +301,170 @@ def finetune(cfg: FinetuneConfig) -> None:
     spatial_iters = [iter(_dl) for _dl in spatial_dataloaders]
     spatial_iter = spatial_iters[0]
     _anchor_rr = [0]  # mutable round-robin cursor
+    # weight on the ground-truth CE over the anchor (old-suite) batch = plain REPLAY.
+    #   0.0  -> distill-only  (arm A: every run before 2026-09-08)
+    #   >0   -> replay + distill (arm B, the strong recipe from the CL literature)
+    _ANCHOR_CE_W = float(os.environ.get("LWF_ANCHOR_CE", "0") or 0)
+    # 1 = anchor on every micro-step (all runs before 2026-09-09). N = pay the anchor 1/N as often,
+    # which is the x-axis of the retention-vs-preservation-budget curve.
+    _ANCHOR_EVERY = max(1, int(os.environ.get("LWF_ANCHOR_EVERY", "1") or 1))
+    print(
+        f"[finetune_lwf] anchor replay-CE weight = {_ANCHOR_CE_W}, anchor every {_ANCHOR_EVERY} micro-step(s)",
+        flush=True,
+    )
 
     if distributed_state.is_main_process:
         wandb.init(entity=cfg.wandb_entity, project=cfg.wandb_project, name=f"lwf+{exp_id}")
 
+    # OFF-DEMO anchor batches (arm C). A .pt written by build_offdemo_anchor.py: states the teacher
+    # actually reached in the simulator under injected action noise, kept only from episodes it
+    # COMPLETED, with the teacher's own action as the label. Loaded once and cycled -- it is a fixed
+    # file, so training stays fully off-policy (no rollout in the loop, unlike OPD).
+    # Comma-separated, ONE FILE PER ANCHOR SUITE in the same order as LWF_ANCHOR_DSET: the demo
+    # anchor round-robins over the old suites, and the off-demo batch must follow the same cursor,
+    # or spatial's teacher distribution would be used to anchor object.
+    _offdemo_spec = [p.strip() for p in os.environ.get("LWF_OFFDEMO_FILE", "").split(",") if p.strip()]
+    _offdemo = None
+    if _offdemo_spec:
+        if len(_offdemo_spec) != len(spatial_dataloaders):
+            raise SystemExit(
+                f"[finetune_lwf] LWF_OFFDEMO_FILE has {len(_offdemo_spec)} files but there are "
+                f"{len(spatial_dataloaders)} anchor suites -- they must correspond one-to-one"
+            )
+        _offdemo = [torch.load(p, map_location="cpu", weights_only=False) for p in _offdemo_spec]
+        # The bank was collated at a fixed size by build_offdemo_anchor.py; the run's micro-batch may
+        # differ (it is lowered to fit activation memory). Re-chunk so the off-demo batch is the same
+        # size as the demo anchor batch -- otherwise the two arms would not see the same number of
+        # anchor samples per step, and the off-demo forward could blow the memory budget on its own.
+        _keep = ("input_ids", "attention_mask", "pixel_values", "labels", "teacher_logp")
+        for _i, _bank in enumerate(_offdemo):
+            _bs = _bank[0]["input_ids"].shape[0]
+            if _bs == cfg.batch_size:
+                continue
+            if _bs % cfg.batch_size:
+                raise SystemExit(
+                    f"[finetune_lwf] off-demo bank batch {_bs} is not a multiple of "
+                    f"--batch_size {cfg.batch_size}; rebuild the bank or pick a divisor"
+                )
+            _split = []
+            for _b in _bank:
+                for _j in range(0, _bs, cfg.batch_size):
+                    # teacher_logp is absent in banks built before augment_bank_logits.py existed
+                    _split.append(
+                        {k: _b[k][_j : _j + cfg.batch_size] for k in _keep if _b.get(k) is not None}
+                    )
+            _offdemo[_i] = _split
+            print(f"[finetune_lwf] re-chunked off-demo bank {_i}: {_bs} -> {cfg.batch_size} "
+                  f"({len(_bank)} -> {len(_split)} batches)", flush=True)
+        print(
+            "[finetune_lwf] OFF-DEMO anchor: "
+            + ", ".join(f"{os.path.basename(p)}={len(b)} batches" for p, b in zip(_offdemo_spec, _offdemo)),
+            flush=True,
+        )
+    _off_cur = [0]
+
+    def _kl_on(batch):
+        """forward-KL( frozen teacher || student ) over the action tokens of ONE batch.
+
+        If the batch carries a precomputed "teacher_logp" (augment_bank_logits.py), the teacher
+        forward is SKIPPED: on a fixed off-demo state set the teacher's output never changes, so
+        re-running a 7B model every step is pure waste. Storing it costs 28 KB/state and also makes
+        adding more teachers nearly free (one stored tensor each, not one forward per step).
+        """
+        ids = batch["input_ids"].to(device_id)
+        attn = batch["attention_mask"].to(device_id)
+        pix = batch["pixel_values"].to(torch.bfloat16).to(device_id)
+        # pass labels so both fwds take the SAME path as the object fwd (the no-labels path computes
+        # position_ids via bool attention_mask.cumsum() -> TypeError). Move labels to device: the raw
+        # (non-DDP) teacher does NOT auto-move them, so CPU labels vs GPU logits -> device mismatch.
+        lbl = batch["labels"].to(device_id)
+        s_out = vla(input_ids=ids, attention_mask=attn, pixel_values=pix, labels=lbl)  # student (grad)
+        # mirror finetune.py's action slicing, then restrict vocab to the 256 action bins
+        s_logits = s_out.logits[:, num_patches:-1, action_bin_start:]
+        gt = lbl[:, 1:]
+        mask = gt > action_tokenizer.action_token_begin_idx                          # [B, T] action positions
+
+        cached = batch.get("teacher_logp")
+        if cached is not None:
+            # [B, n_action_pos, bins], aligned with the masked positions in order
+            logp_t = cached.to(device_id).float()
+            logp_s = F.log_softmax(s_logits[mask].view(logp_t.shape).float(), dim=-1)
+            kl_tok = (logp_t.exp() * (logp_t - logp_s)).sum(dim=-1)                    # [B, n_pos]
+            return kl_tok.mean(), s_out.loss
+
+        with torch.no_grad():
+            t_out = teacher(input_ids=ids, attention_mask=attn, pixel_values=pix, labels=lbl)
+        t_logits = t_out.logits[:, num_patches:-1, action_bin_start:]
+        logp_t = F.log_softmax(t_logits.float(), dim=-1)
+        logp_s = F.log_softmax(s_logits.float(), dim=-1)
+        kl_tok = (logp_t.exp() * (logp_t - logp_s)).sum(dim=-1)                        # [B, T] forward-KL
+        return (kl_tok * mask).sum() / mask.sum().clamp_min(1), s_out.loss
+
+    # Per-batch priorities for prioritised sampling inside a pool (None = never drawn), a running mean
+    # of the scores actually observed, and a lazily-filled cache of each batch's teacher entropy.
+    # An undrawn batch is weighted by the OBSERVED MEAN, not by an optimistic constant: a constant
+    # (e.g. 1.0) sits ~20x above realistic scores (~0.05), so the sampler would spend the whole run
+    # touching each of the 2000 batches once and the drift-based priority would never take effect.
+    _bank_prio = [[None] * len(b) for b in _offdemo] if _offdemo is not None else None
+    _bank_ent = [[None] * len(b) for b in _offdemo] if _offdemo is not None else None
+    _bank_mean = [[0.0, 0] for _ in _offdemo] if _offdemo is not None else None   # [sum, n]
+
+    def _ent_of(j, k):
+        """Normalised entropy of the teacher's action distribution on bank j's batch k (cached)."""
+        if _bank_ent[j][k] is None:
+            lp = _offdemo[j][k].get("teacher_logp")
+            if lp is None:
+                _bank_ent[j][k] = 0.0
+            else:
+                lp = lp.float()
+                h = -(lp.exp() * lp).sum(-1).mean()
+                _bank_ent[j][k] = float(h / math.log(lp.shape[-1]))
+        return _bank_ent[j][k]
+
+    def _anchor_one(j):
+        """KL anchor for ONE old task, drawing states prioritised by
+
+              score = KL(teacher||student)  x  (1 - normalised teacher entropy)
+
+        Both halves are needed. A confident teacher means the state has one right answer, so a
+        student disagreement there really is 'the teacher can, the student no longer can'. Where the
+        teacher is diffuse, any action does and the disagreement costs nothing -- spending the
+        preservation budget there buys nothing. KL alone would rank those together.
+        """
+        if _offdemo is None:                       # no pool -> anchor on that suite's demo stream
+            try:
+                sb = next(spatial_iters[j])
+            except StopIteration:
+                spatial_iters[j] = iter(spatial_dataloaders[j])
+                sb = next(spatial_iters[j])
+            return _kl_on(sb)
+        bank, prio, mstat = _offdemo[j], _bank_prio[j], _bank_mean[j]
+        prior = (mstat[0] / mstat[1]) if mstat[1] else 1.0        # weight for never-drawn batches
+        w = [p if p is not None else prior for p in prio]
+        r = random.random() * sum(w)
+        k = 0
+        for k, wk in enumerate(w):
+            r -= wk
+            if r <= 0:
+                break
+        kl, ce = _kl_on(bank[k])
+        s = max(float(kl.detach()) * (1.0 - _ent_of(j, k)), 1e-6)
+        prio[k] = s
+        mstat[0] += s
+        mstat[1] += 1
+        return kl, ce
+
     def _spatial_distill_loss():
-        """forward-KL( frozen spatial teacher || student ) on the spatial batch's action tokens."""
+        """Returns (KL anchor, replay CE). WHERE each is computed is the whole experiment:
+
+        arm A  LWF_ANCHOR_CE=0, no off-demo file : KL on demo states           (= LwF)
+        arm B  LWF_ANCHOR_CE>0, no off-demo file : KL + ground-truth CE, both on demo states (= DER++)
+        arm C  LWF_ANCHOR_CE>0 + off-demo file   : CE on demo states, KL on OFF-demo states
+
+        Arm C's split is the point: on demo states the ground truth is available and strictly better
+        than an imperfect old model, so distilling there duplicates the replay signal; off the demo
+        manifold the data has no answer at all and only the old checkpoint can supply one.
+        """
         nonlocal spatial_iter
         # round-robin over the anchor suites (single suite -> identical to before)
         _k = _anchor_rr[0] % len(spatial_iters)
@@ -301,27 +475,27 @@ def finetune(cfg: FinetuneConfig) -> None:
             spatial_iters[_k] = iter(spatial_dataloaders[_k])
             sbatch = next(spatial_iters[_k])
         spatial_iter = spatial_iters[_k]
-        ids = sbatch["input_ids"].to(device_id)
-        attn = sbatch["attention_mask"].to(device_id)
-        pix = sbatch["pixel_values"].to(torch.bfloat16).to(device_id)
-        # pass labels so both fwds take the SAME path as the object fwd (the no-labels path computes
-        # position_ids via bool attention_mask.cumsum() -> TypeError). Move labels to device: the raw
-        # (non-DDP) teacher does NOT auto-move them, so CPU labels vs GPU logits -> device mismatch in
-        # its loss. We ignore .loss here and only use .logits for the KL.
-        lbl = sbatch["labels"].to(device_id)
-        s_out = vla(input_ids=ids, attention_mask=attn, pixel_values=pix, labels=lbl)  # student (grad)
-        with torch.no_grad():
-            t_out = teacher(input_ids=ids, attention_mask=attn, pixel_values=pix, labels=lbl)  # teacher (frozen)
-        # mirror finetune.py's action slicing, then restrict vocab to the 256 action bins
-        s_logits = s_out.logits[:, num_patches:-1, action_bin_start:]
-        t_logits = t_out.logits[:, num_patches:-1, action_bin_start:]
-        gt = sbatch["labels"][:, 1:].to(device_id)
-        mask = gt > action_tokenizer.action_token_begin_idx                          # [B, T] action positions
-        logp_t = F.log_softmax(t_logits.float(), dim=-1)
-        logp_s = F.log_softmax(s_logits.float(), dim=-1)
-        kl_tok = (logp_t.exp() * (logp_t - logp_s)).sum(dim=-1)                        # [B, T] forward-KL
-        denom = mask.sum().clamp_min(1)
-        return (kl_tok * mask).sum() / denom
+
+        if _offdemo is None:
+            # one forward serves both terms (arms A and B)
+            return _kl_on(sbatch)
+
+        # arm C: KL off the demo manifold, CE on it. The demo forward is skipped entirely when the
+        # replay weight is 0, so no compute is spent on a term that cannot affect the loss.
+        # _k is the anchor suite chosen above, so the off-demo batch comes from the SAME suite.
+        _bank = _offdemo[_k]
+        ob = _bank[(_off_cur[0] // len(_offdemo)) % len(_bank)]
+        _off_cur[0] += 1
+        kl, _ = _kl_on(ob)
+        if _ANCHOR_CE_W <= 0:
+            return kl, torch.zeros((), device=device_id)
+        d_out = vla(
+            input_ids=sbatch["input_ids"].to(device_id),
+            attention_mask=sbatch["attention_mask"].to(device_id),
+            pixel_values=sbatch["pixel_values"].to(torch.bfloat16).to(device_id),
+            labels=sbatch["labels"].to(device_id),
+        )
+        return kl, d_out.loss
 
     recent_losses = deque(maxlen=cfg.grad_accumulation_steps)
     recent_sft = deque(maxlen=cfg.grad_accumulation_steps)
@@ -329,11 +503,236 @@ def finetune(cfg: FinetuneConfig) -> None:
     recent_action_accuracies = deque(maxlen=cfg.grad_accumulation_steps)
     recent_l1_losses = deque(maxlen=cfg.grad_accumulation_steps)
 
+    # ---------------- ADAPTIVE mode (LWF_ADAPTIVE=1) ----------------------------------------
+    # One rule for everything: at each step train whichever task is currently WORST relative to its
+    # own target -- the new task against ground truth (CE), each old task against its own frozen
+    # checkpoint (KL). Only ONE task is trained per step, so there is no lambda to trade the losses
+    # off against each other (lambda was the least defensible knob in the previous design), and a
+    # step costs ONE forward/backward instead of two.
+    #
+    # Everything that would otherwise be a hand-set constant is removed:
+    #   * comparability   -- each task's gap is divided by ITS OWN historical max (self-normalising),
+    #                        because CE (floors above 0) and KL (starts exactly at 0) are not
+    #                        comparable in raw units
+    #   * exploration     -- a UCB bonus sqrt(2 ln t / n_j) makes stale tasks get re-measured on
+    #                        their own, instead of a "probe every P steps" constant
+    #   * selection       -- sample PROPORTIONAL to the score, not argmax, which would oscillate
+    #                        between tasks and then need a smoothing constant to fix
+    #   * running stats   -- plain all-history means (weight 1/n), not an EMA with a chosen decay
+    _ADAPTIVE = os.environ.get("LWF_ADAPTIVE", "").lower() in ("1", "2", "true", "yes")
+    _n_old = len(spatial_dataloaders)
+    _gap_sum = [0.0] * (1 + _n_old)     # index 0 = the new task, 1.. = old tasks
+    _gap_n = [0] * (1 + _n_old)
+    _picks = [0] * (1 + _n_old)
+    _last_seen = [0] * _n_old           # micro-step at which each old task was last trained
+    _cnt_old = [0] * _n_old             # how many times each old task has been measured (UCB n_j)
+    _kl_seen = [0.0, 0]                 # [sum, n] of every old-task KL observed -> self-scaling bonus
+    # one preservation slot every _SLOT micro-steps; this is the budget axis we sweep, not a tuned
+    # constant (LWF_ANCHOR_EVERY keeps its old meaning in the non-adaptive arms)
+    _SLOT = max(2, int(os.environ.get("LWF_SLOT", "4") or 4))
+    if _ADAPTIVE:
+        print(
+            f"[finetune_lwf] ADAPTIVE: 1 new + {_n_old} old task(s), preservation slot every {_SLOT} micro-steps",
+            flush=True,
+        )
+
+    def _pick_task(t):
+        """Which task to train this micro-step.
+
+        The new task is the DEFAULT; old tasks compete only for the preservation slots. Old tasks are
+        then chosen by their raw drift KL -- all in the same unit, so the comparison is meaningful and
+        fully adaptive.
+
+        Why not one scalar comparison across all three: the new task's gap is a cross-entropy against
+        ground truth (floors well above 0) and an old task's gap is a KL against its own checkpoint
+        (starts at EXACTLY 0, because the student IS the teacher at init). Raw values would always
+        favour the new task; dividing each by its own historical max makes every rising gap read as
+        1.0 and always favours the old tasks. Both are wrong. Comparing acquisition against
+        preservation needs a conversion into a common outcome unit (predicted success-rate loss),
+        which requires a calibration we have not run yet -- so until then the split between the two
+        is STRUCTURAL, and it is the preservation-budget axis we sweep and report anyway, not a
+        tuned constant.
+
+        At t=0 every old KL is 0, so the first steps necessarily go to the new task.
+        """
+        if (t % _SLOT) != 0:
+            return 0                                    # new task
+        best, best_v = 0, -1.0
+        n_slots = max(1, t // _SLOT)                        # preservation slots so far
+        kl_scale = (_kl_seen[0] / _kl_seen[1]) if _kl_seen[1] else 0.0
+        for j in range(_n_old):
+            if not _gap_n[1 + j]:                           # never measured -> measure it first
+                return 1 + j
+            # UCB1 over old tasks: latest drift + exploration bonus. The bonus is scaled by the MEAN
+            # of every KL observed so far (self-scaling, no constant), because a task measured once
+            # at KL=0 (t~4, student still equal to teacher) would otherwise never be re-measured:
+            # a multiplicative form 0 x anything, or a fixed epsilon 4 orders below real KLs, both
+            # starved spatial completely in the first real run (picks were 601/1/199).
+            score = (_gap_sum[1 + j] / _gap_n[1 + j]) + kl_scale * math.sqrt(
+                2.0 * math.log(n_slots + 1) / _cnt_old[j]
+            )
+            if score > best_v:
+                best, best_v = 1 + j, score
+        return best
+
+    def _note_gap(i, v, t):
+        # keep only the LATEST measurement for old tasks: drift is a moving quantity, and an
+        # all-history mean would keep reporting the near-zero KL of the first steps forever.
+        if i == 0:
+            _gap_sum[i] += v
+            _gap_n[i] += 1
+        else:
+            _gap_sum[i], _gap_n[i] = v, 1
+            _last_seen[i - 1] = t
+            _cnt_old[i - 1] += 1
+            _kl_seen[0] += v
+            _kl_seen[1] += 1
+            _pending_ref[i - 1] = True         # window mode: next measurement = new post-train baseline
+        _picks[i] += 1
+
+    # ---------------- WINDOW mode (LWF_ADAPTIVE=2): adaptive TOTAL preservation budget -------------
+    # Once per accumulation window: MEASURE every old task's drift (one no-grad forward each, on a
+    # prioritised bank batch), then give training micro-steps to each task that has drifted beyond
+    # its own noise level since it was last trained -- more micro-steps for larger drift -- and hand
+    # the rest of the window to the new task. Nothing drifting -> the whole window is new-task
+    # training and preservation costs zero. No fixed slot fraction, no lambda, no UCB: the budget
+    # is an OUTPUT of training. The one convention is "drift = rise above one running-std of that
+    # task's own measurements", a statistical criterion rather than a tuned number.
+    #
+    # Why the previous rule (arm D) over-served the non-drifting task: its UCB bonus equalises
+    # measurement COUNTS across arms, which is the wrong objective here -- training an old task
+    # lowers its drift, so the freshly-trained task gets fewer picks and the untouched one more,
+    # regardless of who is actually drifting (spatial's slot share rose 19% -> 36% over the run).
+    # Measuring everyone every window removes the need for any exploration term at all.
+    _WINDOW = os.environ.get("LWF_ADAPTIVE", "") == "2"
+    _G = cfg.grad_accumulation_steps
+    _ref = [0.0] * _n_old              # post-training KL level per old task; drift is measured from here
+    _pending_ref = [False] * _n_old    # set when j is trained: its NEXT measurement becomes the new ref
+    _wf = [[0, 0.0, 0.0] for _ in range(_n_old)]   # Welford [n, mean, M2] of each task's measurements
+    _plan = [0] * _G
+    _streak = [0] * _n_old             # consecutive windows in which task j has been drifting
+    _win = {"windows": 0, "old_slots": 0, "measure_fwd": 0}
+
+    def _welford_add(j, x):
+        n, m, m2 = _wf[j]
+        n += 1
+        d = x - m
+        m += d / n
+        m2 += d * (x - m)
+        _wf[j] = [n, m, m2]
+
+    def _sigma(j):
+        n, _, m2 = _wf[j]
+        return math.sqrt(m2 / (n - 1)) if n > 1 else float("inf")
+
+    def _plan_window(t):
+        """Measure every old task, decide this window's micro-step plan, broadcast it.
+
+        ALL ranks run the measurement forwards (symmetrically, same order): DDP syncs module buffers
+        at the start of every forward even under no_grad, so a rank that skipped the forward would
+        deadlock the others. Only rank 0's numbers decide; the plan is broadcast so the graphs match.
+        """
+        with torch.no_grad():
+            kls = [float(_anchor_one(j)[0]) for j in range(_n_old)]
+        _win["measure_fwd"] += _n_old
+        zs, want = [], []
+        for j, k in enumerate(kls):
+            if _pending_ref[j]:                     # first reading after training j = its new baseline
+                _ref[j] = k
+                _pending_ref[j] = False
+            _welford_add(j, k)
+            s = _sigma(j)
+            z = ((k - _ref[j]) / s) if (0.0 < s < float("inf")) else 0.0
+            zs.append(z)
+            # ESCALATING allocation: 1 micro-step the first window a task drifts, 2 the next if it is
+            # still drifting, 3 after that ... and back to 0 once it is not. "Spend more only if the
+            # last spend was not enough." No scale constant (floor(z) would hand the whole window to
+            # an old task early on, when sigma is still tiny and z is huge), and the new task can
+            # never be starved because the total is capped below.
+            _streak[j] = (_streak[j] + 1) if z > 1.0 else 0
+            want.append(min(_streak[j], _G - 1))
+        while sum(want) > _G - 1:                   # the new task keeps >= 1 micro-step per window
+            want[max(range(_n_old), key=lambda i: want[i])] -= 1
+        plan = []
+        for j, w in enumerate(want):
+            plan += [1 + j] * w
+        plan += [0] * (_G - len(plan))
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            _pt = torch.tensor(plan, device=device_id, dtype=torch.long)
+            dist.broadcast(_pt, src=0)
+            plan = [int(x) for x in _pt.tolist()]
+        if distributed_state.is_main_process and _win["windows"] % 25 == 0:
+            print(
+                f"[window {_win['windows']}] micro={t} kl={[round(k, 4) for k in kls]} ref={[round(r, 4) for r in _ref]} "
+                f"sigma={[(round(_sigma(j), 4) if _sigma(j) != float('inf') else None) for j in range(_n_old)]} "
+                f"z={[round(z, 2) for z in zs]} slots={want} cum_old_slots={_win['old_slots']} "
+                f"cum_measure_fwd={_win['measure_fwd']}",
+                flush=True,
+            )
+        _win["windows"] += 1
+        _win["old_slots"] += sum(1 for x in plan if x)
+        return plan
+
+    if _WINDOW:
+        print(f"[finetune_lwf] WINDOW mode: adaptive preservation budget, window={_G} micro-steps", flush=True)
+
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
-        for batch_idx, batch in enumerate(dataloader):
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+        # The new-task stream is consumed ONLY on steps that train the new task. Iterating it in the
+        # for-loop header would silently discard one batch on every preservation slot, so the
+        # adaptive arm would see 1/_SLOT fewer new-task samples than the baselines -- a confound on
+        # the new-task result that has nothing to do with the method.
+        _sft_it = iter(dataloader)
+
+        def _next_sft():
+            nonlocal _sft_it
+            try:
+                return next(_sft_it)
+            except StopIteration:
+                _sft_it = iter(dataloader)
+                return next(_sft_it)
+
+        for batch_idx in itertools.count():
+            batch = None
+            if _ADAPTIVE:
+                if _WINDOW:
+                    if (batch_idx % _G) == 0:
+                        _plan = _plan_window(batch_idx + 1)   # already broadcast inside
+                    _t = _plan[batch_idx % _G]
+                else:
+                    _t = _pick_task(batch_idx + 1)
+                    # The gap statistics are rank-LOCAL, so two ranks could otherwise pick different
+                    # tasks, run different graphs, and desynchronise DDP's gradient reduction (a hang
+                    # or silently wrong gradients -- invisible on one GPU, fatal on two). Rank 0 decides.
+                    if dist.is_initialized() and dist.get_world_size() > 1:
+                        _tt = torch.tensor([_t], device=device_id, dtype=torch.long)
+                        dist.broadcast(_tt, src=0)
+                        _t = int(_tt.item())
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    if _t == 0:
+                        batch = _next_sft()
+                        output = vla(
+                            input_ids=batch["input_ids"].to(device_id),
+                            attention_mask=batch["attention_mask"].to(device_id),
+                            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+                            labels=batch["labels"],
+                        )
+                        loss = output.loss
+                        sft_loss, distill_loss = loss, torch.zeros((), device=device_id)
+                    else:
+                        loss, _ = _anchor_one(_t - 1)
+                        output = None                      # no SFT batch this step -> no SFT metrics
+                        sft_loss, distill_loss = torch.zeros((), device=device_id), loss
+                    _note_gap(_t, float(loss.detach()), batch_idx + 1)
+                    anchor_ce = torch.zeros((), device=device_id)
+                if distributed_state.is_main_process and (batch_idx % 200) == 0:
+                    print(f"[adaptive] micro-step {batch_idx} picks(new,old...)={_picks}", flush=True)
+                # fall through to the SHARED tail (backward / optimizer / checkpoint saving) --
+                # returning early here would skip adapter saving entirely
+            else:
+              batch = _next_sft()
+              with torch.autocast("cuda", dtype=torch.bfloat16):
                 output: CausalLMOutputWithPast = vla(
                     input_ids=batch["input_ids"].to(device_id),
                     attention_mask=batch["attention_mask"].to(device_id),
@@ -341,26 +740,44 @@ def finetune(cfg: FinetuneConfig) -> None:
                     labels=batch["labels"],
                 )
                 sft_loss = output.loss                                    # object SFT (CE)
-                distill_loss = _spatial_distill_loss()                    # LwF spatial anchor (forward-KL)
-                loss = sft_loss + cfg.distill_lambda * distill_loss
+                # PRESERVATION BUDGET knob: only pay for the anchor every LWF_ANCHOR_EVERY micro-steps.
+                # The anchor (student fwd/bwd on the anchor batch, plus the demo-CE forward in arm C)
+                # is 30-40% of a step, so this is the direct lever for the retention-vs-budget curve:
+                # every N halves/quarters the preservation cost. Scaled by N so the ACCUMULATED
+                # gradient contribution matches an every-step anchor of the same lambda.
+                if (batch_idx % _ANCHOR_EVERY) == 0:
+                    distill_loss, anchor_ce = _spatial_distill_loss()     # LwF anchor: (forward-KL, replay CE)
+                    _w = float(_ANCHOR_EVERY)
+                else:
+                    distill_loss = anchor_ce = torch.zeros((), device=device_id)
+                    _w = 0.0
+                loss = sft_loss + _w * (cfg.distill_lambda * distill_loss + _ANCHOR_CE_W * anchor_ce)
 
             normalized_loss = loss / cfg.grad_accumulation_steps
             normalized_loss.backward()
 
-            # metrics on the OBJECT (SFT) batch, exactly like stock finetune.py
-            action_logits = output.logits[:, num_patches:-1]
-            action_preds = action_logits.argmax(dim=2)
-            action_gt = batch["labels"][:, 1:].to(action_preds.device)
-            mask = action_gt > action_tokenizer.action_token_begin_idx
-            correct_preds = (action_preds == action_gt) & mask
-            action_accuracy = correct_preds.sum().float() / mask.sum().float()
-            continuous_actions_pred = torch.tensor(
-                action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy())
-            )
-            continuous_actions_gt = torch.tensor(
-                action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy())
-            )
-            action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
+            # metrics on the OBJECT (SFT) batch, exactly like stock finetune.py.
+            # In adaptive mode a step that trained an OLD task has no SFT batch, so carry the last
+            # values forward rather than fabricating a number.
+            if output is None:
+                action_accuracy = recent_action_accuracies[-1] if recent_action_accuracies else 0.0
+                action_l1_loss = recent_l1_losses[-1] if recent_l1_losses else 0.0
+                action_accuracy = torch.tensor(float(action_accuracy))
+                action_l1_loss = torch.tensor(float(action_l1_loss))
+            else:
+                action_logits = output.logits[:, num_patches:-1]
+                action_preds = action_logits.argmax(dim=2)
+                action_gt = batch["labels"][:, 1:].to(action_preds.device)
+                mask = action_gt > action_tokenizer.action_token_begin_idx
+                correct_preds = (action_preds == action_gt) & mask
+                action_accuracy = correct_preds.sum().float() / mask.sum().float()
+                continuous_actions_pred = torch.tensor(
+                    action_tokenizer.decode_token_ids_to_actions(action_preds[mask].cpu().numpy())
+                )
+                continuous_actions_gt = torch.tensor(
+                    action_tokenizer.decode_token_ids_to_actions(action_gt[mask].cpu().numpy())
+                )
+                action_l1_loss = torch.nn.functional.l1_loss(continuous_actions_pred, continuous_actions_gt)
 
             recent_losses.append(loss.item())
             recent_sft.append(sft_loss.item())

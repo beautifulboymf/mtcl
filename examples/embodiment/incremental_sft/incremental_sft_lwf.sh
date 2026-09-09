@@ -22,7 +22,12 @@ NPROC=$(echo "$GPUS" | tr ',' '\n' | grep -c .)
 # (new=goal, anchor=spatial or object — anchor the suites the teacher already knows).
 OBJ_DSET="${LWF_NEW_DSET:-libero_object_no_noops}"
 SPA_DSET="${LWF_ANCHOR_DSET:-libero_spatial_no_noops}"
-GACC=$(( 64 / (8 * NPROC) )); [ "$GACC" -lt 1 ] && GACC=1
+# micro-batch is configurable so the EFFECTIVE batch stays 64 while activation memory shrinks:
+# at batch 8 a run already sits at ~78 of 80 GB, leaving no room for an arm that needs one extra
+# forward with a live graph (arm C: CE on demo states + KL on off-demo states). SFT_BATCH=4 with
+# double the accumulation is mathematically the same optimisation, half the peak activations.
+SFT_BATCH="${SFT_BATCH:-8}"
+GACC=$(( 64 / (SFT_BATCH * NPROC) )); [ "$GACC" -lt 1 ] && GACC=1
 
 REPO=/home/fanruochen/CL/RLinf
 NORM130=/share/fanruochen-local/checkpoints/norm_override_libero130.json
@@ -50,7 +55,7 @@ export SFT_NORM_OVERRIDE="$NORM130"    # forces libero_130 action norm for BOTH 
 
 mkdir -p "$OUT"
 echo "== df =="; df -h /share/fanruochen-local | tail -1
-echo "==== LwF-SFT object=$OBJ_DSET + spatial-anchor(KL) teacher=$(basename "$TEACHER") lambda=$LAMBDA init=$(basename "$INIT") steps=$MAXSTEPS gpus=$GPUS(np$NPROC) batch=8 gacc=$GACC eff=$((8*NPROC*GACC)) lr=5e-4  $(date '+%F %T') ===="
+echo "==== LwF-SFT object=$OBJ_DSET + spatial-anchor(KL) teacher=$(basename "$TEACHER") lambda=$LAMBDA init=$(basename "$INIT") steps=$MAXSTEPS gpus=$GPUS(np$NPROC) batch=$SFT_BATCH gacc=$GACC eff=$((SFT_BATCH*NPROC*GACC)) lr=5e-4  $(date '+%F %T') ===="
 cd /tmp   # neutral cwd so repo prismatic/ never shadows venv OFT prismatic
 torchrun --standalone --nnodes 1 --nproc-per-node "$NPROC" "$FINE_LWF" \
   --vla_path "$INIT" \
@@ -62,7 +67,7 @@ torchrun --standalone --nnodes 1 --nproc-per-node "$NPROC" "$FINE_LWF" \
   --run_root_dir "$OUT" \
   --adapter_tmp_dir "${OUT}/adapter-tmp" \
   --lora_rank 32 --lora_dropout 0.0 \
-  --batch_size 8 --grad_accumulation_steps "$GACC" \
+  --batch_size "$SFT_BATCH" --grad_accumulation_steps "$GACC" \
   --learning_rate 5e-4 --image_aug True \
   --max_steps "$MAXSTEPS" --save_steps "$SAVESTEPS" \
   --save_latest_checkpoint_only "${SFT_SAVE_LATEST:-False}" \

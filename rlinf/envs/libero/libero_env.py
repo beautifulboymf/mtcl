@@ -689,11 +689,146 @@ class LiberoEnv(gym.Env):
             ),
         }
 
+    # ---- OFF-DEMO state capture (opt-in via RLINF_DUMP_OBS_DIR) ---------------------------------
+    # The states a policy actually REACHES are exactly the ones the demonstrations do not contain,
+    # and our measurements say that is where the lost capability lives (fitting the demos BETTER than
+    # the original model still leaves success 22 points down). Setting RLINF_DUMP_OBS_DIR during any
+    # rollout writes those visited states to disk, so an old checkpoint can be queried there OFFLINE
+    # afterwards -- this is what makes the "ask the teacher off the demo manifold" anchor possible
+    # WITHOUT on-policy training. Written in shards (not one file per state) to avoid a small-file
+    # explosion on the shared disk.
+    #   RLINF_DUMP_OBS_EVERY  keep 1 step in N   (default 4)
+    #   RLINF_DUMP_OBS_MAX    stop after N states (default 20000)
+    def _maybe_dump_obs(self, ias_list):
+        d = os.environ.get("RLINF_DUMP_OBS_DIR", "")
+        if not d:
+            return
+        self._dump_step = getattr(self, "_dump_step", -1) + 1
+        if self._dump_step % int(os.environ.get("RLINF_DUMP_OBS_EVERY", "4")):
+            return
+        self._dump_n = getattr(self, "_dump_n", 0)
+        cap = int(os.environ.get("RLINF_DUMP_OBS_MAX", "20000"))
+        if self._dump_n >= cap:
+            return
+        buf = getattr(self, "_dump_buf", None)
+        if buf is None:
+            buf = self._dump_buf = []
+            os.makedirs(d, exist_ok=True)
+        if not hasattr(self, "_ep_id"):
+            self._ep_id = np.zeros(self.num_envs, dtype=np.int64)
+            self._ep_outcomes = []
+        sig = getattr(self, "_noise_sigma", None)
+        descs = getattr(self, "task_descriptions", None)
+        for i, ias in enumerate(ias_list):
+            if self._dump_n >= cap:
+                break
+            buf.append(
+                (
+                    np.asarray(ias["full_image"], dtype=np.uint8),
+                    np.asarray(ias["wrist_image"], dtype=np.uint8),
+                    np.asarray(ias["state"], dtype=np.float32),
+                    (descs[i] if descs is not None and i < len(descs) else ""),
+                    self._dump_step,
+                    i,                                        # env index
+                    int(self._ep_id[i]),                      # episode index within that env
+                    float(sig[i]) if sig is not None else 0.0,  # the noise level that produced it
+                )
+            )
+            self._dump_n += 1
+        # flush on a full shard, and also the moment the cap is reached (there is no close() hook on
+        # this env, so a partial tail buffer would otherwise never be written)
+        if len(buf) >= 500 or self._dump_n >= cap:
+            self._flush_dump(d)
+
+    def _flush_dump(self, d):
+        buf = self._dump_buf
+        if not buf:
+            return
+        shard = getattr(self, "_dump_shard", 0)
+        self._dump_shard = shard + 1
+        # zlib on ~200MB of uint8 frames per shard costs real CPU inside the env worker, and a 48-env
+        # osmesa rollout is already using ~50 of 56 cores. Over a multi-pass collection that is the
+        # difference between load ~30 and load ~52, so compression is OPT-IN (disk is not the
+        # constraint here: 1.7TB free, ~400KB/state uncompressed).
+        _save = np.savez_compressed if os.environ.get("RLINF_DUMP_OBS_COMPRESS", "0") == "1" else np.savez
+        _save(
+            os.path.join(d, f"states_{os.getpid()}_{shard:04d}.npz"),
+            full_image=np.stack([b[0] for b in buf]),
+            wrist_image=np.stack([b[1] for b in buf]),
+            state=np.stack([b[2] for b in buf]),
+            task=np.array([b[3] for b in buf], dtype=object),
+            step=np.array([b[4] for b in buf], dtype=np.int32),
+            env_idx=np.array([b[5] for b in buf], dtype=np.int32),
+            ep_id=np.array([b[6] for b in buf], dtype=np.int32),
+            sigma=np.array([b[7] for b in buf], dtype=np.float32),
+        )
+        buf.clear()
+
+    # DART-style noise injection (Laskey et al. 2017): perturb the SUPERVISOR's actions during
+    # collection so the rollout leaves the demonstration manifold while staying near the region the
+    # supervisor can still handle -- "corrective examples at the boundary of the supervisor's policy,
+    # without visiting highly sub-optimal states". Several sigmas can be measured in ONE rollout by
+    # assigning them round-robin across envs (RLINF_ACT_NOISE="0.1,0.2,0.3"), which saves two extra
+    # CPU-saturating rollout passes. The gripper dimension is excluded by default: it is effectively
+    # binary, so noise there flips open/closed mid-grasp -- an instant, unrecoverable failure rather
+    # than the small recoverable deviation we are trying to create.
+    def _maybe_inject_noise(self, actions):
+        spec = os.environ.get("RLINF_ACT_NOISE", "")
+        if not spec or actions is None:
+            return actions
+        if not hasattr(self, "_noise_sigma"):
+            sig = np.array([float(x) for x in spec.split(",") if x.strip()], dtype=np.float32)
+            self._noise_sigma = sig[np.arange(self.num_envs) % len(sig)]
+            self._noise_ndim = int(os.environ.get("RLINF_ACT_NOISE_DIMS", "6"))
+            print(
+                f"[dart] action noise sigmas={sorted(set(sig.tolist()))} on first "
+                f"{self._noise_ndim} dims (gripper excluded)",
+                flush=True,
+            )
+        a = np.asarray(actions, dtype=np.float32).copy()
+        k = min(self._noise_ndim, a.shape[-1])
+        sig = self._noise_sigma.reshape((-1,) + (1,) * (a.ndim - 1))[: a.shape[0]]
+        a[..., :k] += np.random.normal(0.0, 1.0, size=a[..., :k].shape).astype(np.float32) * sig
+        return a
+
+    # A state is only usable as a distillation input if the episode it came from SUCCEEDED: in a
+    # failed episode the teacher itself was wrong there, so its action is a wrong target. This
+    # ledger is what the offline filter joins against.
+    # It is written HERE, not in _flush_dump: episodes only end at the horizon (~512 steps), long
+    # after the state cap has stopped the dumping/flushing, so writing it on flush would leave the
+    # ledger permanently empty and make success-filtering impossible.
+    def _maybe_record_episode_end(self, dones):
+        d = os.environ.get("RLINF_DUMP_OBS_DIR", "")
+        if not d:
+            return
+        idx = np.nonzero(np.asarray(dones).reshape(-1))[0]
+        if len(idx) == 0:
+            return
+        if not hasattr(self, "_ep_id"):
+            self._ep_id = np.zeros(self.num_envs, dtype=np.int64)
+            self._ep_outcomes = []
+        sig = getattr(self, "_noise_sigma", None)
+        for i in idx:
+            self._ep_outcomes.append(
+                (int(i), int(self._ep_id[i]), bool(self.success_once[i]), float(sig[i]) if sig is not None else 0.0)
+            )
+            self._ep_id[i] += 1
+        out = self._ep_outcomes
+        os.makedirs(d, exist_ok=True)
+        np.savez_compressed(
+            os.path.join(d, f"episodes_{os.getpid()}.npz"),
+            env_idx=np.array([o[0] for o in out], dtype=np.int32),
+            ep_id=np.array([o[1] for o in out], dtype=np.int32),
+            success=np.array([o[2] for o in out], dtype=bool),
+            sigma=np.array([o[3] for o in out], dtype=np.float32),
+        )
+
     def _wrap_obs(self, obs_list):
         images_and_states_list = []
         for obs in obs_list:
             images_and_states = self._extract_image_and_state(obs)
             images_and_states_list.append(images_and_states)
+        self._maybe_dump_obs(images_and_states_list)
 
         images_and_states = to_tensor(
             list_of_dict_to_dict_of_list(images_and_states_list)
@@ -782,6 +917,7 @@ class LiberoEnv(gym.Env):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
+        actions = self._maybe_inject_noise(actions)   # no-op unless RLINF_ACT_NOISE is set
 
         self._elapsed_steps += 1
         raw_obs, _reward, terminations, info_lists = self.env.step(actions)
@@ -798,6 +934,7 @@ class LiberoEnv(gym.Env):
             terminations[:] = False
 
         dones = terminations | truncations
+        self._maybe_record_episode_end(dones)   # no-op unless RLINF_DUMP_OBS_DIR is set
         _auto_reset = auto_reset and self.auto_reset
         if dones.any() and _auto_reset:
             obs, infos = self._handle_auto_reset(dones, obs, infos)
